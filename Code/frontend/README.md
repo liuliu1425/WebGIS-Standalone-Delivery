@@ -4,8 +4,8 @@
 
 ## 当前前端定位
 
-- `2D-first`：MapLibre 为当前主地图引擎；3D 默认 MapLibre `globe`，Cesium 为设置可选实验路径（`src/components/map/globe-engine/`，见仓库 `Docs/02-架构设计/cesium-dual-engine.md`）
-- Cesium 懒加载 + `vite-plugin-cesium`；Gateway `:5175` 需 CSP `'unsafe-eval'` + `'wasm-unsafe-eval'`（直连 Vite 无 CSP 时勿误判）
+- `2D-first`：MapLibre 为当前主地图引擎；3D 默认 MapLibre `globe`，Cesium 为设置中的可选实验路径，实现在 [globe-engine](src/components/map/globe-engine/README.md)
+- Cesium 懒加载 + `vite-plugin-cesium`；交付网关的容器内端口为 `5175`，宿主机入口默认为 `127.0.0.1:25175`；相关页面需 CSP `'unsafe-eval'` + `'wasm-unsafe-eval'`（直连 Vite 无 CSP 时勿误判）
 - 天气图层：标准 z/x/y 瓦片加载 + Canvas 风场叠加；支持多 Provider 钉源（侧栏与 InfoPanel，偏好存 localStorage；`open-meteo-online` / `open-meteo-local` / 商业源）
 - 图层面板、时间轴、工具栏「数据」工作台（导入/导出/属性表/详情/作业）、截图导出、工作流状态
 - Cesium / vue-cesium 已在依赖中，尚未成为默认主界面模式
@@ -98,7 +98,7 @@
 - `workflow/`：全局工作流状态按钮与面板；`WorkflowEditorPanel` 画布 Run 提交编译后的 `workflow_definition`
 - `toolbar/`：日志面板；数据入口见 `src/data-manager/ui/DataImportMenu.vue` + `DataWorkspace.vue`
 - `data-manager/`：导入/导出/属性表/详情/作业；侧栏与 InfoPanel 仅调用 `openDataWorkspace` / `exportLayer`
-- `settings/`：系统设置（**数据根 / 产物根可编辑**并「保存并重启后端」、数据源扫描、开放数据预设、静态缓存清理、远程存储 profile）
+- `settings/`：系统设置（数据根和产物根只读展示、数据源扫描、开放数据预设、静态缓存清理、远程存储配置档）。管理员在 `/deployment` 管理部署配置，交付编排的容器维护步骤见[部署与运行](../../Docs/部署与运行.md)。
 - `MapCanvas.vue`：地图运行时总入口（编排各 map 模块；天气错误横幅按层隔离，不因单层无数据盖住健康层）
 
 ## 当前地图与天气渲染事实
@@ -232,12 +232,9 @@
 
 ## 推荐阅读顺序
 
-1. `Code/frontend/README.md`
-2. `Code/shared/contracts/README.md`
-3. `Code/backend/README.md`
-4. `Docs/03-规范协议/双通道接口设计总结.md`
-5. `Docs/02-架构设计/工程决策纪要-配置瓦片与契约.md`
-6. `Docs/07-工程保障/UI优化与底图模块修复-2026-08-12.md`（登录页 / 底图熔断 / 天地图 vec+cva）
+1. [交付首页的系统架构](../../README.md#4-系统架构与组件协作)
+2. [共享契约](../shared/contracts/README.md)和[后端](../backend/README.md)
+3. [二次开发](../../Docs/二次开发.md)和[前端回归](../../Test/frontend/README.md)
 
 ## 说明
 

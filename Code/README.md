@@ -25,7 +25,7 @@ Code/
 
 ```
 
-说明：公开文档在仓库根 **`Docs/`**（编号目录）；AI 本地工作区在 **`.ai/`**。测试在仓库根 **`Test/`**。运行栈见 `backend/docker-compose.yml`；一键启停在仓库根 `launch.py`（`Env/Python312`）。
+交付说明见[文档导航](../Docs/README.md)，测试集中在 [Test](../Test/README.md)。独立交付的启动入口是 [deploy Compose](../deploy/compose.yaml)。原工程的启动器用于其对应的开发环境。
 
 ## 目录职责
 
@@ -95,16 +95,10 @@ Code/
 
 ## 推荐阅读顺序
 
-1. 仓库根 `README.md` → `AGENTS.md`
-2. `Code/README.md`
-3. `Code/backend/README.md`
-4. `Code/frontend/README.md`
-5. `Code/shared/contracts/README.md`
-6. `Docs/README.md` → `Docs/02-架构设计/工程决策纪要-配置瓦片与契约.md`
-7. `Docs/03-规范协议/双通道接口设计总结.md`
-8. `Code/algorithms/providers/Python/README.md`
-9. `Code/algorithms/providers/docs/detailed_design.md`
-10. `Docs/05-专题研究/其它专题/课题组数据全链路-2026-07-21.md`（画布编译 + 数据获取节点）
+1. [交付首页](../README.md)说明平台、实际架构与操作路线。
+2. [交付部署](../Docs/部署与运行.md)和[二次开发](../Docs/二次开发.md)说明实际环境。
+3. 按需查看[后端](backend/README.md)、[前端](frontend/README.md)、[共享契约](shared/contracts/README.md)和 [Python 算法](algorithms/providers/Python/README.md)。
+4. 新增计算模块时参考[后端集成约定](algorithms/providers/docs/backend_integration_contract.md)。
 
 <!-- geoflow-directory-navigation:start -->
 ## 本层目录导航

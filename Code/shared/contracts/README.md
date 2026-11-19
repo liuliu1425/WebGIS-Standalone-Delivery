@@ -17,7 +17,7 @@
 - 字段优先使用 `snake_case`
 - 前后端围绕统一的图层、时间范围、空间范围、任务状态对象协作
 - 当前先用 `Pydantic` 模型作为协议单一事实来源
-- 后续可再导出 JSON Schema 或 TypeScript 类型
+- 通用 API 契约已通过 OpenAPI 供前端生成 TypeScript 类型。前端包包含 `gen:types` 和 `check:openapi`。时序和地图助手也维护手写接口类型，修改后应检查相关调用方。[前端脚本](../../frontend/package.json) · [二次开发](../../../Docs/二次开发.md)
 
 ## 命名例外白名单（N-3）
 

@@ -2,7 +2,6 @@
 
 回归用例与检查辅助。
 
-<!-- geoflow-directory-navigation:start -->
 ## 本层目录导航
 
 [源码根目录](../README.md) · [上一级](../README.md)
@@ -11,10 +10,8 @@
 
 ### 子目录
 
-| 目录 | 说明 |
-|---|---|
-| [algorithms](algorithms/README.md) | 算法回归用例。 |
-| [backend](backend/README.md) | 后端回归用例。 |
-| [frontend](frontend/README.md) | 前端组件、状态与接口回归用例。 |
-
-<!-- geoflow-directory-navigation:end -->
+| 目录                                 | 说明              |
+| ---------------------------------- | --------------- |
+| [algorithms](algorithms/README.md) | 算法回归用例。         |
+| [backend](backend/README.md)       | 后端回归用例。         |
+| [frontend](frontend/README.md)     | 前端组件、状态与接口回归用例。 |

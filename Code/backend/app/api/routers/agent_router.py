@@ -1,0 +1,1058 @@
+"""Agent chat + multi-profile config API (global admin + personal)."""
+
+from __future__ import annotations
+
+import json
+import logging
+import queue
+import threading
+from collections.abc import Iterator
+from hashlib import sha256
+from typing import Any, Literal
+
+from fastapi import APIRouter, Depends, Request, status
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+
+from app.api.deps import check_resource_access, get_request_user, require_write_access
+from app.api.rate_limit import (
+    client_ip,
+    is_guest_request,
+    reserve_guest_agent_tokens,
+    settle_guest_agent_tokens,
+    peek_guest_agent_tokens,
+)
+from app.api.error_codes import (
+    AUTH_ERROR,
+    NOT_FOUND_ERROR,
+    UPSTREAM_ERROR,
+    VALIDATION_ERROR,
+    ApiError,
+)
+from app.core import config
+from app.services.agent import config_service
+from app.services.agent.clients.openai_compat import LlmClientError
+from app.services.agent.config_service import AgentPermissionError
+from app.services.agent.orchestrator import refresh_models_for_profile, run_chat
+from app.services.agent.stream_recovery import (
+    RECOVERY_KEY_HEADER,
+    REQUEST_ID_HEADER,
+    RecoveryOwner,
+    stream_recovery,
+    valid_recovery_key,
+    valid_request_id,
+)
+from app.services.credential_resolver import (
+    CredentialContext,
+    allows_write,
+    dev_bypass_allowed,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/agent", tags=["agent"])
+_RECOVERY_NO_STORE = {"Cache-Control": "no-store"}
+
+AgentProtocolLiteral = Literal["openai", "anthropic", "demo"]
+AgentScopeLiteral = Literal["global", "personal"]
+LegacyProviderLiteral = Literal["mock", "ollama", "openai_compatible"]
+
+
+class AgentUiIntent(BaseModel):
+    command_id: str | None = None
+    name: str
+    args: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentTokenUsage(BaseModel):
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    estimated: bool = False
+
+
+class AgentStep(BaseModel):
+    type: Literal["thought", "tool", "tool_result"] = "thought"
+    summary: str
+    detail: str | None = None
+
+
+class AgentConfirmation(BaseModel):
+    confirmation_id: str
+    action: str = "run_workflow"
+    expires_at: str = ""
+    summary: dict[str, Any] = Field(default_factory=dict)
+    message: str = ""
+
+
+class AgentChatRequest(BaseModel):
+    message: str = Field(min_length=0, max_length=4000)
+    session_id: str | None = Field(default=None, max_length=128)
+    client_context: dict[str, Any] | None = None
+
+
+class AgentChatResponse(BaseModel):
+    request_mode: str | None = None
+    operation_plan: list[dict[str, Any]] = Field(default_factory=list)
+    operation_status: str | None = None
+    operation_target: dict[str, Any] | None = None
+    operation_issues: list[dict[str, str]] = Field(default_factory=list)
+    session_id: str
+    reply: str
+    ui_intents: list[AgentUiIntent] = Field(default_factory=list)
+    provider: str = "demo"
+    profile_id: str | None = None
+    usage: AgentTokenUsage | None = None
+    steps: list[AgentStep] = Field(default_factory=list)
+    confirmations: list[AgentConfirmation] = Field(default_factory=list)
+
+
+class AgentConfirmRequest(BaseModel):
+    confirmation_id: str = Field(min_length=8, max_length=64)
+    decision: Literal["approve", "reject"] = "approve"
+
+
+class AgentConfirmResponse(BaseModel):
+    confirmation_id: str
+    status: str
+    summary: dict[str, Any] = Field(default_factory=dict)
+    run_id: str | None = None
+    status_url: str | None = None
+    message: str = ""
+
+
+class AgentProfilePublic(BaseModel):
+    id: str
+    name: str
+    provider_kind: str
+    protocol: AgentProtocolLiteral
+    base_url: str = ""
+    model: str = ""
+    context_window_input: int = 8192
+    context_window_output: int = 4096
+    preset_id: str | None = None
+    scope: AgentScopeLiteral = "global"
+    enabled: bool = False
+    has_api_key: bool = False
+
+
+class AgentPresetPublic(BaseModel):
+    id: str
+    name: str
+    provider_kind: str
+    protocol: AgentProtocolLiteral
+    base_url: str = ""
+    model: str = ""
+    context_window_input: int = 8192
+    context_window_output: int = 4096
+    needs_api_key: bool = True
+
+
+class AgentConfigBundleResponse(BaseModel):
+    active_profile_id: str
+    active_scope: AgentScopeLiteral = "global"
+    can_manage_global: bool = False
+    can_manage_personal: bool = False
+    profiles: list[AgentProfilePublic] = Field(default_factory=list)
+    presets: list[AgentPresetPublic] = Field(default_factory=list)
+
+
+class AgentProfileCreateRequest(BaseModel):
+    preset_id: str = Field(min_length=1, max_length=64)
+    name: str | None = Field(default=None, max_length=128)
+    scope: AgentScopeLiteral = "personal"
+
+
+class AgentProfileUpdateRequest(BaseModel):
+    scope: AgentScopeLiteral = "personal"
+    name: str | None = Field(default=None, max_length=128)
+    protocol: AgentProtocolLiteral | None = None
+    base_url: str | None = Field(default=None, max_length=512)
+    model: str | None = Field(default=None, max_length=256)
+    context_window_input: int | None = Field(default=None, ge=256, le=2_000_000)
+    context_window_output: int | None = Field(default=None, ge=64, le=512_000)
+    api_key: str | None = Field(default=None, max_length=2048)
+    clear_api_key: bool = False
+
+
+class AgentActiveRequest(BaseModel):
+    profile_id: str = Field(min_length=1, max_length=64)
+    scope: AgentScopeLiteral = "personal"
+
+
+class AgentModelsRefreshRequest(BaseModel):
+    profile_id: str | None = Field(default=None, max_length=64)
+    scope: AgentScopeLiteral | None = None
+    # Optional draft overrides so unsaved Base URL / API Key edits can refresh.
+    base_url: str | None = Field(default=None, max_length=512)
+    api_key: str | None = Field(default=None, max_length=2048)
+
+
+class AgentModelsRefreshResponse(BaseModel):
+    profile_id: str
+    models: list[str] = Field(default_factory=list)
+    manual: bool = False
+    error: str | None = None
+
+
+class AgentConfigResponse(BaseModel):
+    provider: LegacyProviderLiteral = "mock"
+    base_url: str = "http://127.0.0.1:11434/v1"
+    model: str = "qwen2.5"
+    has_api_key: bool = False
+
+
+class AgentConfigUpdateRequest(BaseModel):
+    provider: LegacyProviderLiteral | None = None
+    base_url: str | None = Field(default=None, max_length=512)
+    model: str | None = Field(default=None, max_length=128)
+    api_key: str | None = Field(default=None, max_length=2048)
+    clear_api_key: bool = False
+
+
+def _require_agent_access(
+    request: Request,
+    cred: CredentialContext | None,
+    *,
+    response_headers: dict[str, str] | None = None,
+) -> None:
+    if cred is not None:
+        return
+    if (
+        not config.settings.api_keys_enabled
+        and (config.settings.environment or "").lower()
+        in {"development", "dev", "test", "testing"}
+        and dev_bypass_allowed(request)
+    ):
+        return
+    raise ApiError(
+        AUTH_ERROR,
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Authentication required.",
+        headers=response_headers,
+    )
+
+
+def _cred_meta(cred: CredentialContext | None) -> tuple[int | None, str | None]:
+    if cred is None:
+        return None, None
+    return cred.user_id, cred.role
+
+
+def _stream_recovery_owner(request: Request, cred: CredentialContext | None) -> RecoveryOwner:
+    visitor = (request.headers.get("x-visitor-id") or "").strip()[:64]
+    if cred is None:
+        return ("development", visitor)
+    if cred.source == "session" and cred.role.strip().lower() in {"demo", "guest"}:
+        # get_request_user has validated this session cookie. Demo accounts
+        # are shared, so their user_id cannot identify the browser.
+        session = request.cookies.get(config.settings.session_cookie_name) or ""
+        return ("guest-session", sha256(session.encode()).hexdigest(), visitor)
+    if cred.user_id is not None:
+        return (cred.source, str(cred.user_id), str(cred.token_id or ""))
+    return (cred.source, visitor)
+
+
+def _is_guest_session_request(request: Request) -> bool:
+    """请求是否属于「游客」——游客不拥有历史会话能力。
+
+    与额度侧 ``is_guest_request`` 同口径：没有有效会话、或会话角色是 demo/guest
+    （含「以游客身份进入」）都算游客。这些请求共用一个共享 demo 账号，绝不能
+    按 ``cred.user_id`` 去列/读/删历史会话，否则会互相越权（2026-11-10 实测 P0）。
+    """
+    from app.api.rate_limit import is_guest_request
+
+    return bool(is_guest_request(request))
+
+
+def _perm_error(exc: AgentPermissionError) -> ApiError:
+    return ApiError(
+        AUTH_ERROR,
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=str(exc),
+    )
+
+
+def _value_error(exc: ValueError) -> ApiError:
+    return ApiError(
+        VALIDATION_ERROR,
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail=str(exc),
+    )
+
+
+def _require_profile_write(cred: CredentialContext | None) -> None:
+    """Writable role required (admin/standard); demo blocked."""
+    if cred is None:
+        raise ApiError(
+            AUTH_ERROR,
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required.",
+        )
+    if not allows_write(cred):
+        raise ApiError(
+            AUTH_ERROR,
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Insufficient permissions for this operation.",
+        )
+
+
+@router.get("/config", response_model=AgentConfigBundleResponse)
+def get_agent_config(
+    request: Request,
+    cred: CredentialContext | None = Depends(get_request_user),
+) -> AgentConfigBundleResponse:
+    _require_agent_access(request, cred)
+    uid, role = _cred_meta(cred)
+    data = config_service.get_config_bundle(user_id=uid, role=role)
+    return AgentConfigBundleResponse(**data)
+
+
+@router.put("/config", response_model=AgentConfigResponse)
+def put_agent_config_legacy(
+    payload: AgentConfigUpdateRequest,
+    request: Request,
+    cred: CredentialContext | None = Depends(get_request_user),
+    _write_ok: None = Depends(require_write_access),
+) -> AgentConfigResponse:
+    uid, role = _cred_meta(cred)
+    try:
+        data = config_service.update_agent_config(
+            provider=payload.provider,
+            base_url=payload.base_url,
+            model=payload.model,
+            api_key=payload.api_key,
+            clear_api_key=payload.clear_api_key,
+            user_id=uid,
+            role=role,
+        )
+    except AgentPermissionError as exc:
+        raise _perm_error(exc) from exc
+    except ValueError as exc:
+        raise _value_error(exc) from exc
+    return AgentConfigResponse(**data)
+
+
+@router.post("/config/profiles", response_model=AgentProfilePublic)
+def create_agent_profile(
+    payload: AgentProfileCreateRequest,
+    cred: CredentialContext | None = Depends(get_request_user),
+    _write_ok: None = Depends(require_write_access),
+) -> AgentProfilePublic:
+    _require_profile_write(cred)
+    uid, role = _cred_meta(cred)
+    try:
+        data = config_service.create_profile_from_preset(
+            payload.preset_id,
+            name=payload.name,
+            scope=payload.scope,
+            user_id=uid,
+            role=role,
+        )
+    except AgentPermissionError as exc:
+        raise _perm_error(exc) from exc
+    except ValueError as exc:
+        raise _value_error(exc) from exc
+    return AgentProfilePublic(**data)
+
+
+@router.put("/config/profiles/{profile_id}", response_model=AgentProfilePublic)
+def update_agent_profile(
+    profile_id: str,
+    payload: AgentProfileUpdateRequest,
+    cred: CredentialContext | None = Depends(get_request_user),
+    _write_ok: None = Depends(require_write_access),
+) -> AgentProfilePublic:
+    _require_profile_write(cred)
+    uid, role = _cred_meta(cred)
+    try:
+        data = config_service.update_profile(
+            profile_id,
+            scope=payload.scope,
+            user_id=uid,
+            role=role,
+            name=payload.name,
+            protocol=payload.protocol,
+            base_url=payload.base_url,
+            model=payload.model,
+            context_window_input=payload.context_window_input,
+            context_window_output=payload.context_window_output,
+            api_key=payload.api_key,
+            clear_api_key=payload.clear_api_key,
+        )
+    except AgentPermissionError as exc:
+        raise _perm_error(exc) from exc
+    except ValueError as exc:
+        raise _value_error(exc) from exc
+    return AgentProfilePublic(**data)
+
+
+@router.delete(
+    "/config/profiles/{profile_id}", response_model=AgentConfigBundleResponse
+)
+def delete_agent_profile(
+    profile_id: str,
+    scope: AgentScopeLiteral = "personal",
+    cred: CredentialContext | None = Depends(get_request_user),
+    _write_ok: None = Depends(require_write_access),
+) -> AgentConfigBundleResponse:
+    _require_profile_write(cred)
+    uid, role = _cred_meta(cred)
+    try:
+        data = config_service.delete_profile(
+            profile_id, scope=scope, user_id=uid, role=role
+        )
+    except AgentPermissionError as exc:
+        raise _perm_error(exc) from exc
+    except ValueError as exc:
+        raise _value_error(exc) from exc
+    return AgentConfigBundleResponse(**data)
+
+
+@router.post("/config/active", response_model=AgentConfigBundleResponse)
+def set_active_agent_profile(
+    payload: AgentActiveRequest,
+    cred: CredentialContext | None = Depends(get_request_user),
+    _write_ok: None = Depends(require_write_access),
+) -> AgentConfigBundleResponse:
+    _require_profile_write(cred)
+    uid, role = _cred_meta(cred)
+    try:
+        if payload.scope == "global" and role != "admin":
+            # Non-admin "use this global profile" → clear personal active
+            if uid is None:
+                raise AgentPermissionError("需要登录用户才能回退到全局配置档")
+            data = config_service.clear_personal_active(user_id=uid, role=role)
+        else:
+            data = config_service.set_active_profile(
+                payload.profile_id,
+                scope=payload.scope,
+                user_id=uid,
+                role=role,
+            )
+    except AgentPermissionError as exc:
+        raise _perm_error(exc) from exc
+    except ValueError as exc:
+        raise _value_error(exc) from exc
+    return AgentConfigBundleResponse(**data)
+
+
+@router.post("/config/use-global", response_model=AgentConfigBundleResponse)
+def use_global_agent_profile(
+    cred: CredentialContext | None = Depends(get_request_user),
+    _write_ok: None = Depends(require_write_access),
+) -> AgentConfigBundleResponse:
+    """Clear personal active so chat falls back to global active."""
+    _require_profile_write(cred)
+    uid, role = _cred_meta(cred)
+    if uid is None:
+        raise ApiError(
+            AUTH_ERROR,
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="需要登录用户",
+        )
+    try:
+        data = config_service.clear_personal_active(user_id=uid, role=role)
+    except AgentPermissionError as exc:
+        raise _perm_error(exc) from exc
+    return AgentConfigBundleResponse(**data)
+
+
+@router.post("/models/refresh", response_model=AgentModelsRefreshResponse)
+def refresh_agent_models(
+    payload: AgentModelsRefreshRequest,
+    request: Request,
+    cred: CredentialContext | None = Depends(get_request_user),
+) -> AgentModelsRefreshResponse:
+    _require_agent_access(request, cred)
+    uid, role = _cred_meta(cred)
+    bundle = config_service.get_config_bundle(user_id=uid, role=role)
+    pid = (payload.profile_id or bundle["active_profile_id"]).strip()
+    scope: AgentScopeLiteral = payload.scope or bundle.get("active_scope") or "global"
+    if scope == "global" and role != "admin":
+        raise ApiError(
+            AUTH_ERROR,
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="仅管理员可刷新全局配置档的模型列表。",
+        )
+    raw = config_service.get_profile_raw(pid, scope=scope, user_id=uid)
+    if raw is None and scope == "personal":
+        raw = config_service.get_profile_raw(pid, scope="global", user_id=uid)
+        if raw is not None and role != "admin":
+            raise ApiError(
+                AUTH_ERROR,
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="仅管理员可刷新全局配置档的模型列表。",
+            )
+    if raw is None:
+        raise ApiError(
+            NOT_FOUND_ERROR,
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"配置档不存在: {pid}",
+        )
+    raw_for_refresh = dict(raw)
+    draft_url = (payload.base_url or "").strip()
+    if draft_url:
+        raw_for_refresh["base_url"] = draft_url
+    draft_key = (payload.api_key or "").strip() or None
+    try:
+        result = refresh_models_for_profile(raw_for_refresh, api_key_override=draft_key)
+    except Exception as exc:
+        logger.exception("agent models refresh crashed profile=%s", pid)
+        result = {
+            "models": [],
+            "manual": True,
+            "error": f"刷新模型列表失败：{exc}",
+        }
+    return AgentModelsRefreshResponse(
+        profile_id=pid,
+        models=[str(m) for m in (result.get("models") or []) if m is not None],
+        manual=bool(result.get("manual")),
+        error=str(result["error"]) if result.get("error") else None,
+    )
+
+
+@router.get("/sessions")
+def agent_list_sessions(
+    request: Request,
+    limit: int = 40,
+    cred: CredentialContext | None = Depends(get_request_user),
+) -> dict[str, Any]:
+    _require_agent_access(request, cred)
+    # 游客（demo/guest 共享账号）没有历史会话：直接返回空。否则所有游客共用
+    # 同一个 demo user_id，列表会把其他人的查询全文列出来（2026-11-10 老师
+    # 实测 P0 越权）。游客的「当前会话内」多轮追问走 session_id，不受影响。
+    if _is_guest_session_request(request):
+        return {"sessions": [], "count": 0}
+    uid, _role = _cred_meta(cred)
+    from app.services.agent.session_store import list_sessions
+
+    items = list_sessions(user_id=uid, limit=limit)
+    return {"sessions": items, "count": len(items)}
+
+
+@router.get("/sessions/{session_id}")
+def agent_get_session(
+    session_id: str,
+    request: Request,
+    cred: CredentialContext | None = Depends(get_request_user),
+) -> dict[str, Any]:
+    _require_agent_access(request, cred)
+    # 游客读不到任何历史会话（同上，防止共享 demo 桶互相越权读取全文）。
+    if _is_guest_session_request(request):
+        raise ApiError(
+            NOT_FOUND_ERROR,
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found.",
+        )
+    uid, _role = _cred_meta(cred)
+    from app.services.agent.session_store import get_session_messages
+
+    data = get_session_messages(user_id=uid, session_id=session_id)
+    if data is None:
+        raise ApiError(
+            NOT_FOUND_ERROR,
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found.",
+        )
+    return data
+
+
+@router.delete("/sessions/{session_id}")
+def agent_delete_session(
+    session_id: str,
+    request: Request,
+    cred: CredentialContext | None = Depends(get_request_user),
+) -> dict[str, Any]:
+    _require_agent_access(request, cred)
+    # 游客不能删历史会话（不存在，也就谈不上删）。
+    if _is_guest_session_request(request):
+        raise ApiError(
+            NOT_FOUND_ERROR,
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found.",
+        )
+    uid, _role = _cred_meta(cred)
+    # Fail-closed: anonymous callers cannot list/get/delete sessions
+    if uid is None:
+        raise ApiError(
+            NOT_FOUND_ERROR,
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found.",
+        )
+    from app.services.agent.session_store import delete_session
+
+    ok = delete_session(user_id=uid, session_id=session_id)
+    if not ok:
+        raise ApiError(
+            VALIDATION_ERROR,
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid session_id.",
+        )
+    return {"ok": True, "session_id": session_id}
+
+
+class AgentQuotaResponse(BaseModel):
+    """助手日额度（供输入框上方的额度条展示）。"""
+
+    scope: Literal["account", "guest"]
+    limit: int = Field(description="当日上限；0 表示不限")
+    used: int = Field(description="今日已用次数")
+    remaining: int = Field(description="剩余次数；不限时为 -1")
+    percent: int = Field(description="剩余百分比 0~100；不限时为 100")
+    reset_at: str = Field(description="额度恢复时刻（北京时间次日 0 点）")
+    blocked: bool = Field(description="今日是否已用尽")
+    message: str | None = Field(default=None, description="给用户看的一句话")
+
+
+@router.get("/quota", response_model=AgentQuotaResponse)
+def agent_quota(request: Request) -> AgentQuotaResponse:
+    """查询当前请求者还剩多少助手额度（只读，不消耗额度）。
+
+    登录账号不占用访客额度；未登录按「访客号（缺省退回 IP）」统计，
+    口径与中间件里的实际拦截完全同源，避免「显示还有剩余却被拦」。
+    """
+    from app.api.rate_limit import (
+        QUOTA_SCOPE_GLOBAL,
+        QUOTA_SCOPE_IP,
+        QUOTA_SCOPE_VISITOR,
+        beijing_quota_reset_at,
+        client_ip,
+        is_guest_request,
+        peek_agent_guest_quota_layers,
+        session_role,
+    )
+
+    reset_at = beijing_quota_reset_at()
+    if not is_guest_request(request):
+        role = session_role(request) or "account"
+        return AgentQuotaResponse(
+            scope="account",
+            limit=0,
+            used=0,
+            remaining=-1,
+            percent=100,
+            reset_at=reset_at,
+            blocked=False,
+            message=f"已用「{role}」账号登录，不占用访客额度。",
+        )
+
+    visitor_id = (request.headers.get("x-visitor-id") or "").strip()[:64]
+    layers = peek_agent_guest_quota_layers(visitor_id or None, client_ip(request))
+    used, limit = layers.get(QUOTA_SCOPE_VISITOR, (0, 0))
+    if limit <= 0:
+        return AgentQuotaResponse(
+            scope="guest",
+            limit=0,
+            used=0,
+            remaining=-1,
+            percent=100,
+            reset_at=reset_at,
+            blocked=False,
+            message=None,
+        )
+
+    remaining = max(0, limit - used)
+    # 三道闸任意一道满额都发不出去，进度条就按「已用尽」显示，
+    # 否则会出现「显示还剩 15 次却一直报错」的困惑。
+    blocked_by = QUOTA_SCOPE_VISITOR if remaining <= 0 else None
+    if blocked_by is None:
+        for scope in (QUOTA_SCOPE_IP, QUOTA_SCOPE_GLOBAL):
+            pair = layers.get(scope)
+            if pair and pair[1] > 0 and pair[0] >= pair[1]:
+                blocked_by = scope
+                break
+    if blocked_by is not None:
+        remaining = 0
+    percent = max(0, min(100, int(round(remaining / limit * 100))))
+    blocked = blocked_by is not None
+    message = None
+    if blocked_by == QUOTA_SCOPE_IP:
+        message = (
+            "当前网络今天的 AI 助手体验额度已用完，北京时间 0 点恢复；"
+            "登录后可继续使用。"
+        )
+    elif blocked_by == QUOTA_SCOPE_GLOBAL:
+        message = (
+            "今天的 AI 助手体验总额度已用完，北京时间 0 点恢复；登录后可继续使用。"
+        )
+    elif blocked:
+        message = "未登录状态下 AI 助手今天的额度已用完，北京时间 0 点恢复；登录后可继续使用。"
+    return AgentQuotaResponse(
+        scope="guest",
+        limit=limit,
+        used=used,
+        remaining=remaining,
+        percent=percent,
+        reset_at=reset_at,
+        blocked=blocked,
+        message=message,
+    )
+
+
+def _attach_guest_plan_quota_tokens(result: dict[str, Any], request: Request, parent_message: str) -> None:
+    """Only a server-counted top-level request may authorize its exact child steps."""
+    if not getattr(request.state, "agent_guest_counted", False):
+        return
+    plan = result.get("operation_plan")
+    if not isinstance(plan, list) or not plan:
+        return
+    if not all(isinstance(step, dict) and step.get("id") and isinstance(step.get("message"), str) for step in plan):
+        raise ApiError(VALIDATION_ERROR, status_code=422, detail="无法确认操作计划，未执行后续步骤。")
+    from app.api.rate_limit import GuestContinuationUnavailable, issue_agent_guest_continuations
+
+    try:
+        tokens = issue_agent_guest_continuations(
+            visitor_id=(request.headers.get("x-visitor-id") or "").strip()[:64] or None,
+            ip=client_ip(request), session_id=str(result["session_id"]),
+            parent_message=parent_message, steps=plan,
+        )
+    except GuestContinuationUnavailable as exc:
+        raise ApiError(
+            UPSTREAM_ERROR, status_code=503,
+            detail="游客额度服务暂时不可用，尚未执行计划步骤，请稍后重试。",
+            headers={"Retry-After": "30"},
+        ) from exc
+    for step, token in zip(plan, tokens):
+        step["quota_token"] = token
+
+
+@router.post("/chat", response_model=AgentChatResponse)
+def agent_chat(
+    payload: AgentChatRequest,
+    request: Request,
+    cred: CredentialContext | None = Depends(get_request_user),
+) -> AgentChatResponse:
+    _require_agent_access(request, cred)
+    uid, _role = _cred_meta(cred)
+    reservation = None
+    try:
+        result = run_chat(
+            payload.message,
+            session_id=payload.session_id,
+            client_context=payload.client_context,
+            user_id=uid,
+            cred=cred,
+        )
+    except ValueError as exc:
+        settle_guest_agent_tokens(reservation, None)
+        raise ApiError(
+            VALIDATION_ERROR,
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    except LlmClientError as exc:
+        settle_guest_agent_tokens(reservation, None)
+        raise ApiError(
+            UPSTREAM_ERROR,
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(exc),
+        ) from exc
+
+    usage = result.get("usage") if isinstance(result, dict) else None
+    settle_guest_agent_tokens(reservation, usage.get("total_tokens") if isinstance(usage, dict) else None)
+    _attach_guest_plan_quota_tokens(result, request, payload.message)
+    return _chat_result_to_response(result)
+
+
+def _sse_pack(event: str, data: dict[str, Any]) -> str:
+    payload = json.dumps(data, ensure_ascii=False, default=str)
+    return f"event: {event}\ndata: {payload}\n\n"
+
+
+# 心跳间隔（秒）。必须远小于网关的 proxy_read_timeout（nginx.conf 里是 600s），
+# 15s 既能让 nginx 认为连接活着，也不至于刷屏。
+_SSE_HEARTBEAT_SECONDS = 15.0
+
+
+def _chat_result_to_response(result: dict[str, Any]) -> AgentChatResponse:
+    usage_raw = result.get("usage")
+    usage = AgentTokenUsage(**usage_raw) if isinstance(usage_raw, dict) else None
+    steps = [
+        AgentStep(
+            type=str(s.get("type") or "thought"),  # type: ignore[arg-type]
+            summary=str(s.get("summary") or ""),
+            detail=s.get("detail"),
+        )
+        for s in (result.get("steps") or [])
+        if isinstance(s, dict)
+    ]
+    confirmations = [
+        AgentConfirmation(
+            confirmation_id=str(c.get("confirmation_id") or ""),
+            action=str(c.get("action") or "run_workflow"),
+            expires_at=str(c.get("expires_at") or ""),
+            summary=dict(c.get("summary") or {})
+            if isinstance(c.get("summary"), dict)
+            else {},
+            message=str(c.get("message") or ""),
+        )
+        for c in (result.get("confirmations") or [])
+        if isinstance(c, dict) and c.get("confirmation_id")
+    ]
+    return AgentChatResponse(
+        session_id=str(result["session_id"]),
+        reply=str(result["reply"]),
+        ui_intents=[
+            AgentUiIntent(name=str(i["name"]), args=dict(i.get("args") or {}), command_id=i.get("command_id"))
+            for i in (result.get("ui_intents") or [])
+            if isinstance(i, dict)
+        ],
+        provider=str(result.get("provider") or "demo"),
+        profile_id=result.get("profile_id"),
+        usage=usage,
+        steps=steps,
+        confirmations=confirmations,
+        request_mode=result.get("request_mode"),
+        operation_plan=result.get("operation_plan") or [],
+        operation_status=result.get("operation_status"),
+        operation_target=result.get("operation_target"),
+        operation_issues=result.get("operation_issues") or [],
+    )
+
+
+@router.post(
+    "/chat/stream",
+    response_class=StreamingResponse,
+    responses={
+        200: {
+            "description": "SSE stream: token | step | intent | done | error",
+            "content": {"text/event-stream": {}},
+        }
+    },
+)
+def agent_chat_stream(
+    payload: AgentChatRequest,
+    request: Request,
+    cred: CredentialContext | None = Depends(get_request_user),
+) -> StreamingResponse:
+    """SSE chat stream (Phase D). Events: token, step, intent, done, error."""
+    _require_agent_access(request, cred, response_headers=_RECOVERY_NO_STORE)
+    uid, _role = _cred_meta(cred)
+    reservation = None
+    recovery_id = request.headers.get(REQUEST_ID_HEADER)
+    recovery_key = request.headers.get(RECOVERY_KEY_HEADER)
+    if recovery_id is not None or recovery_key is not None:
+        if (
+            recovery_id is None
+            or recovery_key is None
+            or not valid_request_id(recovery_id)
+            or not valid_recovery_key(recovery_key)
+        ):
+            raise ApiError(
+                VALIDATION_ERROR,
+                status_code=400,
+                detail="无效的 Agent 请求恢复参数。",
+                headers=_RECOVERY_NO_STORE,
+            )
+
+    def event_iter() -> Iterator[str]:
+        recovery = None
+        if recovery_id is not None and recovery_key is not None:
+            recovery = stream_recovery.register(
+                recovery_id, recovery_key, _stream_recovery_owner(request, cred)
+            )
+        q: queue.Queue[tuple[str, dict[str, Any]] | None] = queue.Queue()
+
+        def on_event(kind: str, data: dict[str, Any]) -> None:
+            q.put((kind, data))
+
+        def worker() -> None:
+            try:
+                result = run_chat(
+                    payload.message,
+                    session_id=payload.session_id,
+                    client_context=payload.client_context,
+                    user_id=uid,
+                    cred=cred,
+                    on_event=on_event,
+                )
+                usage = result.get("usage") if isinstance(result, dict) else None
+                settle_guest_agent_tokens(reservation, usage.get("total_tokens") if isinstance(usage, dict) else None)
+                _attach_guest_plan_quota_tokens(result, request, payload.message)
+                done = _chat_result_to_response(result).model_dump(mode="json")
+                if recovery is not None:
+                    stream_recovery.complete(recovery, done)
+                q.put(("done", done))
+            except ApiError as exc:
+                q.put(("error", {
+                    "error_code": exc.error_code,
+                    "detail": str(exc.detail),
+                    "status_code": exc.status_code,
+                }))
+            except ValueError as exc:
+                settle_guest_agent_tokens(reservation, None)
+                q.put(
+                    (
+                        "error",
+                        {
+                            "error_code": VALIDATION_ERROR,
+                            "detail": str(exc),
+                            "status_code": 422,
+                        },
+                    )
+                )
+            except LlmClientError as exc:
+                settle_guest_agent_tokens(reservation, None)
+                q.put(
+                    (
+                        "error",
+                        {
+                            "error_code": UPSTREAM_ERROR,
+                            "detail": str(exc),
+                            "status_code": 502,
+                        },
+                    )
+                )
+            except Exception as exc:
+                logger.exception("agent chat stream failed")
+                q.put(
+                    (
+                        "error",
+                        {
+                            "error_code": UPSTREAM_ERROR,
+                            "detail": f"模型调用失败：{exc}",
+                            "status_code": 502,
+                        },
+                    )
+                )
+            finally:
+                # Only pending records can fail. A saved result stays completed.
+                if recovery is not None:
+                    stream_recovery.fail(recovery)
+                q.put(None)
+
+        try:
+            threading.Thread(target=worker, daemon=True, name="agent-chat-stream").start()
+        except RuntimeError:
+            if recovery is not None:
+                stream_recovery.fail(recovery)
+            raise
+        # 2026-11-04：加心跳。原来这里是裸的 ``q.get()`` ——模型/工具在服务端卡住时
+        # 一个字节都发不出去，nginx 的 proxy_read_timeout 600s 一到就掐成 504，
+        # 前端显示「流式连接异常」（外部测试第 1 轮就是这么挂的）。
+        # SSE 注释行 ``:`` 开头，浏览器的 EventSource 与前端自研解析器都会忽略，
+        # 既保活又不改变消息语义。
+        while True:
+            try:
+                item = q.get(timeout=_SSE_HEARTBEAT_SECONDS)
+            except queue.Empty:
+                yield ": keepalive\n\n"
+                continue
+            if item is None:
+                break
+            kind, data = item
+            yield _sse_pack(kind, data)
+
+    return StreamingResponse(
+        event_iter(),
+        media_type="text/event-stream",
+        headers={
+            **_RECOVERY_NO_STORE,
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get("/chat/recovery/{request_id}")
+def agent_chat_recovery(
+    request_id: str,
+    request: Request,
+    cred: CredentialContext | None = Depends(get_request_user),
+) -> JSONResponse:
+    """Return the original stream result without repeating any Agent actions."""
+    _require_agent_access(request, cred, response_headers=_RECOVERY_NO_STORE)
+    key = request.headers.get(RECOVERY_KEY_HEADER) or ""
+    if valid_request_id(request_id) and valid_recovery_key(key):
+        result = stream_recovery.lookup(request_id, key, _stream_recovery_owner(request, cred))
+        if result is not None:
+            return JSONResponse(result, headers=_RECOVERY_NO_STORE)
+    raise ApiError(
+        NOT_FOUND_ERROR,
+        status_code=404,
+        detail="该 Agent 请求结果不可用。",
+        headers=_RECOVERY_NO_STORE,
+    )
+
+
+@router.post("/confirm", response_model=AgentConfirmResponse)
+def agent_confirm(
+    payload: AgentConfirmRequest,
+    cred: CredentialContext | None = Depends(get_request_user),
+    _write_ok: None = Depends(require_write_access),
+) -> AgentConfirmResponse:
+    """Approve or reject a pending Agent confirmation ticket (Phase B)."""
+    _require_profile_write(cred)
+    uid, role = _cred_meta(cred)
+    from app.services.agent.agent_confirm import consume_confirmation
+    from shared.contracts.api_contracts import WorkflowSubmitRequest
+
+    try:
+        consumed = consume_confirmation(
+            payload.confirmation_id,
+            user_id=uid,
+            role=role,
+            decision=payload.decision,
+        )
+    except ValueError as exc:
+        raise _value_error(exc) from exc
+
+    if consumed.get("status") == "rejected":
+        return AgentConfirmResponse(
+            confirmation_id=payload.confirmation_id,
+            status="rejected",
+            summary=dict(consumed.get("summary") or {}),
+            message="已取消提交",
+        )
+
+    raw_payload = consumed.get("submit_payload")
+    if not isinstance(raw_payload, dict):
+        raise ApiError(
+            VALIDATION_ERROR,
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="确认票据缺少提交快照",
+        )
+
+    try:
+        submit_req = WorkflowSubmitRequest.model_validate(raw_payload)
+    except Exception as exc:
+        raise ApiError(
+            VALIDATION_ERROR,
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"提交快照无效: {exc}",
+        ) from exc
+
+    if submit_req.layer_id:
+        check_resource_access(cred, "layer", submit_req.layer_id)
+
+    from app.services.workflow.service_container import submission_service
+
+    try:
+        accepted = submission_service.submit_workflow(
+            submit_req,
+            user_id=uid,
+            role=role,
+        )
+    except ValueError as exc:
+        raise ApiError(
+            VALIDATION_ERROR,
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+    logger.info(
+        "Agent confirmation approved confirmation_id=%s run_id=%s user=%s",
+        payload.confirmation_id,
+        accepted.run_id,
+        uid,
+    )
+
+    return AgentConfirmResponse(
+        confirmation_id=payload.confirmation_id,
+        status="approved",
+        summary=dict(consumed.get("summary") or {}),
+        run_id=accepted.run_id,
+        status_url=accepted.status_url,
+        message=f"已提交工作流 {accepted.run_id}",
+    )

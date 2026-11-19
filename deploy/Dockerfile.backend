@@ -1,0 +1,37 @@
+# Test-only image: staged dependencies and persistent download caches.
+# No host Python environment or production Dockerfile is modified.
+FROM python:3.12-slim-bookworm AS runtime-os
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 TZ=Asia/Shanghai
+# Keep downloaded packages between interrupted builds (test builder cache only).
+RUN rm -f /etc/apt/apt.conf.d/docker-clean
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+    libsqlite3-mod-spatialite libeccodes0 p7zip-full ca-certificates curl tini
+
+FROM runtime-os AS geospatial-os
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends gdal-bin
+
+FROM geospatial-os AS python-deps
+WORKDIR /srv/Code/backend
+COPY Code/backend/requirements.txt /tmp/backend-requirements.txt
+COPY Code/algorithms/providers/Python/requirements.txt /tmp/algorithm-requirements.txt
+COPY deploy/constraints.txt /tmp/local-test-constraints.txt
+# Preserve the project's pinned versions and cache partial download progress.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --timeout 45 --retries 2 -c /tmp/local-test-constraints.txt -r /tmp/backend-requirements.txt -r /tmp/algorithm-requirements.txt
+
+FROM python-deps AS app
+COPY Code/backend/ /srv/Code/backend/
+COPY Code/algorithms/ /srv/Code/algorithms/
+COPY Code/shared/ /srv/Code/shared/
+COPY Code/agentKits/ /srv/Code/agentKits/
+COPY Tools/ /srv/Tools/
+RUN useradd -u 10001 -U -m -s /usr/sbin/nologin cgda \
+    && mkdir -p /runtime/data /runtime/home /runtime/cache /runtime/output /runtime/state /srv/Code/backend/.data \
+    && chown -R cgda:cgda /runtime /srv/Code/backend/.data
+USER cgda
+ENTRYPOINT ["/usr/bin/tini", "-s", "--"]
+CMD ["python", "start_fastapi.py"]

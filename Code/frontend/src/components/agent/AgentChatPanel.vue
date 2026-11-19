@@ -1,0 +1,2893 @@
+<script setup lang="ts">
+import { computed, nextTick, onBeforeUnmount, onUnmounted, ref, watch } from 'vue'
+import {
+  Check,
+  ChevronDown,
+  Copy,
+  Download,
+  RefreshCw,
+  Sparkles,
+  Square,
+  User,
+  Wrench,
+  X,
+} from '../ui/icons'
+import {
+  confirmAgentAction,
+  deleteAgentSession,
+  fetchAgentConfig,
+  getAgentQuota,
+  getAgentSession,
+  listAgentSessions,
+  postAgentChat,
+  streamAgentChat,
+  type AgentChatResponse,
+  type AgentConfirmation,
+  type AgentProfile,
+  type AgentQuota,
+  type AgentSessionSummary,
+  type AgentStep,
+  type AgentUiIntent,
+} from '../../services/agent-api'
+import AgentQuotaBar from './AgentQuotaBar.vue'
+import { useAgentQuotaReset } from './useAgentQuotaReset'
+import { useLayerWorkspace, useLayerViewport } from '../../stores/layers/selectors'
+import { useOverlaySymbologyStore } from '../../stores/overlay-symbology'
+import { useUiStore } from '../../stores/ui'
+import {
+  AGENT_CHAT_PANEL_MAX_HEIGHT_PX,
+  AGENT_CHAT_PANEL_WIDTH_PX,
+  COMPANION_SIZE_PX,
+} from '../../composables/useAgentCompanionPosition'
+import { renderAgentMarkdown } from '../../utils/agent-markdown'
+import { recoverMislabeledHtmlClipboardText } from '../../utils/clipboard-text'
+import { settleAgentResponse, runAgentOperationPlan } from './agent-operation-runner'
+import { useOnDemandFrameStore } from '../../stores/layers/ondemand-frame'
+import {
+  buildAgentClientContextPayload,
+  pickAgentTimelineTimeList,
+  formatLocalDateKey,
+  exportChatMarkdown,
+  extractLayerCardsFromSteps,
+  isTimeoutAbortError,
+  isUserInitiatedStop,
+  sumSessionTokens,
+  summarizeTimeRange,
+  type AgentLayerCard,
+} from './agent-chat-helpers'
+import { agentMapPoint } from '../../stores/agent-map-point'
+import { useAuthStore } from '../../stores/auth'
+import companionIcon from '../../assets/agent-companion.png'
+import 'katex/dist/katex.min.css'
+
+const PANEL_MIN_W = 320
+const PANEL_MIN_H = 280
+const PANEL_MAX_W = 720
+const PANEL_DEFAULT_H = 420
+const PANEL_COMPACT_BREAKPOINT = 600
+
+const props = defineProps<{
+  open: boolean
+  /** 挂件拖动中：面板位置跟随但不播过渡，避免拖影卡顿 */
+  dragging?: boolean
+  anchor: {
+    x: number
+    y: number
+    dock: 'left' | 'right' | 'none'
+    /** 锚点已是视口坐标（Teleport fixed） */
+    viewport?: boolean
+  }
+  fitToLayerExtent?: (instanceId: string) => boolean
+  fitChina?: () => boolean
+  locateCoordinate?: (lng: number, lat: number, zoom?: number) => boolean
+  /** true=已切换；字符串=失败原因（直接展示）；false=未知原因失败 */
+  setBasemap?: (sourceId: string) => boolean | string
+  /** 地图是否已就绪；undefined = 当前模式没有 MapCanvas（如 Cesium 实验 3D） */
+  isMapReady?: () => boolean | undefined
+  /** 地图初始化失败原因（就绪时为 null） */
+  getMapError?: () => string | null
+  /**
+   * 按需补帧：给「图层 + 日期」就去 NAS 取那天的单日图（2026-11-02）。
+   * set_timeline 走它，等价于用户自己拖日历 —— 见 agent-ui-intent 里 set_timeline 分支。
+   */
+  ensureOnDemandFrame?: (
+    catalogId: string,
+    date: Date,
+  ) => Promise<{ ok: boolean; applied?: string; cached?: boolean; message?: string }>
+}>()
+
+const emit = defineEmits<{
+  close: []
+}>()
+
+const authStore = useAuthStore()
+// 游客（demo 共享账号）没有历史会话：后端对游客一律返回空/404，前端也隐藏入口，
+// 否则所有游客共用同一个 demo user_id，历史会话会互相越权（2026-11-10 实测 P0）。
+const guestWithoutHistory = computed(() => authStore.isRestrictedRole)
+
+interface PendingConfirmation extends AgentConfirmation {
+  status: 'pending' | 'approved' | 'rejected' | 'error'
+  resultMessage?: string
+  busy?: boolean
+}
+
+interface ChatMessage {
+  id: string
+  role: 'user' | 'assistant' | 'system'
+  text: string
+  /** 助手消息的消毒 HTML；流式中为空，结束后再填 */
+  html?: string
+  usage?: {
+    total_tokens: number
+    estimated?: boolean
+  } | null
+  steps?: Array<{
+    type: string
+    summary: string
+    detail?: string | null
+  }>
+  confirmations?: PendingConfirmation[]
+  /** search_layers / list_active_layers 可点卡片 */
+  layerCards?: AgentLayerCard[]
+  /** 结束后是否默认展开「过程」（有工具步骤时） */
+  keepStepsOpen?: boolean
+  /** 后端 provider：demo = 规则演示；limited = 撞单次预算（模型是好的）；busy = 并发满 */
+  provider?: string
+}
+
+const WELCOME_TEXT = '你好，我是地图助手。试试「打开 CMFD 降水」或「有哪些活动图层」。'
+
+const workspace = useLayerWorkspace()
+const viewport = useLayerViewport()
+const uiStore = useUiStore()
+// 图层来源标签（SMAP/风云卫星）：意图文案的来源前缀从这里取
+const overlaySymbology = useOverlaySymbologyStore()
+const messages = ref<ChatMessage[]>([
+  {
+    id: 'welcome',
+    role: 'assistant',
+    text: WELCOME_TEXT,
+    html: renderAgentMarkdown(WELCOME_TEXT),
+  },
+])
+
+function finalizeAssistantHtml(msg: ChatMessage) {
+  if (msg.role !== 'assistant') return
+  msg.html = msg.text ? renderAgentMarkdown(msg.text) : ''
+}
+
+/**
+ * 助手模式徽章：让用户一眼看出这条回复是「规则演示」还是真实模型，
+ * 以及是否处于降级状态。验收要求 demo 模式必须显式标识。
+ */
+function modeBadge(provider?: string): string {
+  if (provider === 'demo') return '规则演示模式'
+  // 2026-11-11 用户复测：这里原来会挂出「模型不可用 · 已降级」。但用户实际遇到的场景
+  // 是这一条请求撞了单次预算，模型下一句照样答得很完整——状态牌在撒谎；而且「降级」
+  // 是工程术语，用户只关心「到底做了没有」。原因正文里已经说清，这里不再挂牌。
+  if (provider === 'degraded' || provider === 'limited') return ''
+  if (provider === 'busy') return '助手繁忙'
+  if (provider === 'guard') return '已超出输入预算'
+  return ''
+}
+const input = ref('')
+const sending = ref(false)
+const sessionId = ref<string | null>(null)
+const listRef = ref<HTMLElement | null>(null)
+const inputRef = ref<HTMLTextAreaElement | null>(null)
+const errorText = ref<string | null>(null)
+const nowMs = ref(Date.now())
+const streamingId = ref<string | null>(null)
+/** 发送阶段：让用户区分「连不上 / 在想 / 在调工具 / 在出字 / 回退」 */
+const streamPhase = ref<'idle' | 'connecting' | 'working' | 'streaming' | 'fallback'>('idle')
+const liveStatus = ref('')
+const stepsOpen = ref(false)
+const sendStartedAt = ref(0)
+const sessionMenuOpen = ref(false)
+/** 今日额度（游客按浏览器计数，登录账号不占额度）——见 AgentQuotaBar。 */
+const quota = ref<AgentQuota | null>(null)
+const quotaLoading = ref(false)
+const quotaBlocked = computed(() => quota.value?.blocked === true)
+const sessionSummaries = ref<AgentSessionSummary[]>([])
+const sessionsLoading = ref(false)
+let tickTimer: ReturnType<typeof setInterval> | null = null
+let sendTickTimer: ReturnType<typeof setInterval> | null = null
+let scrollRaf: number | null = null
+/** 用户上滚阅读时不强制吸底 */
+let stickToBottom = true
+/** 当前发送请求的 AbortController（停止生成） */
+let sendAbort: AbortController | null = null
+/** 由「开启新会话」触发的中止：不再往清空后的列表里补「已停止生成」 */
+let suppressStopHint = false
+/**
+ * 上一轮界面意图的真实执行结果。
+ * 服务端下发意图时只能告诉模型「已下发、未执行」，模型据此不敢说「已完成」；
+ * 真正成没成要靠这里回报——下一轮 client_context.intent_results 带给它。
+ */
+let lastIntentResults: Array<{ name: string; ok?: boolean; message?: string }> = []
+
+const sessionTokenTotal = computed(() => sumSessionTokens(messages.value))
+
+const elapsedWaitLabel = computed(() => {
+  if (!sending.value || !sendStartedAt.value) return ''
+  const s = Math.max(0, Math.floor((nowMs.value - sendStartedAt.value) / 1000))
+  if (s < 2) return ''
+  return `已等待 ${s}s`
+})
+
+const statusLabel = computed(() => {
+  if (!sending.value) return ''
+  const wait = elapsedWaitLabel.value
+  const suffix = wait ? `（${wait}）` : ''
+  if (liveStatus.value) return `${liveStatus.value}${suffix}`
+  switch (streamPhase.value) {
+    case 'connecting':
+      return `正在连接助手…${suffix}`
+    case 'working':
+      return `助手处理中（模型思考或调用工具）…${suffix}`
+    case 'streaming':
+      return `正在生成回复…${suffix}`
+    case 'fallback':
+      return `连接中断，正在确认原请求结果…${suffix}`
+    default:
+      return `处理中…${suffix}`
+  }
+})
+
+const activeProfile = ref<AgentProfile | null>(null)
+
+async function loadActiveProfile() {
+  try {
+    const bundle = await fetchAgentConfig()
+    activeProfile.value =
+      bundle.profiles.find((p) => p.id === bundle.active_profile_id) ?? bundle.profiles[0] ?? null
+  } catch {
+    activeProfile.value = null
+  }
+}
+
+const copiedMsgId = ref<string | null>(null)
+let copyTimer: ReturnType<typeof setTimeout> | null = null
+
+async function copyMessageText(msg: ChatMessage) {
+  if (!msg.text) return
+  try {
+    await navigator.clipboard.writeText(msg.text)
+    copiedMsgId.value = msg.id
+    if (copyTimer != null) clearTimeout(copyTimer)
+    copyTimer = setTimeout(() => {
+      copiedMsgId.value = null
+      copyTimer = null
+    }, 2000)
+  } catch {
+    /* ignore */
+  }
+}
+
+const PROMPT_SUGGESTIONS = [
+  '查看活动图层',
+  '缩放到中国范围',
+  '有哪些气象降水数据',
+  '切换为天地图影像',
+  '定位到北京',
+]
+
+function sendSuggestion(text: string) {
+  if (sending.value) return
+  input.value = text
+  void send()
+}
+
+function stopGenerating() {
+  if (!sending.value || !sendAbort) return
+  sendAbort.abort(new DOMException('用户停止生成', 'AbortError'))
+}
+
+function pushSystemHint(text: string) {
+  messages.value.push({
+    id: `hint-${Date.now()}`,
+    role: 'system',
+    text,
+  })
+  void scrollToBottom()
+}
+
+function resetChat() {
+  chatGeneration += 1
+  sessionLoadSequence += 1
+  // 2026-10-26：原来在「生成进行中」时只弹一句提示就 return，聊天记录一条都不清，
+  // 用户点了以为按钮坏了（提示说清空、实际没清）。现在改为：先中止当前生成，
+  // 再无条件清空，并如实报出清掉了几条。
+  const clearedCount = Math.max(0, messages.value.length - 1)
+  const hadHistory = clearedCount > 0 || Boolean(sessionId.value)
+  if (sending.value) {
+    // 中止会走 send() 的「已停止生成」分支，那条提示不能插进新会话里
+    suppressStopHint = true
+    stopGenerating()
+  }
+  // 报告第二轮 P2：点「开启新会话」后「未见消息或会话状态重置」。
+  // 原来在「无 sessionId 且只有欢迎语」时直接 return 只留一行小字，
+  // 用户看不出发生了什么。现在无论什么状态都执行清理，并如实说明做了什么。
+  messages.value = [
+    {
+      id: 'welcome',
+      role: 'assistant',
+      text: WELCOME_TEXT,
+      html: renderAgentMarkdown(WELCOME_TEXT),
+    },
+  ]
+  sessionId.value = null
+  errorText.value = null
+  streamPhase.value = 'idle'
+  liveStatus.value = ''
+  streamingId.value = null
+  stepsOpen.value = false
+  sessionMenuOpen.value = false
+  stopSendTick()
+  pushSystemHint(
+    hadHistory
+      ? `已开启新会话：已清空 ${clearedCount} 条聊天记录，服务端会话也一并解绑，下一次提问会新建会话。`
+      : '当前已是全新会话（还没有历史消息）。',
+  )
+  void scrollToBottom()
+}
+
+const sessionListError = ref<string | null>(null)
+
+async function refreshSessionList() {
+  sessionsLoading.value = true
+  sessionListError.value = null
+  try {
+    const res = await listAgentSessions(40)
+    sessionSummaries.value = res.sessions || []
+  } catch (err) {
+    sessionSummaries.value = []
+    sessionListError.value = err instanceof Error ? err.message : String(err)
+  } finally {
+    sessionsLoading.value = false
+  }
+}
+
+async function toggleSessionMenu() {
+  sessionMenuOpen.value = !sessionMenuOpen.value
+  if (sessionMenuOpen.value) await refreshSessionList()
+}
+
+// 会话菜单外点 / Esc 关闭（打开期间挂 document 监听）
+function onDocPointerDownCloseSessionMenu(e: PointerEvent) {
+  const target = e.target as HTMLElement | null
+  if (target?.closest('.agent-session-wrap')) return
+  sessionMenuOpen.value = false
+}
+function onDocKeydownCloseSessionMenu(e: KeyboardEvent) {
+  if (e.key === 'Escape') sessionMenuOpen.value = false
+}
+watch(sessionMenuOpen, (open) => {
+  if (open) {
+    document.addEventListener('pointerdown', onDocPointerDownCloseSessionMenu, true)
+    document.addEventListener('keydown', onDocKeydownCloseSessionMenu)
+  } else {
+    document.removeEventListener('pointerdown', onDocPointerDownCloseSessionMenu, true)
+    document.removeEventListener('keydown', onDocKeydownCloseSessionMenu)
+  }
+})
+
+onBeforeUnmount(() => {
+  document.removeEventListener('pointerdown', onDocPointerDownCloseSessionMenu, true)
+  document.removeEventListener('keydown', onDocKeydownCloseSessionMenu)
+})
+
+async function loadSession(sid: string) {
+  if (sending.value || !sid) return
+  const loadSequence = ++sessionLoadSequence
+  chatGeneration += 1
+  sessionMenuOpen.value = false
+  try {
+    const detail = await getAgentSession(sid)
+    if (loadSequence !== sessionLoadSequence || detail.session_id !== sid) return
+    sessionId.value = detail.session_id
+    const restored: ChatMessage[] = (detail.messages || [])
+      .filter((m) => m.role === 'user' || m.role === 'assistant')
+      .map((m, idx) => {
+        const msg: ChatMessage = {
+          id: `restored-${sid}-${idx}`,
+          role: m.role as 'user' | 'assistant',
+          text: m.content || '',
+        }
+        if (msg.role === 'assistant') finalizeAssistantHtml(msg)
+        return msg
+      })
+    messages.value = restored.length
+      ? restored
+      : [
+          {
+            id: 'welcome',
+            role: 'assistant',
+            text: WELCOME_TEXT,
+            html: renderAgentMarkdown(WELCOME_TEXT),
+          },
+        ]
+    errorText.value = null
+    void scrollToBottom()
+  } catch (err) {
+    messages.value.push({
+      id: `sess-err-${Date.now()}`,
+      role: 'system',
+      text: `加载会话失败：${err instanceof Error ? err.message : String(err)}`,
+    })
+  }
+}
+
+async function removeSession(sid: string) {
+  if (sending.value || !sid) return
+  try {
+    await deleteAgentSession(sid)
+    if (sessionId.value === sid) resetChat()
+    await refreshSessionList()
+  } catch (err) {
+    messages.value.push({
+      id: `sess-del-err-${Date.now()}`,
+      role: 'system',
+      text: `删除会话失败：${err instanceof Error ? err.message : String(err)}`,
+    })
+  }
+}
+
+function downloadChatExport() {
+  const exportable = messages.value.filter(
+    (m) => (m.role === 'user' || m.role === 'assistant') && m.text.trim(),
+  )
+  if (!exportable.length) {
+    pushSystemHint('暂无可导出的对话内容——先和助手聊一轮再导出。')
+    return
+  }
+  const md = exportChatMarkdown(
+    exportable.map((m) => ({
+      role: m.role,
+      text: m.text,
+      usage: m.usage,
+      steps: m.steps,
+    })),
+    { sessionId: sessionId.value, title: 'CGDA 地图助手会话' },
+  )
+  const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `cgda-agent-${sessionId.value || 'draft'}-${Date.now()}.md`
+  a.click()
+  URL.revokeObjectURL(url)
+  pushSystemHint(`已导出 Markdown（${exportable.length} 条消息）。`)
+}
+
+function startExpiryTick() {
+  if (tickTimer != null) return
+  tickTimer = setInterval(() => {
+    nowMs.value = Date.now()
+  }, 1000)
+}
+
+function startSendTick() {
+  sendStartedAt.value = Date.now()
+  nowMs.value = Date.now()
+  if (sendTickTimer != null) return
+  sendTickTimer = setInterval(() => {
+    nowMs.value = Date.now()
+  }, 1000)
+}
+
+function stopSendTick() {
+  sendStartedAt.value = 0
+  if (sendTickTimer != null) {
+    clearInterval(sendTickTimer)
+    sendTickTimer = null
+  }
+}
+
+onUnmounted(() => {
+  sendAbort?.abort()
+  sendAbort = null
+  if (tickTimer != null) {
+    clearInterval(tickTimer)
+    tickTimer = null
+  }
+  stopSendTick()
+  if (scrollRaf != null) cancelAnimationFrame(scrollRaf)
+  if (copyTimer != null) {
+    clearTimeout(copyTimer)
+    copyTimer = null
+  }
+})
+
+/** 视口绝对位置（打开时由锚点初始化；拖动/缩放只改这些值，避免锚点重算跳动） */
+const absLeft = ref(12)
+const absTop = ref(72)
+const sizeW = ref(AGENT_CHAT_PANEL_WIDTH_PX)
+const sizeH = ref(PANEL_DEFAULT_H)
+const panelDragging = ref(false)
+const panelResizing = ref(false)
+const viewportWidth = ref(typeof window === 'undefined' ? 1200 : window.innerWidth)
+const viewportHeight = ref(typeof window === 'undefined' ? 800 : window.innerHeight)
+let chatGeneration = 0
+let sessionLoadSequence = 0
+
+let dragPtrId: number | null = null
+let dragStartX = 0
+let dragStartY = 0
+let dragBaseLeft = 0
+let dragBaseTop = 0
+
+let resizePtrId: number | null = null
+let resizeStartX = 0
+let resizeStartY = 0
+let resizeBaseW = 0
+let resizeBaseH = 0
+let resizeRaf: number | null = null
+let pendingResize: { w: number; h: number } | null = null
+
+/** 机器人拖动时同步面板：记录上一帧锚点 */
+let lastAnchorX = 0
+let lastAnchorY = 0
+
+const interacting = computed(
+  () => panelDragging.value || panelResizing.value || Boolean(props.dragging),
+)
+
+function clamp(n: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, n))
+}
+
+/**
+ * 量取停靠面板的实际占位（只读 DOM），供对话面板主动避让。
+ * 面板被隐藏（宽高为 0）或当前页面没有该面板时返回 null，调用方按"无面板"处理。
+ */
+function measureDockPanelRect(
+  selector: string,
+): { left: number; top: number; right: number } | null {
+  if (typeof document === 'undefined') return null
+  const el = document.querySelector<HTMLElement>(selector)
+  if (!el) return null
+  const rect = el.getBoundingClientRect()
+  if (rect.width <= 0 || rect.height <= 0) return null
+  return { left: rect.left, top: rect.top, right: rect.right }
+}
+
+/**
+ * 面板打开时的落点。
+ *
+ * 2026-10-22 改为「靠右停靠」：浮窗展开会盖住右侧分析面板与底部时间轴
+ * （SGFS 测试报告 P2）。现做法是**主动避让**——排在分析面板左侧并列显示，
+ * 纵向不让出时间轴；不改动任何面板的显隐状态。
+ * 机器人贴左边缘时仍沿用「挨着机器人」的原逻辑，避免面板跳到对侧。
+ */
+function computeAnchorBase(panelW = sizeW.value): { left: number; top: number } {
+  const gap = 14
+  const companion = COMPANION_SIZE_PX
+  const vw = typeof window !== 'undefined' ? window.innerWidth : 1200
+  const vh = typeof window !== 'undefined' ? window.innerHeight : 800
+
+  let left: number
+  if (props.anchor.dock === 'left') {
+    left = props.anchor.x + companion + gap
+    left = Math.min(Math.max(12, left), Math.max(12, vw - panelW - 12))
+  } else {
+    const rightDock = measureDockPanelRect('.overlay-right')
+    const leftDock = measureDockPanelRect('.overlay-left')
+    // 左边界：不压住左侧图层面板
+    const minLeft = leftDock ? leftDock.right + 8 : 12
+    const flushRight = vw - panelW - 12
+    if (rightDock) {
+      // 与右侧分析面板并排；空间不足才退回贴屏幕右缘
+      const beside = rightDock.left - 8 - panelW
+      left = beside >= minLeft ? beside : flushRight
+    } else {
+      left = flushRight
+    }
+    left = Math.min(Math.max(minLeft, left), Math.max(minLeft, flushRight))
+  }
+
+  const maxH = Math.min(AGENT_CHAT_PANEL_MAX_HEIGHT_PX, vh - 96)
+  const h = clamp(sizeH.value, PANEL_MIN_H, maxH)
+  // 底部让位：不与底部时间轴重叠
+  const bottomDock = measureDockPanelRect('.overlay-bottom')
+  const bottomLimit = bottomDock ? bottomDock.top - 12 : vh - 24
+  let top = Math.max(72, props.anchor.y - 48)
+  top = Math.min(top, Math.max(72, bottomLimit - h))
+  top = Math.min(top, Math.max(72, vh - maxH - 24))
+  return { left, top }
+}
+
+function placeNearAnchor() {
+  const base = computeAnchorBase()
+  absLeft.value = base.left
+  absTop.value = base.top
+  lastAnchorX = props.anchor.x
+  lastAnchorY = props.anchor.y
+}
+
+function clampPanelIntoViewport() {
+  const vw = viewportWidth.value
+  const vh = viewportHeight.value
+  const renderedW = Math.min(sizeW.value, Math.max(0, vw - 16))
+  const renderedH = Math.min(sizeH.value, Math.max(0, vh - 16))
+  absLeft.value = clamp(absLeft.value, 8, Math.max(8, vw - renderedW - 8))
+  absTop.value = clamp(absTop.value, 8, Math.max(8, vh - renderedH - 8))
+}
+
+const dynamicTransformOrigin = computed(() => {
+  const companionCenterX = props.anchor.x + COMPANION_SIZE_PX / 2
+  const companionCenterY = props.anchor.y + COMPANION_SIZE_PX / 2
+  const panelCenterX = absLeft.value + sizeW.value / 2
+  const panelCenterY = absTop.value + sizeH.value / 2
+
+  const isRight = companionCenterX > panelCenterX
+  const isBelow = companionCenterY > panelCenterY
+
+  const hOrigin = isRight ? 'right' : 'left'
+  const vOrigin = isBelow ? 'bottom' : 'top'
+  return `${hOrigin} ${vOrigin}`
+})
+
+const panelStyle = computed(() => {
+  const vw = viewportWidth.value
+  const vh = viewportHeight.value
+  if (vw <= PANEL_COMPACT_BREAKPOINT) {
+    return {
+      left: '8px',
+      top: '8px',
+      width: `${Math.max(0, vw - 16)}px`,
+      height: `${Math.max(PANEL_MIN_H, vh - 16)}px`,
+      maxHeight: `${Math.max(0, vh - 16)}px`,
+      transformOrigin: 'right bottom',
+    }
+  }
+  const maxH = Math.min(AGENT_CHAT_PANEL_MAX_HEIGHT_PX, vh - 72)
+  const h = clamp(sizeH.value, PANEL_MIN_H, maxH)
+  const w = clamp(sizeW.value, PANEL_MIN_W, Math.min(PANEL_MAX_W, vw - 24))
+  return {
+    left: `${absLeft.value}px`,
+    top: `${absTop.value}px`,
+    width: `${w}px`,
+    height: `${h}px`,
+    transformOrigin: dynamicTransformOrigin.value,
+  }
+})
+
+function onViewportResize() {
+  viewportWidth.value = window.innerWidth
+  viewportHeight.value = window.innerHeight
+  clampPanelIntoViewport()
+}
+
+window.addEventListener('resize', onViewportResize)
+onBeforeUnmount(() => window.removeEventListener('resize', onViewportResize))
+
+let dragRaf: number | null = null
+let pendingDragLeft = 0
+let pendingDragTop = 0
+
+function flushDragFrame() {
+  dragRaf = null
+  absLeft.value = pendingDragLeft
+  absTop.value = pendingDragTop
+}
+
+function onHeaderPointerDown(ev: PointerEvent) {
+  if (ev.button !== 0) return
+  const t = ev.target as HTMLElement | null
+  // 头部同时是拖拽把手（title「拖动移动对话框」）。若在按钮上按下也走
+  // setPointerCapture，指针捕获会把 pointerup 与随后的 click 一起派发到
+  // header 上，按钮自己的 @click 永远不触发 —— 表现就是「点了没反应」，
+  // 当年只放行了关闭按钮，历史会话 / 导出 / 开启新会话三个按钮全中招。
+  // ⇒ 所有可交互元素都不参与拖拽。
+  if (t?.closest('button, a, input, select, textarea, [role="button"], .agent-session-menu')) return
+  const el = ev.currentTarget as HTMLElement
+  dragPtrId = ev.pointerId
+  dragStartX = ev.clientX
+  dragStartY = ev.clientY
+  dragBaseLeft = absLeft.value
+  dragBaseTop = absTop.value
+  panelDragging.value = true
+  el.setPointerCapture(ev.pointerId)
+  window.addEventListener('pointermove', onHeaderPointerMove)
+  window.addEventListener('pointerup', onHeaderPointerUp)
+  window.addEventListener('pointercancel', onHeaderPointerUp)
+}
+
+function onHeaderPointerMove(ev: PointerEvent) {
+  if (dragPtrId !== ev.pointerId) return
+  pendingDragLeft = dragBaseLeft + (ev.clientX - dragStartX)
+  pendingDragTop = dragBaseTop + (ev.clientY - dragStartY)
+  if (dragRaf === null) {
+    dragRaf = requestAnimationFrame(flushDragFrame)
+  }
+}
+
+function onHeaderPointerUp(ev: PointerEvent) {
+  if (dragPtrId !== null && ev.pointerId !== dragPtrId) return
+  if (dragRaf !== null) {
+    cancelAnimationFrame(dragRaf)
+    dragRaf = null
+    absLeft.value = pendingDragLeft
+    absTop.value = pendingDragTop
+  }
+  panelDragging.value = false
+  dragPtrId = null
+  window.removeEventListener('pointermove', onHeaderPointerMove)
+  window.removeEventListener('pointerup', onHeaderPointerUp)
+  window.removeEventListener('pointercancel', onHeaderPointerUp)
+  clampPanelIntoViewport()
+}
+
+function flushResizeFrame() {
+  resizeRaf = null
+  if (!pendingResize) return
+  sizeW.value = pendingResize.w
+  sizeH.value = pendingResize.h
+  pendingResize = null
+}
+
+function onResizePointerDown(ev: PointerEvent) {
+  if (ev.button !== 0) return
+  ev.preventDefault()
+  ev.stopPropagation()
+  const el = ev.currentTarget as HTMLElement
+  resizePtrId = ev.pointerId
+  resizeStartX = ev.clientX
+  resizeStartY = ev.clientY
+  resizeBaseW = sizeW.value
+  resizeBaseH = sizeH.value
+  panelResizing.value = true
+  el.setPointerCapture(ev.pointerId)
+  window.addEventListener('pointermove', onResizePointerMove)
+  window.addEventListener('pointerup', onResizePointerUp)
+  window.addEventListener('pointercancel', onResizePointerUp)
+}
+
+function onResizePointerMove(ev: PointerEvent) {
+  if (resizePtrId !== ev.pointerId) return
+  const vw = window.innerWidth
+  const vh = window.innerHeight
+  const maxW = Math.min(PANEL_MAX_W, vw - absLeft.value - 8)
+  const maxH = Math.min(AGENT_CHAT_PANEL_MAX_HEIGHT_PX, vh - absTop.value - 8)
+  pendingResize = {
+    w: clamp(resizeBaseW + (ev.clientX - resizeStartX), PANEL_MIN_W, maxW),
+    h: clamp(resizeBaseH + (ev.clientY - resizeStartY), PANEL_MIN_H, maxH),
+  }
+  if (resizeRaf == null) {
+    resizeRaf = requestAnimationFrame(flushResizeFrame)
+  }
+}
+
+function onResizePointerUp(ev: PointerEvent) {
+  if (resizePtrId !== null && ev.pointerId !== resizePtrId) return
+  if (pendingResize) flushResizeFrame()
+  panelResizing.value = false
+  resizePtrId = null
+  window.removeEventListener('pointermove', onResizePointerMove)
+  window.removeEventListener('pointerup', onResizePointerUp)
+  window.removeEventListener('pointercancel', onResizePointerUp)
+}
+
+let anchorMoveRaf: number | null = null
+let pendingAnchorDx = 0
+let pendingAnchorDy = 0
+
+function flushAnchorMove() {
+  anchorMoveRaf = null
+  absLeft.value += pendingAnchorDx
+  absTop.value += pendingAnchorDy
+  pendingAnchorDx = 0
+  pendingAnchorDy = 0
+}
+
+onBeforeUnmount(() => {
+  window.removeEventListener('pointermove', onHeaderPointerMove)
+  window.removeEventListener('pointerup', onHeaderPointerUp)
+  window.removeEventListener('pointercancel', onHeaderPointerUp)
+  window.removeEventListener('pointermove', onResizePointerMove)
+  window.removeEventListener('pointerup', onResizePointerUp)
+  window.removeEventListener('pointercancel', onResizePointerUp)
+  if (resizeRaf != null) cancelAnimationFrame(resizeRaf)
+  if (dragRaf != null) cancelAnimationFrame(dragRaf)
+  if (anchorMoveRaf != null) cancelAnimationFrame(anchorMoveRaf)
+})
+
+watch(
+  () => props.open,
+  (open) => {
+    if (open) {
+      void loadActiveProfile()
+      placeNearAnchor()
+      void scrollToBottom()
+      void nextTick(() => {
+        autosizeInput()
+        inputRef.value?.focus()
+      })
+    }
+  },
+)
+
+/** 拖机器人时面板一并平移，保持相对间隙 */
+watch(
+  () => [props.anchor.x, props.anchor.y, props.dragging] as const,
+  ([ax, ay, dragging]) => {
+    if (!props.open) return
+    if (dragging || panelDragging.value) {
+      const dx = ax - lastAnchorX
+      const dy = ay - lastAnchorY
+      if (dx || dy) {
+        pendingAnchorDx += dx
+        pendingAnchorDy += dy
+        if (anchorMoveRaf === null) {
+          anchorMoveRaf = requestAnimationFrame(flushAnchorMove)
+        }
+      }
+    }
+    lastAnchorX = ax
+    lastAnchorY = ay
+  },
+)
+
+watch(input, () => {
+  void nextTick(() => autosizeInput())
+})
+
+/** 时间范围跟随选中对象，隐藏也保留其自身范围。 */
+function dominantTimeList(): string[] | null {
+  return pickAgentTimelineTimeList(workspace.activeLayers.value, workspace.selectedInstanceId.value)
+}
+
+function buildClientContext() {
+  const selectedInstanceId = workspace.selectedInstanceId.value
+  return buildAgentClientContextPayload({
+    layers: workspace.activeLayers.value.map((l) => ({
+      catalogId: l.catalogId,
+      instanceId: l.instanceId,
+      name:
+        workspace.activeLayersDisplay.value.find((shown) => shown.instanceId === l.instanceId)
+          ?.name ||
+        l.name ||
+        l.catalogId,
+      isAdminBoundary: l.isAdminBoundary,
+      overlayLayerId: l.importedRaster?.overlayLayerId ?? null,
+      // R04/R05：可见 / 选中是「实际显示的是哪些」与「选中的是哪个」的唯一依据
+      visible: l.visible !== false,
+      selected: !!selectedInstanceId && l.instanceId === selectedInstanceId,
+      requestedTime: uiStore.layerTimeMemory[l.catalogId]
+        ? { date: uiStore.layerTimeMemory[l.catalogId].dateKey, hour: uiStore.layerTimeMemory[l.catalogId].hour }
+        : l.instanceId === selectedInstanceId
+          ? { date: formatLocalDateKey(uiStore.currentDate), hour: uiStore.currentHour } : undefined,
+      actualTime: useOnDemandFrameStore().dayTagFor(l.catalogId) || l.importedRaster?.effectiveTimeLabel,
+      loading: Boolean(useOnDemandFrameStore().pendingTag[l.catalogId]) || ['queued', 'running', 'retry_pending'].includes(l.jobLayer?.status ?? ''),
+      loadState: l.jobLayer?.status,
+    })),
+    mapPoint: agentMapPoint.value,
+    timeline: {
+      hour: uiStore.currentHour,
+      date: uiStore.currentDate,
+      playing: uiStore.isPlaying,
+    },
+    viewport: {
+      center: viewport.currentMapCenter.value,
+      zoom: viewport.currentMapZoom.value,
+      bbox: viewport.currentMapBBox.value
+        ? [
+            viewport.currentMapBBox.value.west,
+            viewport.currentMapBBox.value.south,
+            viewport.currentMapBBox.value.east,
+            viewport.currentMapBBox.value.north,
+          ]
+        : null,
+    },
+    basemapId: uiStore.tileSourceId,
+    dataRange: summarizeTimeRange(dominantTimeList()),
+    mapReady: props.isMapReady?.(),
+    mapError: props.getMapError?.() ?? null,
+    intentResults: lastIntentResults,
+  })
+}
+
+const mapPointLabel = computed(() => {
+  const pt = agentMapPoint.value
+  if (!pt) return null
+  return `${pt.lng.toFixed(4)}, ${pt.lat.toFixed(4)}`
+})
+
+function remainingSeconds(expiresAt?: string): number | null {
+  if (!expiresAt) return null
+  const t = Date.parse(expiresAt)
+  if (Number.isNaN(t)) return null
+  return Math.max(0, Math.floor((t - nowMs.value) / 1000))
+}
+
+function confirmSummaryLabel(c: PendingConfirmation): string {
+  const s = c.summary || {}
+  const name = String(s.display_name || s.catalog_id || '')
+  const wf = String(s.workflow_id || '')
+  if (name && wf) return `${name} · ${wf}`
+  return name || wf || c.action || 'run_workflow'
+}
+
+function onListScroll() {
+  const el = listRef.value
+  if (!el) return
+  const gap = el.scrollHeight - el.scrollTop - el.clientHeight
+  stickToBottom = gap < 48
+}
+
+function scheduleScrollToBottom(force = false) {
+  if (!force && !stickToBottom) return
+  if (scrollRaf != null) return
+  scrollRaf = requestAnimationFrame(() => {
+    scrollRaf = null
+    const el = listRef.value
+    if (el) el.scrollTop = el.scrollHeight
+  })
+}
+
+async function scrollToBottom() {
+  stickToBottom = true
+  await nextTick()
+  scheduleScrollToBottom(true)
+}
+
+function autosizeInput() {
+  const el = inputRef.value
+  if (!el) return
+  el.style.height = 'auto'
+  const max = 120
+  el.style.height = `${Math.min(max, Math.max(40, el.scrollHeight))}px`
+}
+
+function onPasteInput(event: ClipboardEvent) {
+  const original = event.clipboardData?.getData('text/plain')
+  if (!original) return
+  const recovered = recoverMislabeledHtmlClipboardText(original)
+  if (recovered == null) return
+  event.preventDefault()
+  const el = event.currentTarget as HTMLTextAreaElement
+  el.setRangeText(recovered, el.selectionStart, el.selectionEnd, 'end')
+  input.value = el.value
+  autosizeInput()
+}
+
+async function resolveConfirmation(
+  msgId: string,
+  confirmationId: string,
+  decision: 'approve' | 'reject',
+) {
+  const msg = messages.value.find((m) => m.id === msgId)
+  const card = msg?.confirmations?.find((c) => c.confirmation_id === confirmationId)
+  if (!card || card.status !== 'pending' || card.busy) return
+  card.busy = true
+  try {
+    const res = await confirmAgentAction({
+      confirmation_id: confirmationId,
+      decision,
+    })
+    card.status = res.status === 'approved' ? 'approved' : 'rejected'
+    card.resultMessage = res.message || (decision === 'approve' ? '已提交' : '已取消')
+    messages.value.push({
+      id: `c-${Date.now()}`,
+      role: 'system',
+      text:
+        decision === 'approve'
+          ? `✓ ${card.resultMessage}${res.run_id ? `（${res.run_id}）` : ''}`
+          : `✗ ${card.resultMessage}`,
+    })
+  } catch (err) {
+    card.status = 'error'
+    card.resultMessage = err instanceof Error ? err.message : String(err)
+    messages.value.push({
+      id: `c-err-${Date.now()}`,
+      role: 'system',
+      text: `确认失败：${card.resultMessage}`,
+    })
+  } finally {
+    card.busy = false
+    void scrollToBottom()
+  }
+}
+
+async function applyChatResult(
+  res: AgentChatResponse,
+  assistantId: string,
+) {
+  sessionId.value = res.session_id
+  const msg = messages.value.find((m) => m.id === assistantId)
+  const pending: PendingConfirmation[] | undefined = res.confirmations?.length
+    ? res.confirmations.map((c) => ({
+        ...c,
+        status: 'pending' as const,
+      }))
+    : undefined
+  if (pending?.length) startExpiryTick()
+  if (msg) {
+    msg.text = res.reply || msg.text
+    msg.usage = res.usage
+      ? {
+          total_tokens: res.usage.total_tokens,
+          estimated: res.usage.estimated,
+        }
+      : null
+    if (res.steps?.length) msg.steps = res.steps
+    if (pending?.length) msg.confirmations = pending
+    msg.provider = res.provider
+    finalizeAssistantHtml(msg)
+  } else {
+    const created: ChatMessage = {
+      id: assistantId,
+      role: 'assistant',
+      text: res.reply,
+      usage: res.usage
+        ? {
+            total_tokens: res.usage.total_tokens,
+            estimated: res.usage.estimated,
+          }
+        : null,
+      steps: res.steps?.length ? res.steps : undefined,
+      confirmations: pending,
+      provider: res.provider,
+    }
+    finalizeAssistantHtml(created)
+    messages.value.push(created)
+  }
+
+  const target = messages.value.find((m) => m.id === assistantId)
+
+  if (target) {
+    const fromSteps = extractLayerCardsFromSteps(target.steps)
+    if (fromSteps.length) {
+      const merged = new Map<string, AgentLayerCard>()
+      for (const c of target.layerCards || []) merged.set(c.catalog_id, c)
+      for (const c of fromSteps) merged.set(c.catalog_id, c)
+      target.layerCards = [...merged.values()]
+    }
+  }
+
+  if (target) {
+    const trimmed = String(target.text || '').trim()
+    if (!trimmed || trimmed === '（模型未返回文本）') {
+      const fromSteps = synthesizeReplyFromSteps(target.steps)
+      if (fromSteps) {
+        target.text = fromSteps
+        finalizeAssistantHtml(target)
+      } else if (!trimmed) {
+        target.text = '（助手未返回可见文本。可展开「过程」查看工具步骤，或换一种问法重试。）'
+        finalizeAssistantHtml(target)
+      } else {
+        // 后端占位符「（模型未返回文本）」但无步骤可合成时，换成用户读得懂的一句，
+        // 不再把内部占位符直接甩给用户（外部测试报告 P1-3）。
+        target.text = '（这次没有生成文字说明。可展开「过程」查看执行步骤，或换一种问法重试。）'
+        finalizeAssistantHtml(target)
+      }
+    }
+    // 2026-10-22：不再因为「用过工具」就保持执行流程展开——那会把回答顶出视野。
+    // 折叠条仍保留，用户点开可看完整步骤。
+  }
+}
+
+function synthesizeReplyFromSteps(steps: ChatMessage['steps']): string | null {
+  if (!steps?.length) return null
+  for (let i = steps.length - 1; i >= 0; i -= 1) {
+    const step = steps[i]
+    if (step.type !== 'tool_result' || !step.detail) continue
+    try {
+      const data = JSON.parse(step.detail) as Record<string, unknown>
+      if (!data || typeof data !== 'object') continue
+      if (!data.ok) {
+        const err = typeof data.error === 'string' ? data.error : ''
+        if (err) return `工具调用未成功：${err}`
+        continue
+      }
+      const layers = data.layers
+      if (Array.isArray(layers)) {
+        const q = typeof data.query === 'string' ? data.query : ''
+        if (!layers.length) {
+          return `未在图层库中找到与「${q || '该关键词'}」匹配的图层。若要查看已添加图层，请说「有哪些活动图层」。`
+        }
+        const lines = layers
+          .filter((x): x is Record<string, unknown> => !!x && typeof x === 'object')
+          .map((item) => {
+            const name = String(item.display_name || '').trim()
+            // 2026-10-22：正文只给中文名，内部 layer_id 不外露（用户看不懂，且显得杂乱）
+            return `- ${name || '该图层'}`
+          })
+        return (
+          (q
+            ? `图层库搜索「${q}」命中 ${lines.length} 条：\n`
+            : `找到 ${lines.length} 个图层：\n`) + lines.join('\n')
+        )
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return null
+}
+
+/**
+ * 拉取今日额度（`GET /agent/quota`，只读、不消耗次数）。
+ *
+ * 失败时静默保留上一次的值：额度只是辅助信息，不能因为它弹错误打断对话。
+ */
+async function refreshQuota(): Promise<void> {
+  if (quotaLoading.value) return
+  quotaLoading.value = true
+  try {
+    quota.value = await getAgentQuota()
+  } catch {
+    /* 静默：额度请求失败不影响正常提问 */
+  } finally {
+    quotaLoading.value = false
+  }
+}
+
+watch(
+  () => props.open,
+  (open) => {
+    if (open) void refreshQuota()
+  },
+  { immediate: true },
+)
+
+useAgentQuotaReset(() => quota.value, () => props.open, refreshQuota)
+
+async function send() {
+  const text = input.value.trim()
+  if (!text || sending.value) return
+  if (quotaBlocked.value) return
+  input.value = ''
+  void nextTick(() => autosizeInput())
+  errorText.value = null
+  messages.value.push({
+    id: `u-${Date.now()}`,
+    role: 'user',
+    text,
+  })
+  const assistantId = `a-${Date.now()}`
+  messages.value.push({
+    id: assistantId,
+    role: 'assistant',
+    text: '',
+    steps: [],
+  })
+  void scrollToBottom()
+  sending.value = true
+  streamingId.value = assistantId
+  streamPhase.value = 'connecting'
+  liveStatus.value = '正在连接助手…'
+  stepsOpen.value = true
+  startSendTick()
+  sendAbort = new AbortController()
+  const abortSignal = sendAbort.signal
+  const requestGeneration = chatGeneration
+
+  const req = {
+    message: text,
+    session_id: sessionId.value,
+    client_context: { ...buildClientContext(), operation_protocol: 1 },
+  }
+  // 只回报一次：避免几轮之后模型还把「上一轮执行成功」当成这一轮的结果
+  lastIntentResults = []
+
+  const onStep = (step: AgentStep) => {
+    if (requestGeneration !== chatGeneration) return
+    const msg = messages.value.find((m) => m.id === assistantId)
+    if (!msg) return
+    if (!msg.steps) msg.steps = []
+    msg.steps.push(step)
+    streamPhase.value = 'working'
+    liveStatus.value =
+      step.type === 'tool'
+        ? `正在调用工具：${step.summary}`
+        : step.type === 'tool_result'
+          ? `工具已返回：${step.summary}`
+          : step.summary || '助手处理中…'
+    scheduleScrollToBottom()
+  }
+  const onToken = (chunk: string) => {
+    if (requestGeneration !== chatGeneration) return
+    streamPhase.value = 'streaming'
+    liveStatus.value = '正在生成回复…'
+    // Tool execution is still pending. Display only the final actual receipt.
+    if (chunk) liveStatus.value = '已收到回复，正在核对操作…'
+  }
+
+  try {
+    let res: AgentChatResponse
+    try {
+      res = await streamAgentChat(
+        req,
+        {
+          onToken,
+          onStep,
+          onRecovering: () => {
+            if (requestGeneration !== chatGeneration || isUserInitiatedStop(abortSignal)) return
+            streamPhase.value = 'fallback'
+            liveStatus.value = '连接中断，正在确认原请求结果…'
+          },
+          onConnected: () => {
+            if (requestGeneration !== chatGeneration) return
+            if (streamPhase.value === 'connecting') {
+              streamPhase.value = 'working'
+              liveStatus.value = '已连接，等待模型或工具…'
+            }
+          },
+          onIntent: (_intent: AgentUiIntent) => {
+            /* applied from done payload */
+          },
+        },
+        { signal: abortSignal },
+      )
+    } catch (_streamErr) {
+      // 断线只读确认由 streamAgentChat 处理，不能重新 POST 原操作。
+      if (requestGeneration !== chatGeneration) return
+      if (isUserInitiatedStop(abortSignal)) {
+        const msg = messages.value.find((m) => m.id === assistantId)
+        if (msg) finalizeAssistantHtml(msg)
+        messages.value.push({
+          id: `stop-${Date.now()}`,
+          role: 'system',
+          text: '已停止生成。已输出内容保留。',
+        })
+        return
+      }
+      throw _streamErr
+
+    }
+    if (isUserInitiatedStop(abortSignal)) {
+      // 由「开启新会话」触发的中止：列表已清空，别再补一条「已停止生成」
+      if (!suppressStopHint) {
+        const msg = messages.value.find((m) => m.id === assistantId)
+        if (msg) finalizeAssistantHtml(msg)
+        messages.value.push({
+          id: `stop-${Date.now()}`,
+          role: 'system',
+          text: '已停止生成。已输出内容保留。',
+        })
+      }
+      return
+    }
+    if (requestGeneration !== chatGeneration) return
+    const handlers = {
+      isMapReady: props.isMapReady,
+      fitToLayerExtent: props.fitToLayerExtent, fitChina: props.fitChina,
+      locateCoordinate: props.locateCoordinate, setBasemap: props.setBasemap,
+      resolveSourceLabel: (id: string) => overlaySymbology.getSourceLabel(id),
+      ensureOnDemandFrame: props.ensureOnDemandFrame,
+    }
+    const execute = async (response: AgentChatResponse) => {
+      const settled = await settleAgentResponse(response, handlers, abortSignal)
+      lastIntentResults = [{ name: 'operation', ok: settled.operation_status === 'success', message: settled.reply }]
+      return settled
+    }
+    res = res.operation_plan?.length
+      ? await runAgentOperationPlan(res, {
+          signal: abortSignal, initialContext: req.client_context, context: buildClientContext, execute,
+          progress: (text) => { liveStatus.value = text },
+          request: (message, sid, context, quotaToken) => postAgentChat(
+            { message, session_id: sid, client_context: context }, { signal: abortSignal, quotaToken },
+          ),
+        })
+      : await execute(res)
+    if (requestGeneration !== chatGeneration) return
+    await applyChatResult(res, assistantId)
+  } catch (err) {
+    if (requestGeneration !== chatGeneration) return
+    if (isUserInitiatedStop(abortSignal)) {
+      if (!suppressStopHint) {
+        const msg = messages.value.find((m) => m.id === assistantId)
+        if (msg) finalizeAssistantHtml(msg)
+        messages.value.push({
+          id: `stop-${Date.now()}`,
+          role: 'system',
+          text: '已停止生成。已输出内容保留。',
+        })
+      }
+    } else if (isTimeoutAbortError(err)) {
+      errorText.value = '请求超时'
+      messages.value.push({
+        id: `e-${Date.now()}`,
+        role: 'system',
+        text: '请求超时。已输出内容保留，可重试或换一种问法。',
+      })
+    } else {
+      errorText.value = err instanceof Error ? err.message : String(err)
+      const msg = messages.value.find((m) => m.id === assistantId)
+      if (msg && !msg.text) {
+        messages.value = messages.value.filter((m) => m.id !== assistantId)
+      }
+      messages.value.push({
+        id: `e-${Date.now()}`,
+        role: 'system',
+        text: `请求失败：${errorText.value}`,
+      })
+    }
+  } finally {
+    if (requestGeneration === chatGeneration) {
+      sendAbort = null
+      suppressStopHint = false
+      const msg = messages.value.find((m) => m.id === assistantId)
+      // 2026-10-22：回答结束后执行流程一律折叠。原先「用过工具就保持展开」会把
+      // 正文顶出视野，用户看不到回答。需要细节时点开折叠条即可。
+      if (msg) msg.keepStepsOpen = false
+      sending.value = false
+      streamingId.value = null
+      streamPhase.value = 'idle'
+      liveStatus.value = ''
+      stepsOpen.value = false
+      stopSendTick()
+      void scrollToBottom()
+      // 每轮结束后刷新额度：用尽时输入区会立刻变成「已用完」态
+      void refreshQuota()
+    }
+  }
+}
+
+function onKeydown(ev: KeyboardEvent) {
+  if (ev.key === 'Enter' && !ev.shiftKey) {
+    ev.preventDefault()
+    void send()
+  }
+}
+</script>
+
+<template>
+  <Transition name="cgda-fade-scale">
+    <aside
+      v-if="open"
+      class="agent-chat-panel"
+      :class="{ 'agent-chat-panel--interacting': interacting }"
+      :style="panelStyle"
+      role="dialog"
+      aria-label="地图助手对话"
+      :aria-busy="sending"
+    >
+      <header class="agent-chat-header" title="拖动移动对话框" @pointerdown="onHeaderPointerDown">
+        <div class="agent-chat-title">
+          <span
+            class="agent-chat-dot"
+            :class="{ 'agent-chat-dot--busy': sending }"
+            aria-hidden="true"
+          />
+          <span>地图助手</span>
+          <span
+            v-if="activeProfile?.model || activeProfile?.name"
+            class="agent-profile-badge"
+            :title="`当前模型: ${activeProfile.model || activeProfile.name}`"
+          >
+            {{ activeProfile.model || activeProfile.name }}
+          </span>
+        </div>
+        <div class="agent-chat-header-actions">
+          <div v-if="!guestWithoutHistory" class="agent-session-wrap">
+            <button
+              type="button"
+              class="agent-chat-header-btn"
+              title="历史会话"
+              aria-label="历史会话"
+              @click.stop="toggleSessionMenu"
+            >
+              <ChevronDown :size="13" />
+            </button>
+            <div v-if="sessionMenuOpen" class="agent-session-menu" @click.stop>
+              <div class="agent-session-menu-head">
+                <span>历史会话</span>
+                <button type="button" class="agent-session-link" @click="refreshSessionList">
+                  {{ sessionsLoading ? '…' : '刷新' }}
+                </button>
+              </div>
+              <p v-if="sessionListError && !sessionsLoading" class="agent-session-empty">
+                会话列表加载失败：{{ sessionListError }}
+              </p>
+              <p
+                v-else-if="!sessionSummaries.length && !sessionsLoading"
+                class="agent-session-empty"
+              >
+                暂无服务端会话
+              </p>
+              <button
+                v-for="s in sessionSummaries"
+                :key="s.session_id"
+                type="button"
+                class="agent-session-item"
+                :class="{ 'agent-session-item--active': s.session_id === sessionId }"
+                @click="loadSession(s.session_id)"
+              >
+                <span class="agent-session-preview">{{
+                  s.preview || s.session_id.slice(0, 8)
+                }}</span>
+                <span class="agent-session-meta">{{ s.message_count }} 条</span>
+                <button
+                  type="button"
+                  class="agent-session-del"
+                  title="删除会话"
+                  @click.stop="removeSession(s.session_id)"
+                >
+                  ×
+                </button>
+              </button>
+            </div>
+          </div>
+          <button
+            type="button"
+            class="agent-chat-header-btn"
+            title="导出当前对话为 Markdown"
+            aria-label="导出对话"
+            @click="downloadChatExport"
+          >
+            <Download :size="13" />
+          </button>
+          <button
+            type="button"
+            class="agent-chat-header-btn"
+            title="开启新会话（重置历史）"
+            aria-label="开启新会话"
+            @click="resetChat"
+          >
+            <RefreshCw :size="13" />
+          </button>
+          <button type="button" class="agent-chat-close" aria-label="关闭" @click="emit('close')">
+            <X :size="16" />
+          </button>
+        </div>
+      </header>
+
+      <div
+        ref="listRef"
+        class="agent-chat-list"
+        :aria-busy="sending"
+        @scroll.passive="onListScroll"
+      >
+        <div
+          v-for="msg in messages"
+          :key="msg.id"
+          class="agent-chat-row"
+          :class="[
+            `agent-chat-row--${msg.role}`,
+            msg.id === streamingId ? 'agent-chat-row--streaming' : '',
+          ]"
+        >
+          <div
+            v-if="msg.role !== 'system'"
+            class="agent-chat-avatar"
+            :class="`agent-chat-avatar--${msg.role}`"
+            aria-hidden="true"
+          >
+            <img
+              v-if="msg.role === 'assistant'"
+              class="agent-chat-avatar-img"
+              :src="companionIcon"
+              alt=""
+              draggable="false"
+            />
+            <User v-else :size="14" />
+          </div>
+
+          <div
+            class="agent-chat-bubble"
+            :class="[
+              `agent-chat-bubble--${msg.role}`,
+              msg.id === streamingId ? 'agent-chat-bubble--streaming' : '',
+            ]"
+          >
+            <span
+              v-if="msg.role === 'assistant' && modeBadge(msg.provider)"
+              class="agent-chat-mode"
+              :class="`agent-chat-mode--${msg.provider}`"
+            >
+              {{ modeBadge(msg.provider) }}
+            </span>
+            <div
+              v-if="msg.role === 'assistant' && msg.html != null && msg.html !== ''"
+              class="agent-chat-md agent-scroll"
+              v-html="msg.html"
+            />
+            <pre v-else class="agent-chat-text agent-scroll">{{
+              msg.text ||
+              (msg.id === streamingId && sending
+                ? streamPhase === 'connecting'
+                  ? '正在连接助手…'
+                  : streamPhase === 'fallback'
+                    ? '连接中断，正在确认原请求结果…'
+                    : streamPhase === 'working'
+                      ? liveStatus || '助手处理中…'
+                      : '…'
+                : '')
+            }}</pre>
+
+            <span
+              v-if="msg.id === streamingId && sending"
+              class="agent-typing-cursor"
+              aria-hidden="true"
+            />
+
+            <details
+              v-if="msg.steps?.length"
+              class="agent-chat-steps"
+              :open="msg.id === streamingId ? stepsOpen : msg.keepStepsOpen"
+            >
+              <summary class="agent-steps-summary">
+                <span class="agent-steps-summary-left">
+                  <span
+                    class="agent-steps-indicator"
+                    :class="{ 'agent-steps-indicator--live': msg.id === streamingId && sending }"
+                  >
+                    <Sparkles v-if="msg.id === streamingId && sending" :size="11" />
+                    <Wrench v-else :size="11" />
+                  </span>
+                  <span>执行流程（{{ msg.steps.length }}）</span>
+                </span>
+                <ChevronDown :size="12" class="agent-steps-chevron" />
+              </summary>
+              <div class="agent-steps-flow">
+                <div
+                  v-for="(step, idx) in msg.steps"
+                  :key="idx"
+                  class="agent-step-item"
+                  :data-step-type="step.type"
+                >
+                  <div class="agent-step-header">
+                    <span class="agent-step-badge" :data-type="step.type">
+                      {{
+                        step.type === 'thought' ? '思考' : step.type === 'tool' ? '工具' : '结果'
+                      }}
+                    </span>
+                    <span class="agent-step-summary">{{ step.summary }}</span>
+                  </div>
+                  <pre v-if="step.detail" class="agent-chat-step-detail agent-scroll">{{
+                    step.detail
+                  }}</pre>
+                </div>
+              </div>
+            </details>
+
+            <div
+              v-for="card in msg.confirmations || []"
+              :key="card.confirmation_id"
+              class="agent-confirm-card"
+              :data-status="card.status"
+            >
+              <div class="agent-confirm-title">确认提交工作流</div>
+              <div class="agent-confirm-summary">{{ confirmSummaryLabel(card) }}</div>
+              <p v-if="card.message" class="agent-confirm-msg">{{ card.message }}</p>
+              <div v-if="card.status === 'pending'" class="agent-confirm-meta">
+                <template v-if="remainingSeconds(card.expires_at) != null">
+                  剩余 {{ remainingSeconds(card.expires_at) }}s
+                </template>
+                <template v-else>待确认</template>
+              </div>
+              <div v-else class="agent-confirm-meta">
+                {{ card.resultMessage || card.status }}
+              </div>
+              <div v-if="card.status === 'pending'" class="agent-confirm-actions">
+                <button
+                  type="button"
+                  class="agent-confirm-approve"
+                  :disabled="card.busy || remainingSeconds(card.expires_at) === 0"
+                  @click="resolveConfirmation(msg.id, card.confirmation_id, 'approve')"
+                >
+                  确认提交
+                </button>
+                <button
+                  type="button"
+                  class="agent-confirm-reject"
+                  :disabled="card.busy"
+                  @click="resolveConfirmation(msg.id, card.confirmation_id, 'reject')"
+                >
+                  取消
+                </button>
+              </div>
+            </div>
+
+            <!-- 图层结果卡片已下线（2026-10-22）：正文已列中文名与显示状态，
+                 卡片会连带内部 ID 与大按钮占满面板、把回答顶出视野。
+                 需要打开/定位时用左侧图层面板或直接说「打开 XX 图层」。 -->
+
+            <!-- Assistant Actions footer (Copy + tokens) -->
+            <div
+              v-if="msg.role === 'assistant' && msg.text && msg.id !== streamingId"
+              class="agent-bubble-actions"
+            >
+              <button
+                type="button"
+                class="agent-copy-btn"
+                :title="copiedMsgId === msg.id ? '已复制到剪贴板' : '复制回答内容'"
+                :aria-label="copiedMsgId === msg.id ? '已复制' : '复制回答'"
+                @click="copyMessageText(msg)"
+              >
+                <Check v-if="copiedMsgId === msg.id" :size="11" class="text-success" />
+                <Copy v-else :size="11" />
+                <span>{{ copiedMsgId === msg.id ? '已复制' : '复制' }}</span>
+              </button>
+              <div v-if="msg.usage" class="agent-chat-usage">
+                tokens: {{ msg.usage.total_tokens }}{{ msg.usage.estimated ? '（估）' : '' }}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Suggestions shown below welcome message -->
+        <div v-if="messages.length <= 1 && !sending" class="agent-prompt-suggestions">
+          <div class="agent-suggestions-label">
+            <Sparkles :size="12" />
+            <span>快捷指令推荐</span>
+          </div>
+          <div class="agent-chips-grid">
+            <button
+              v-for="item in PROMPT_SUGGESTIONS"
+              :key="item"
+              type="button"
+              class="agent-suggestion-chip"
+              @click="sendSuggestion(item)"
+            >
+              {{ item }}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <footer class="agent-chat-footer">
+        <AgentQuotaBar :quota="quota" :loading="quotaLoading" />
+        <div class="agent-chat-context" aria-live="polite">
+          <span v-if="mapPointLabel" class="agent-chat-chip" title="地图选点将随对话一并发送">
+            选点 {{ mapPointLabel }}
+          </span>
+          <span v-else class="agent-chat-chip agent-chat-chip--muted">
+            地图点击选点后可查坐标与图层值
+          </span>
+          <span
+            v-if="sessionTokenTotal > 0"
+            class="agent-chat-chip agent-chat-chip--muted"
+            title="本会话累计 tokens"
+          >
+            Σ tokens {{ sessionTokenTotal }}
+          </span>
+        </div>
+        <p v-if="sending && statusLabel" class="agent-chat-status" role="status" aria-live="polite">
+          <span class="agent-chat-status-dot" aria-hidden="true" />
+          {{ statusLabel }}
+        </p>
+        <textarea
+          ref="inputRef"
+          v-model="input"
+          class="agent-chat-input"
+          rows="1"
+          placeholder="输入指令，Enter 发送 · Shift+Enter 换行"
+          @keydown="onKeydown"
+          @input="autosizeInput"
+          @paste="onPasteInput"
+        />
+        <button
+          v-if="sending"
+          type="button"
+          class="agent-chat-send agent-chat-send--stop"
+          title="停止生成"
+          @click="stopGenerating"
+        >
+          <Square :size="12" />
+          停止
+        </button>
+        <button
+          v-else
+          type="button"
+          class="agent-chat-send"
+          :disabled="!input.trim() || quotaBlocked"
+          :title="quotaBlocked ? quota?.message || '今日额度已用完' : undefined"
+          @click="send"
+        >
+          发送给 AI
+        </button>
+      </footer>
+      <button
+        type="button"
+        class="agent-chat-resize"
+        aria-label="拖拽调整对话框大小"
+        title="拖拽调整大小"
+        @pointerdown="onResizePointerDown"
+      />
+    </aside>
+  </Transition>
+</template>
+
+<style scoped>
+.agent-chat-panel {
+  position: fixed;
+  z-index: 1601;
+  pointer-events: auto;
+  min-width: 320px;
+  min-height: 280px;
+  display: flex;
+  flex-direction: column;
+  border-radius: 16px;
+  border: 1px solid var(--border-default);
+  background: color-mix(in srgb, var(--surface-2) 92%, transparent);
+  color: var(--text-primary);
+  box-shadow:
+    0 18px 48px rgba(0, 0, 0, 0.36),
+    0 0 0 1px color-mix(in srgb, var(--accent-surface) 35%, transparent) inset;
+  overflow: hidden;
+  isolation: isolate;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+.agent-chat-panel--interacting {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+/* ═══ 面板开合（覆盖共享 cgda-fade-scale：保留轻 scale + blur）═══ */
+.cgda-fade-scale-enter-active,
+.cgda-fade-scale-leave-active {
+  will-change: transform, opacity;
+}
+
+.cgda-fade-scale-enter-active {
+  transition:
+    opacity var(--motion-slow) var(--ease-standard),
+    transform var(--motion-slow) var(--ease-standard),
+    filter var(--motion-slow) var(--ease-standard);
+}
+
+.cgda-fade-scale-leave-active {
+  transition:
+    opacity var(--motion-surface-duration) var(--ease-soft),
+    transform var(--motion-surface-duration) var(--ease-soft),
+    filter var(--motion-interactive-duration) var(--ease-soft);
+}
+
+.cgda-fade-scale-enter-from {
+  opacity: 0;
+  transform: scale(0.86) translateY(10px);
+  filter: blur(4px);
+}
+
+.cgda-fade-scale-leave-to {
+  opacity: 0;
+  transform: scale(0.92) translateY(6px);
+  filter: blur(2px);
+}
+
+.agent-chat-panel--interacting.cgda-fade-scale-enter-active,
+.agent-chat-panel--interacting.cgda-fade-scale-leave-active {
+  transition: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cgda-fade-scale-enter-active,
+  .cgda-fade-scale-leave-active {
+    transition: opacity var(--motion-interactive-duration) var(--motion-interactive-ease);
+  }
+
+  .cgda-fade-scale-enter-from,
+  .cgda-fade-scale-leave-to {
+    transform: none;
+    filter: none;
+  }
+}
+
+.agent-chat-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.6rem 0.85rem;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--surface-3);
+  flex-shrink: 0;
+  min-height: 2.65rem;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  border-top-left-radius: 15px;
+  border-top-right-radius: 15px;
+}
+
+.agent-chat-panel--interacting .agent-chat-header {
+  cursor: grabbing;
+}
+
+.agent-chat-title {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: var(--font-size-body);
+  font-weight: 600;
+  color: var(--text-primary);
+  min-width: 0;
+}
+
+.agent-profile-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.65rem;
+  font-weight: 500;
+  color: var(--accent-strong);
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface-1));
+  border: 1px solid var(--accent-border);
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-chat-dot {
+  width: 0.4rem;
+  height: 0.4rem;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--accent) 55%, transparent);
+  flex-shrink: 0;
+}
+
+.agent-chat-dot--busy {
+  animation: agent-status-pulse 1.1s ease-in-out infinite;
+}
+
+.agent-chat-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.agent-chat-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  position: relative;
+}
+
+.agent-session-wrap {
+  position: relative;
+}
+
+.agent-session-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 20;
+  width: 240px;
+  max-height: 260px;
+  overflow: auto;
+  padding: 0.4rem;
+  border-radius: 10px;
+  border: 1px solid var(--border-default);
+  background: var(--surface-2);
+  box-shadow: var(--elevation-2, 0 8px 24px rgba(0, 0, 0, 0.35));
+}
+
+.agent-session-menu-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.2rem 0.35rem 0.45rem;
+  font-size: var(--font-size-caption);
+  color: var(--text-secondary);
+}
+
+.agent-session-link {
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.7rem;
+}
+
+.agent-session-empty {
+  margin: 0;
+  padding: 0.5rem 0.35rem;
+  font-size: var(--font-size-caption);
+  color: var(--text-muted);
+}
+
+.agent-session-item {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.15rem;
+  width: 100%;
+  margin: 0 0 0.25rem;
+  padding: 0.4rem 1.6rem 0.4rem 0.45rem;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+
+.agent-session-item:hover {
+  background: var(--surface-hover, var(--surface-3));
+}
+
+.agent-session-item--active {
+  border-color: var(--accent-border, var(--border-strong));
+  background: var(--accent-surface);
+}
+
+.agent-session-preview {
+  font-size: var(--font-size-caption);
+  color: var(--text-primary);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.agent-session-meta {
+  font-size: 0.65rem;
+  color: var(--text-muted);
+}
+
+.agent-session-del {
+  position: absolute;
+  top: 0.25rem;
+  right: 0.25rem;
+  width: 1.2rem;
+  height: 1.2rem;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  line-height: 1;
+}
+
+.agent-session-del:hover {
+  color: var(--danger, #c44);
+  background: color-mix(in srgb, var(--danger, #c44) 12%, transparent);
+}
+
+.agent-chat-header-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.6rem;
+  height: 1.6rem;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition:
+    background var(--motion-interactive-duration) var(--motion-interactive-ease),
+    color var(--motion-interactive-duration) var(--motion-interactive-ease),
+    transform var(--motion-interactive-duration) var(--motion-interactive-ease);
+}
+
+.agent-chat-header-btn:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.agent-chat-header-btn:active:not(:disabled) {
+  transform: rotate(-45deg) scale(0.92);
+}
+
+.agent-chat-header-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.agent-chat-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.6rem;
+  height: 1.6rem;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition:
+    background var(--motion-interactive-duration) var(--motion-interactive-ease),
+    color var(--motion-interactive-duration) var(--motion-interactive-ease),
+    transform var(--motion-interactive-duration) var(--motion-interactive-ease);
+}
+
+.agent-chat-close:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.agent-chat-close:active {
+  transform: scale(0.92);
+}
+
+.agent-chat-list {
+  flex: 1;
+  overflow: auto;
+  padding: 0.75rem 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  min-height: 0;
+  overscroll-behavior: contain;
+}
+
+.agent-chat-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  width: 100%;
+}
+
+.agent-chat-row--user {
+  flex-direction: row-reverse;
+}
+
+.agent-chat-row--system {
+  display: block;
+}
+
+.agent-chat-avatar {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 2px;
+}
+
+/* 助手头像：直接复用悬浮水滴的位图，去掉底色与描边；比用户头像略大以呈现细节 */
+.agent-chat-avatar--assistant {
+  width: 32px;
+  height: 32px;
+}
+
+.agent-chat-avatar-img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+  pointer-events: none;
+  user-select: none;
+}
+
+.agent-chat-avatar--user {
+  background: var(--surface-3);
+  border: 1px solid var(--border-default);
+  color: var(--text-secondary);
+}
+
+/* 浅/深主题滚动条：跟设置面板同一套 token */
+.agent-scroll,
+.agent-chat-list,
+.agent-chat-input {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-accent) var(--border-subtle);
+}
+
+.agent-scroll::-webkit-scrollbar,
+.agent-chat-list::-webkit-scrollbar,
+.agent-chat-input::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+.agent-scroll::-webkit-scrollbar-track,
+.agent-chat-list::-webkit-scrollbar-track,
+.agent-chat-input::-webkit-scrollbar-track {
+  background: var(--border-subtle);
+  border-radius: 4px;
+}
+
+.agent-scroll::-webkit-scrollbar-thumb,
+.agent-chat-list::-webkit-scrollbar-thumb,
+.agent-chat-input::-webkit-scrollbar-thumb {
+  background: var(--border-accent);
+  border-radius: 4px;
+  border: 1px solid transparent;
+  background-clip: padding-box;
+}
+
+.agent-scroll::-webkit-scrollbar-thumb:hover,
+.agent-chat-list::-webkit-scrollbar-thumb:hover,
+.agent-chat-input::-webkit-scrollbar-thumb:hover {
+  background: var(--border-strong);
+}
+
+.agent-scroll::-webkit-scrollbar-corner,
+.agent-chat-list::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.agent-chat-bubble {
+  max-width: 86%;
+  padding: 0.55rem 0.75rem;
+  border-radius: 12px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-1);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  /* 长列表：远离视口的气泡降低绘制成本 */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 72px;
+  position: relative;
+}
+
+.agent-chat-bubble--user {
+  border-top-right-radius: 4px;
+  background: var(--accent-surface);
+  border-color: var(--accent-border);
+  color: var(--text-primary);
+  animation: agent-bubble-msg var(--motion-surface-duration) var(--ease-decelerate);
+}
+
+.agent-chat-bubble--assistant {
+  border-top-left-radius: 4px;
+}
+
+.agent-chat-bubble--assistant:not(.agent-chat-bubble--streaming) {
+  animation: agent-bubble-msg var(--motion-surface-duration) var(--ease-decelerate);
+}
+
+.agent-chat-bubble--system {
+  max-width: 100%;
+  background: var(--surface-sunken);
+  color: var(--text-secondary);
+  font-size: var(--font-size-caption);
+  animation: agent-bubble-msg var(--motion-surface-duration) var(--ease-decelerate);
+}
+
+@keyframes agent-bubble-msg {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.agent-chat-mode {
+  display: inline-block;
+  margin-bottom: 6px;
+  padding: 0 6px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 4px;
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  font-size: var(--font-size-caption);
+  font-weight: var(--font-weight-regular);
+  line-height: 18px;
+  letter-spacing: 0.02em;
+  user-select: none;
+}
+
+.agent-chat-mode--degraded,
+.agent-chat-mode--busy {
+  border-color: var(--accent-border);
+  color: var(--text-secondary);
+}
+
+.agent-chat-text {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  font-family: inherit;
+  font-size: var(--font-size-caption);
+  /* 2026-10-21：Agent 对话按规范用 Regular + 行高 1.6（原 1.5 偏挤） */
+  font-weight: var(--font-weight-regular);
+  line-height: 1.6;
+  max-height: min(42vh, 320px);
+  overflow: auto;
+}
+
+.agent-chat-md {
+  margin: 0;
+  font-size: var(--font-size-caption);
+  /* 2026-10-21：同上，正文 Regular / 1.6 */
+  font-weight: var(--font-weight-regular);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  max-height: min(42vh, 360px);
+  overflow: auto;
+  color: var(--text-primary);
+}
+
+.agent-chat-md :deep(:first-child) {
+  margin-top: 0;
+}
+
+.agent-chat-md :deep(:last-child) {
+  margin-bottom: 0;
+}
+
+.agent-chat-md :deep(p),
+.agent-chat-md :deep(ul),
+.agent-chat-md :deep(ol),
+.agent-chat-md :deep(blockquote),
+.agent-chat-md :deep(pre),
+.agent-chat-md :deep(table) {
+  margin: 0.4em 0;
+}
+
+.agent-chat-md :deep(h1),
+.agent-chat-md :deep(h2),
+.agent-chat-md :deep(h3),
+.agent-chat-md :deep(h4) {
+  margin: 0.55em 0 0.3em;
+  font-size: 1.05em;
+  font-weight: 650;
+  line-height: 1.35;
+  color: var(--text-primary);
+}
+
+.agent-chat-md :deep(ul),
+.agent-chat-md :deep(ol) {
+  padding-left: 1.25em;
+}
+
+.agent-chat-md :deep(li + li) {
+  margin-top: 0.15em;
+}
+
+.agent-chat-md :deep(a) {
+  color: var(--accent-strong);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.agent-chat-md :deep(blockquote) {
+  margin-left: 0;
+  padding: 0.25em 0.65em;
+  border-left: 3px solid var(--border-accent);
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--surface-sunken) 70%, transparent);
+}
+
+.agent-chat-md :deep(code) {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.92em;
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+  background: var(--surface-sunken);
+  color: var(--text-primary);
+  border: 1px solid var(--border-subtle);
+}
+
+.agent-chat-md :deep(pre) {
+  max-height: min(28vh, 220px);
+  overflow: auto;
+  padding: 0.55rem 0.65rem;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-sunken);
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-accent) var(--border-subtle);
+}
+
+.agent-chat-md :deep(pre)::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+.agent-chat-md :deep(pre)::-webkit-scrollbar-thumb {
+  background: var(--border-accent);
+  border-radius: 4px;
+}
+
+.agent-chat-md :deep(pre code) {
+  padding: 0;
+  border: none;
+  background: transparent;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  white-space: pre;
+  display: block;
+  overflow-x: auto;
+}
+
+.agent-chat-md :deep(table) {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8em;
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.agent-chat-md :deep(th),
+.agent-chat-md :deep(td) {
+  border: 1px solid var(--border-subtle);
+  padding: 0.25em 0.45em;
+  text-align: left;
+}
+
+.agent-chat-md :deep(th) {
+  background: var(--surface-3);
+  font-weight: 600;
+}
+
+.agent-chat-md :deep(.katex) {
+  font-size: 1.05em;
+  color: inherit;
+}
+
+.agent-chat-md :deep(.katex-display) {
+  margin: 0.55em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  max-width: 100%;
+  padding: 0.15em 0;
+}
+
+.agent-chat-md :deep(.katex-display > .katex) {
+  white-space: normal;
+}
+
+.agent-typing-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 0.9em;
+  margin-left: 3px;
+  vertical-align: middle;
+  background: var(--accent);
+  border-radius: 1px;
+  box-shadow: 0 0 5px color-mix(in srgb, var(--accent) 75%, transparent);
+  animation: agent-cursor-blink var(--motion-spin) infinite ease-in-out;
+}
+
+@keyframes agent-cursor-blink {
+  0%,
+  100% {
+    opacity: 0.2;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.agent-bubble-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-top: 0.45rem;
+  padding-top: 0.35rem;
+  border-top: 1px solid color-mix(in srgb, var(--border-subtle) 60%, transparent);
+}
+
+.agent-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.65rem;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  padding: 0.15rem 0.4rem;
+  cursor: pointer;
+  transition:
+    background-color var(--motion-interactive-duration) var(--motion-interactive-ease),
+    border-color var(--motion-interactive-duration) var(--motion-interactive-ease),
+    color var(--motion-interactive-duration) var(--motion-interactive-ease),
+    box-shadow var(--motion-interactive-duration) var(--motion-interactive-ease),
+    opacity var(--motion-interactive-duration) var(--motion-interactive-ease),
+    transform var(--motion-interactive-duration) var(--motion-interactive-ease);
+}
+
+.agent-copy-btn:hover {
+  background: var(--surface-hover);
+  border-color: var(--border-subtle);
+  color: var(--text-primary);
+}
+
+.agent-copy-btn .text-success {
+  color: var(--success);
+}
+
+.agent-chat-usage {
+  font-size: 0.65rem;
+  letter-spacing: 0.02em;
+  color: var(--text-muted);
+  opacity: 0.8;
+}
+
+.agent-chat-steps {
+  margin-top: 0.45rem;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-sunken);
+  overflow: hidden;
+}
+
+.agent-steps-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.35rem 0.55rem;
+  cursor: pointer;
+  user-select: none;
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  font-weight: 500;
+  transition: background var(--motion-interactive-duration) var(--motion-interactive-ease);
+}
+
+.agent-steps-summary:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.agent-steps-summary::-webkit-details-marker {
+  display: none;
+}
+
+.agent-steps-summary-left {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.agent-steps-indicator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+}
+
+.agent-steps-indicator--live {
+  animation: agent-status-pulse 1.1s ease-in-out infinite;
+}
+
+.agent-steps-chevron {
+  transition: transform var(--motion-interactive-duration) var(--motion-interactive-ease);
+  color: var(--text-muted);
+}
+
+.agent-chat-steps[open] .agent-steps-chevron {
+  transform: rotate(180deg);
+}
+
+.agent-steps-flow {
+  padding: 0.25rem 0.5rem 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.agent-step-item {
+  padding: 0.3rem 0.45rem;
+  border-radius: 6px;
+  background: var(--surface-1);
+  border: 1px solid var(--border-subtle);
+}
+
+.agent-step-header {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.68rem;
+  line-height: 1.35;
+}
+
+.agent-step-badge {
+  padding: 0.05rem 0.3rem;
+  border-radius: 4px;
+  font-size: 0.62rem;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.agent-step-badge[data-type='thought'] {
+  background: color-mix(in srgb, #9b59b6 18%, var(--surface-2));
+  color: #af7ac5;
+  border: 1px solid color-mix(in srgb, #9b59b6 35%, transparent);
+}
+
+.agent-step-badge[data-type='tool'] {
+  background: color-mix(in srgb, var(--accent) 18%, var(--surface-2));
+  color: var(--accent-strong);
+  border: 1px solid var(--accent-border);
+}
+
+.agent-step-badge[data-type='tool_result'] {
+  background: color-mix(in srgb, var(--success) 18%, var(--surface-2));
+  color: var(--success);
+  border: 1px solid color-mix(in srgb, var(--success) 35%, transparent);
+}
+
+.agent-step-summary {
+  color: var(--text-secondary);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-chat-step-detail {
+  margin: 0.25rem 0 0.1rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  font-family: inherit;
+  font-size: 0.65rem;
+  line-height: 1.4;
+  color: var(--text-muted);
+  max-height: 5.5rem;
+  overflow: auto;
+  background: var(--surface-sunken);
+  padding: 0.25rem 0.4rem;
+  border-radius: 4px;
+}
+
+.agent-prompt-suggestions {
+  margin: 0.25rem 0 0.5rem;
+  padding: 0.6rem 0.75rem;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--accent-surface) 40%, var(--surface-1));
+  border: 1px dashed var(--accent-border);
+  animation: agent-bubble-msg var(--motion-modal) var(--ease-decelerate);
+}
+
+.agent-suggestions-label {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--accent-strong);
+  margin-bottom: 0.45rem;
+}
+
+.agent-chips-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.agent-suggestion-chip {
+  padding: 0.25rem 0.55rem;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-2);
+  color: var(--text-primary);
+  font-size: 0.7rem;
+  line-height: 1.35;
+  cursor: pointer;
+  transition:
+    background var(--motion-interactive-duration) var(--motion-interactive-ease),
+    border-color var(--motion-interactive-duration) var(--motion-interactive-ease),
+    color var(--motion-interactive-duration) var(--motion-interactive-ease),
+    transform var(--motion-interactive-duration) var(--motion-interactive-ease),
+    box-shadow var(--motion-interactive-duration) var(--motion-interactive-ease);
+}
+
+.agent-suggestion-chip:hover {
+  background: var(--accent-surface);
+  border-color: var(--accent-border);
+  color: var(--accent-strong);
+  transform: translateY(-1px);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
+}
+
+.agent-suggestion-chip:active {
+  transform: scale(0.96);
+}
+
+.agent-confirm-card {
+  margin-top: 0.55rem;
+  padding: 0.55rem 0.6rem;
+  border-radius: 8px;
+  border: 1px solid var(--accent-border);
+  background: color-mix(in srgb, var(--accent-surface) 55%, var(--surface-1));
+}
+
+.agent-confirm-card[data-status='approved'] {
+  border-color: color-mix(in srgb, #3d9a5f 50%, var(--border-subtle));
+  opacity: 0.92;
+}
+
+.agent-confirm-card[data-status='rejected'],
+.agent-confirm-card[data-status='error'] {
+  opacity: 0.75;
+  border-color: var(--border-subtle);
+}
+
+.agent-confirm-title {
+  font-size: var(--font-size-caption);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.agent-confirm-summary {
+  margin-top: 0.2rem;
+  font-size: var(--font-size-caption);
+  color: var(--text-secondary);
+  word-break: break-word;
+}
+
+.agent-confirm-msg {
+  margin: 0.35rem 0 0;
+  font-size: 0.7rem;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
+.agent-confirm-meta {
+  margin-top: 0.35rem;
+  font-size: 0.65rem;
+  color: var(--text-muted);
+}
+
+.agent-confirm-actions {
+  display: flex;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+
+.agent-confirm-approve,
+.agent-confirm-reject {
+  flex: 1;
+  border-radius: 6px;
+  border: 1px solid var(--border-default);
+  padding: 0.35rem 0.5rem;
+  font-size: var(--font-size-caption);
+  cursor: pointer;
+  transition:
+    background var(--motion-interactive-duration) var(--motion-interactive-ease),
+    opacity var(--motion-interactive-duration) var(--motion-interactive-ease);
+}
+
+.agent-confirm-approve {
+  background: var(--accent);
+  color: var(--text-on-accent, #fff);
+  border-color: transparent;
+}
+
+.agent-confirm-approve:disabled,
+.agent-confirm-reject:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.agent-confirm-reject {
+  background: var(--surface-2);
+  color: var(--text-secondary);
+}
+
+.agent-layer-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-top: 0.55rem;
+}
+
+.agent-layer-card {
+  padding: 0.5rem 0.55rem;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-2);
+}
+
+.agent-layer-card-title {
+  font-size: var(--font-size-caption);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.agent-layer-card-id {
+  margin-top: 0.15rem;
+  font-size: 0.65rem;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  word-break: break-all;
+}
+
+.agent-chat-send--stop {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  border-color: var(--danger-border, var(--border-strong));
+  background: color-mix(in srgb, var(--danger, #c44) 18%, var(--surface-1));
+  color: var(--danger, #c44);
+}
+
+.agent-chat-footer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto auto;
+  gap: 0.4rem 0.5rem;
+  padding: 0.55rem 0.75rem 0.75rem;
+  border-top: 1px solid var(--border-subtle);
+  background: var(--surface-3);
+  flex-shrink: 0;
+  align-items: end;
+  /* 与面板圆角对齐，避免输入框聚焦描边/白底顶破左下角 */
+  border-bottom-left-radius: 15px;
+  border-bottom-right-radius: 15px;
+  overflow: hidden;
+  position: relative;
+  z-index: 0;
+}
+
+.agent-chat-context {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+.agent-chat-status {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0;
+  padding: 0.28rem 0.45rem;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface-1));
+  color: var(--text-secondary);
+  font-size: 0.7rem;
+  line-height: 1.35;
+}
+
+.agent-chat-status-dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 999px;
+  background: var(--accent);
+  flex: 0 0 auto;
+  animation: agent-status-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes agent-status-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.85);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.agent-chat-chip {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  padding: 0.15rem 0.45rem;
+  border-radius: 6px;
+  border: 1px solid var(--accent-border);
+  background: color-mix(in srgb, var(--accent-surface) 55%, var(--surface-1));
+  color: var(--accent-strong);
+  font-size: 0.65rem;
+  line-height: 1.35;
+  letter-spacing: 0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-chat-chip--muted {
+  border-color: var(--border-subtle);
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+}
+
+.agent-chat-input {
+  resize: none;
+  border-radius: 10px;
+  border: 1px solid var(--border-default);
+  background: var(--surface-1);
+  color: var(--text-primary);
+  padding: 0.55rem 0.7rem;
+  font: inherit;
+  font-size: var(--font-size-caption);
+  line-height: 1.4;
+  min-height: 2.5rem;
+  max-height: 7.5rem;
+  height: 2.5rem;
+  box-sizing: border-box;
+  overflow-y: auto;
+}
+
+.agent-chat-input:focus {
+  outline: none;
+  border-color: var(--accent-border);
+  box-shadow: 0 0 0 2px var(--accent-focus-ring);
+}
+
+.agent-chat-send {
+  box-sizing: border-box;
+  align-self: end;
+  min-width: 3.5rem;
+  height: 2.5rem;
+  padding: 0 0.85rem;
+  border-radius: 10px;
+  border: 1px solid var(--accent-border);
+  background: var(--accent-surface);
+  color: var(--accent-strong);
+  font-size: var(--font-size-caption);
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    transform var(--motion-interactive-duration) var(--motion-interactive-ease),
+    background var(--motion-interactive-duration) var(--motion-interactive-ease),
+    opacity var(--motion-interactive-duration) var(--motion-interactive-ease);
+}
+
+.agent-chat-send:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.agent-chat-send:not(:disabled):hover {
+  background: var(--surface-hover);
+}
+
+.agent-chat-send:not(:disabled):active {
+  transform: scale(0.96);
+}
+
+.agent-chat-resize {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  padding: 0;
+  border: none;
+  border-radius: 0 0 14px 0;
+  background:
+    linear-gradient(
+      135deg,
+      transparent 45%,
+      color-mix(in srgb, var(--text-muted) 55%, transparent) 46%,
+      color-mix(in srgb, var(--text-muted) 55%, transparent) 54%,
+      transparent 55%
+    ),
+    linear-gradient(
+      135deg,
+      transparent 62%,
+      color-mix(in srgb, var(--text-muted) 55%, transparent) 63%,
+      color-mix(in srgb, var(--text-muted) 55%, transparent) 71%,
+      transparent 72%
+    );
+  background-color: transparent;
+  cursor: nwse-resize;
+  touch-action: none;
+  opacity: 0.75;
+  z-index: 2;
+}
+
+.agent-chat-resize:hover,
+.agent-chat-panel--interacting .agent-chat-resize {
+  opacity: 1;
+}
+
+@media (max-width: 600px) {
+  .agent-chat-panel {
+    min-width: 0;
+    min-height: 0;
+    border-radius: 12px;
+  }
+
+  .agent-chat-header {
+    cursor: default;
+    touch-action: auto;
+  }
+
+  .agent-chat-resize {
+    display: none;
+  }
+}
+</style>

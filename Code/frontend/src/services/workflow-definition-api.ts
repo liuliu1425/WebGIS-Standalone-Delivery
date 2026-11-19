@@ -1,0 +1,248 @@
+/**
+ * 工作流定义 API 服务
+ *
+ * 提供与后端 /workflow-definitions 端点的交互。
+ * 遵循项目原生 fetch + resolveApiUrl 模式（不使用 axios）Sprint 3.6 后由 _http.ts 统一实现。
+ */
+// Sprint 3.6: requestJson 已抽取到 _http.ts 统一维护
+import { requestJson } from './_http'
+
+// ─── 类型定义 ──────────────────────────────────────────────────────────────
+export interface NodePortSpec {
+  name: string
+  type: string
+  required?: boolean
+  description?: string
+}
+
+export interface NodeParamSpec {
+  key: string
+  type: string
+  default?: unknown
+  description?: string
+  options?: string[]
+  /** 有 options 时是否允许输入不在列表中的自定义值；默认 true（enum/option 类型默认 false） */
+  allow_custom?: boolean
+  unit?: string
+  min?: number
+  max?: number
+  step?: number
+  /** 指定前端渲染控件类型，优先级高于根据 type/value 自动推断 */
+  widget?: 'date' | 'datetime' | 'bbox' | 'coordinate' | 'path' | 'textarea' | 'color'
+  /** widget=bbox 时，指定四个分量 key 映射 */
+  bbox_keys?: {
+    west?: string
+    east?: string
+    south?: string
+    north?: string
+  }
+}
+
+export interface NodeTemplate {
+  type: string
+  engine: string
+  category: string
+  title: string
+  description: string
+  inputs: NodePortSpec[]
+  outputs: NodePortSpec[]
+  params: NodeParamSpec[]
+  node_class: string
+  /** false = stub / 未实现执行器；调色板灰显且不可加入画布 */
+  executable?: boolean
+}
+
+export interface WorkflowDefinitionSummary {
+  workflow_id: string
+  kind: 'system' | 'user'
+  engine: string
+  name: string
+  description: string | null
+  readonly: boolean
+  /** 范例工作流：可一键「从范例新建」用户副本 */
+  is_template?: boolean
+  linked_layer_id: string | null
+  updated_at: string | null
+  node_count: number
+  /** 工作流标签（如 ["pipeline", "inversion"]），用于分类过滤 */
+  tags?: string[]
+  /** 工作流主分类（如 "inversion"/"weather"/"data_access"/"demo"） */
+  category?: string | null
+  /** Private user-workflow review state; system workflows have no review state. */
+  review_status?: 'draft' | 'submitted' | 'approved' | 'rejected' | null
+  review_submitted_at?: string | null
+}
+
+export interface WorkflowDefinitionNode {
+  id: number
+  type: string
+  title: string
+  pos: [number, number]
+  properties: Record<string, unknown>
+  inputs?: NodePortSpec[]
+  outputs?: NodePortSpec[]
+}
+
+export interface WorkflowDefinitionLink {
+  0: number // link_id
+  1: number // from_node_id
+  2: number // from_slot
+  3: number // to_node_id
+  4: number // to_slot
+  5: string // type
+}
+
+export interface WorkflowDefinitionMeta {
+  kind: 'system' | 'user'
+  engine: string
+  name: string
+  description: string | null
+  created_at: string
+  updated_at: string
+  author: string
+  readonly: boolean
+  linked_layer_id: string | null
+  /** 工作流标签列表 */
+  tags?: string[]
+  /** 工作流主分类 */
+  category?: string | null
+}
+
+export interface WorkflowDefinition {
+  _meta: WorkflowDefinitionMeta
+  workflow_id: string
+  name: string
+  description: string | null
+  nodes: WorkflowDefinitionNode[]
+  links: WorkflowDefinitionLink[]
+  extra?: Record<string, unknown>
+}
+
+// ─── API 调用层 ─────────────────────────────────────────────────────────────
+// Sprint 3.6: requestJson 实现已抽取到 _http.ts，此处直接复用
+const BASE = '/workflow-definitions'
+
+// ─── 公开 API 函数 ──────────────────────────────────────────────────────────
+
+export async function fetchNodeTemplates(): Promise<NodeTemplate[]> {
+  const data = await requestJson<{ templates: NodeTemplate[] }>(`${BASE}/node-templates`)
+  return data.templates
+}
+
+export async function fetchWorkflowDefinitions(): Promise<WorkflowDefinitionSummary[]> {
+  const data = await requestJson<{ items: WorkflowDefinitionSummary[] }>(BASE)
+  return data.items
+}
+
+export async function fetchWorkflowDefinition(workflowId: string): Promise<WorkflowDefinition> {
+  return requestJson<WorkflowDefinition>(`${BASE}/${workflowId}`)
+}
+
+export async function createWorkflowDefinition(payload: {
+  workflow_id: string
+  name: string
+  description?: string
+  engine?: string
+  linked_layer_id?: string
+  tags?: string[]
+  category?: string
+  nodes?: unknown[]
+  links?: unknown[]
+}): Promise<WorkflowDefinition> {
+  return requestJson<WorkflowDefinition>(BASE, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function updateWorkflowDefinition(
+  workflowId: string,
+  payload: Partial<{
+    name: string
+    description: string
+    engine: string
+    linked_layer_id: string
+    tags: string[]
+    category: string
+    nodes: unknown[]
+    links: unknown[]
+  }>,
+): Promise<WorkflowDefinition> {
+  return requestJson<WorkflowDefinition>(`${BASE}/${workflowId}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function deleteWorkflowDefinition(workflowId: string): Promise<void> {
+  // DELETE 端点返回 204 No Content；allowEmpty=true 显式声明允许空响应
+  await requestJson<void>(`${BASE}/${workflowId}`, { method: 'DELETE', allowEmpty: true })
+}
+
+export async function duplicateWorkflowDefinition(
+  workflowId: string,
+  newId: string,
+  newName?: string,
+): Promise<WorkflowDefinition> {
+  return requestJson<WorkflowDefinition>(`${BASE}/${workflowId}/duplicate`, {
+    method: 'POST',
+    body: JSON.stringify({ new_id: newId, new_name: newName }),
+  })
+}
+
+export async function submitWorkflowForReview(
+  workflowId: string,
+  note?: string,
+): Promise<WorkflowDefinition> {
+  return requestJson<WorkflowDefinition>(`${BASE}/${workflowId}/review-submission`, {
+    method: 'POST',
+    body: JSON.stringify({ note }),
+  })
+}
+
+export async function listWorkflowReviewSubmissions(): Promise<WorkflowDefinitionSummary[]> {
+  const data = await requestJson<{ items: WorkflowDefinitionSummary[] }>(`${BASE}/review-submissions`)
+  return data.items
+}
+
+export async function decideWorkflowReview(
+  workflowId: string,
+  approved: boolean,
+  note?: string,
+): Promise<WorkflowDefinition> {
+  return requestJson<WorkflowDefinition>(`${BASE}/${workflowId}/review-decision`, {
+    method: 'POST',
+    body: JSON.stringify({ approved, note }),
+  })
+}
+
+export async function compileWorkflowGraph(payload: {
+  workflow_id: string
+  name?: string
+  description?: string | null
+  nodes: unknown[]
+  links: unknown[]
+}): Promise<{ ok: boolean; workflow_definition: Record<string, unknown> }> {
+  return requestJson(`${BASE}/compile`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+/** 图模式提交前干跑校验（不入队） */
+export async function dryValidateWorkflowGraph(payload: {
+  workflow_id: string
+  name?: string
+  description?: string | null
+  nodes: unknown[]
+  links: unknown[]
+}): Promise<{
+  ok: boolean
+  workflow_definition?: Record<string, unknown>
+  issues?: Array<{ field?: string; code?: string; message?: string }>
+}> {
+  return requestJson(`${BASE}/dry-validate`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}

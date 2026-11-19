@@ -1,0 +1,352 @@
+/**
+ * 天气瓦片 API 与坐标工具。
+ *
+ * 提供标准 Web Mercator z/x/y 瓦片请求和坐标转换，供 weather-tile-manager 使用。
+ */
+import type { Map as MaplibreMap } from 'maplibre-gl'
+import type { WindGeoJSON } from '../types/map-geo'
+import { resolveVisibleLngBounds } from '../utils/map-viewport'
+import { applyApiFetchDefaults } from './http-credentials'
+import { resolveApiUrl, submitWorkflow } from './runtime-api'
+import type { WorkflowSubmitRequest } from './runtime-api'
+
+export interface WeatherTileCoords {
+  z: number
+  x: number
+  y: number
+}
+
+export interface LngLatBounds {
+  west: number
+  south: number
+  east: number
+  north: number
+}
+
+export interface FetchWeatherTileOptions {
+  hour?: number
+  model?: string
+  /** Weather provider id; omit or 'auto' for registry priority */
+  provider?: string
+  signal?: AbortSignal
+  /** 客户端缓存 bust 参数，不参与业务 */
+  t?: number
+}
+
+const _WEB_MERCATOR_MAX_LAT = 85.0511287798066
+/** 瓦片缓存 key 统一前缀；nearby-z 扫描等处需用它拼完整前缀做归属判断 */
+export const TILE_KEY_PREFIX = 'weather:tile:'
+
+/**
+ * 将 HTTP 错误响应体压成短文案。
+ * Cloudflare / 反向代理 502 常返回整页 HTML；若原样拼进 Error.message，
+ * 地图错误横幅会铺满黄字 HTML，看起来像「中间浮了一块黑底地球展开图」。
+ */
+export function summarizeHttpErrorDetail(status: number, body: string, maxLen = 160): string {
+  const trimmed = (body || '').trim()
+  if (!trimmed) return `HTTP ${status}`
+  const looksHtml =
+    /<!DOCTYPE\s+html|<html[\s>]|<head[\s>]|<body[\s>]/i.test(trimmed) || trimmed.startsWith('<')
+  if (looksHtml) {
+    const titleMatch = /<title[^>]*>([^<]+)<\/title>/i.exec(trimmed)
+    const title = titleMatch?.[1]?.replace(/\s+/g, ' ').trim()
+    if (title) {
+      const short = title.length > 80 ? `${title.slice(0, 80)}…` : title
+      return `HTTP ${status}: ${short}`
+    }
+    if (status === 502) return 'HTTP 502: Bad gateway'
+    if (status === 504) return 'HTTP 504: Gateway timeout'
+    return `HTTP ${status}: 上游网关错误`
+  }
+  const oneLine = trimmed.replace(/\s+/g, ' ')
+  return oneLine.length > maxLen ? `${oneLine.slice(0, maxLen)}…` : oneLine
+}
+
+function normalizeProviderPart(provider?: string): string {
+  const p = (provider ?? 'auto').trim()
+  if (!p || p.toLowerCase() === 'default') return 'auto'
+  return p.replace(/\//g, '_').replace(/:/g, '_')
+}
+
+/** 与后端 tile_key 对齐的前端缓存键（含 model + provider，避免换源脏缓存）。 */
+export function buildTileKey(
+  layerId: string,
+  z: number,
+  x: number,
+  y: number,
+  hour: number,
+  model = 'ecmwf_ifs025',
+  provider = 'auto',
+): string {
+  const modelPart = model.replace(/\//g, '_').replace(/:/g, '_')
+  const providerPart = normalizeProviderPart(provider)
+  return `${TILE_KEY_PREFIX}${layerId}:z${z}:x${x}:y${y}:h${hour}:m${modelPart}:p${providerPart}`
+}
+
+/** 标准 Web Mercator：经纬度 → z/x/y 瓦片坐标。 */
+export function lngLatToTile(lng: number, lat: number, z: number): WeatherTileCoords {
+  const n = 2 ** z
+  // 先折进 [-180,180]，避免未 wrap 的 center/lon 把 x 钳到 n-1 造成日界线偏一侧
+  let lon = lng
+  while (lon > 180) lon -= 360
+  while (lon < -180) lon += 360
+  const x = Math.floor(((lon + 180) / 360) * n)
+  // 纬度 clamp 到 Web Mercator 有效范围
+  const clampedLat = Math.max(-_WEB_MERCATOR_MAX_LAT, Math.min(_WEB_MERCATOR_MAX_LAT, lat))
+  const latRad = (clampedLat * Math.PI) / 180
+  const y = Math.floor(((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n)
+  return {
+    z,
+    x: Math.max(0, Math.min(n - 1, x)),
+    y: Math.max(0, Math.min(n - 1, y)),
+  }
+}
+
+/**
+ * 视口瓦片按距地图中心从近到远排序（同 priority 时 sequence 决定调度顺序）。
+ * 缩放后先拉中心瓦片，避免边缘先到、父级 underlay 被裁掉后出现「中间空洞」。
+ * 跨日界线时对 x 取环形最短距离（模 n）。
+ */
+export function sortTilesCenterFirst(
+  tiles: readonly WeatherTileCoords[],
+  centerLng: number,
+  centerLat: number,
+): WeatherTileCoords[] {
+  if (tiles.length <= 1) return tiles.slice()
+  const z = tiles[0]!.z
+  const n = 2 ** z
+  const center = lngLatToTile(centerLng, centerLat, z)
+  const dist2 = (t: WeatherTileCoords): number => {
+    let dx = Math.abs(t.x - center.x)
+    if (dx > n / 2) dx = n - dx
+    const dy = t.y - center.y
+    return dx * dx + dy * dy
+  }
+  return tiles.slice().sort((a, b) => dist2(a) - dist2(b) || a.x - b.x || a.y - b.y)
+}
+
+/** 标准 Web Mercator：瓦片 z/x/y → EPSG:4326 bbox。 */
+export function tileToLngLatBounds(z: number, x: number, y: number): LngLatBounds {
+  const n = 2 ** z
+  const west = (x / n) * 360 - 180
+  const east = ((x + 1) / n) * 360 - 180
+
+  function tileYToLat(yTile: number): number {
+    const latRad = Math.atan(Math.sinh(Math.PI * (1 - (2 * yTile) / n)))
+    return (latRad * 180) / Math.PI
+  }
+
+  const north = tileYToLat(y)
+  const south = tileYToLat(y + 1)
+  return { west, south, east, north }
+}
+
+/**
+ * 获取指定经纬度边界内的所有瓦片坐标。
+ *
+ * 反子午线 / 宽视口约定（与 ``normalizeLngBounds`` 对齐）：
+ * - ``east >= west``：按从 west 向东到 east 的路径枚举（east 可 >180，如 170→185）
+ * - ``east < west``：旧式「未展开」跨日界线形式，将 east += 360
+ * - 跨度 >= 360°：退化为全球 [-180, 180]
+ *
+ * **禁止**在 ``east - west > 180`` 时改走短路径：亚洲–太平洋等宽视口
+ *（如 west=-20, east=200）是合法长路径；旧逻辑会错取美洲一侧，
+ * 表现为「屏幕两侧有瓦片、亚洲中部整片空白」。
+ *
+ * @param buffer 视口外扩圈数（0 = 仅边界内，1 = 外扩一圈）
+ * @returns 主世界瓦片坐标集合（经度已归一化到 [0, n)）
+ */
+export function tilesInBounds(bounds: LngLatBounds, z: number, buffer = 0): WeatherTileCoords[] {
+  const clampedZ = Math.max(0, Math.min(12, Math.round(z)))
+  const n = 2 ** clampedZ
+
+  let westLng = bounds.west
+  let eastLng = bounds.east
+  // 旧式未展开跨日界线：east < west（如 west=170, east=-175）
+  if (eastLng < westLng) {
+    eastLng += 360
+  }
+  // 全屏 / 异常超大跨度
+  if (eastLng - westLng >= 360) {
+    westLng = -180
+    eastLng = 180
+  }
+
+  // 手动计算瓦片 x 坐标（不 clamp，允许 > n 以处理穿越后的回绕）
+  const westTileX = Math.floor(((westLng + 180) / 360) * n)
+  const eastTileX = Math.floor(((eastLng + 180) / 360) * n)
+
+  // y 坐标使用 lngLatToTile 确保 Web Mercator 投影正确
+  const southTileY = lngLatToTile(0, bounds.south, clampedZ).y
+  const northTileY = lngLatToTile(0, bounds.north, clampedZ).y
+
+  const minX = Math.min(westTileX, eastTileX) - buffer
+  const maxX = Math.max(westTileX, eastTileX) + buffer
+  const minY = Math.min(southTileY, northTileY) - buffer
+  const maxY = Math.max(southTileY, northTileY) + buffer
+
+  const seen = new Set<string>()
+  const tiles: WeatherTileCoords[] = []
+
+  for (let x = minX; x <= maxX; x += 1) {
+    // 归一化到主世界 [0, n)
+    const normalizedX = ((x % n) + n) % n
+    for (let y = minY; y <= maxY; y += 1) {
+      if (y < 0 || y >= n) continue
+      const key = `${clampedZ}:${normalizedX}:${y}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      tiles.push({ z: clampedZ, x: normalizedX, y })
+    }
+  }
+
+  return tiles
+}
+
+/**
+ * 获取当前视口内的所有瓦片坐标。
+ *
+ * @param buffer 视口外扩圈数（0 = 仅视口内，1 = 外扩一圈）
+ * @returns 主世界瓦片坐标集合（经度已归一化到 [0, n)）
+ */
+export function tilesInViewport(map: MaplibreMap, buffer = 0): WeatherTileCoords[] {
+  const z = Math.max(0, Math.min(12, Math.round(map.getZoom())))
+  const bounds = map.getBounds()
+  const { west, east } = resolveVisibleLngBounds(map)
+  return tilesInBounds(
+    {
+      west,
+      south: bounds.getSouth(),
+      east,
+      north: bounds.getNorth(),
+    },
+    z,
+    buffer,
+  )
+}
+
+export interface SubmitWeatherTileWorkflowOptions {
+  hour?: number
+  model?: string
+  signal?: AbortSignal
+}
+
+/**
+ * 提交单个天气瓦片的 workflow 渲染任务。
+ * 仅用于显式扩展 DAG / 调试；视口热路径请使用 fetchWeatherTile。
+ * 显式 tile workflow 计入后端 weather_tile 容量池（max_active_weather_tile_runs）。
+ */
+export async function submitWeatherTileWorkflow(
+  layerId: string,
+  z: number,
+  x: number,
+  y: number,
+  options: SubmitWeatherTileWorkflowOptions = {},
+): Promise<{ runId: string }> {
+  const workflowId = `weather-tile-${layerId}-z${z}-x${x}-y${y}-h${options.hour ?? 0}`
+  const payload: WorkflowSubmitRequest = {
+    command_type: 'analysis',
+    layer_id: layerId,
+    priority: 'normal',
+    resource_profile: 'standard',
+    realtime_preferred: false,
+    requested_outputs: ['json'],
+    parameters: { hour: options.hour ?? 0 },
+    weather_request: {
+      workflow_id: workflowId,
+      workflow: {
+        workflow_id: workflowId,
+        nodes: [
+          {
+            node_id: 'tile-render',
+            node_type: 'weather_tile_render',
+            params: {
+              layer_id: layerId,
+              z,
+              x,
+              y,
+              hour: options.hour ?? 0,
+              model: options.model,
+            },
+          },
+        ],
+        edges: [],
+      },
+    },
+  }
+  const resp = await submitWorkflow(payload)
+  return { runId: resp.run_id }
+}
+
+/**
+ * 天气瓦片请求超时（毫秒）。
+ * 后端热路径可能经历：tile 信号量排队 + API 槽位等待(≤30s) + urlopen(≤30s) + 429 退避，
+ * 25s 前端中止会误判为永久失败并清空图层；放宽到 75s 与后端最坏排队对齐。
+ */
+const TILE_FETCH_TIMEOUT_MS = 75_000
+
+/**
+ * 视口热路径：直接请求 GET /weather/tiles/{layer}/{z}/{x}/{y}。
+ * 由 WeatherTileService 负责缓存与网格生成；不占用 workflow-runs 业务容量池。
+ *
+ * 内置超时，避免后端排队或 Open-Meteo API 慢时前端并发槽位被无限占用。
+ * 超时抛出 Error（message 含 "timeout"），与外部 AbortSignal 取消区分。
+ */
+export async function fetchWeatherTile(
+  layerId: string,
+  z: number,
+  x: number,
+  y: number,
+  options: FetchWeatherTileOptions = {},
+): Promise<WindGeoJSON> {
+  const search = new URLSearchParams()
+  if (typeof options.hour === 'number') search.set('hour', String(options.hour))
+  if (options.model) search.set('model', options.model)
+  if (options.provider && options.provider !== 'auto') search.set('provider', options.provider)
+  if (typeof options.t === 'number') search.set('t', String(options.t))
+
+  const suffix = search.toString() ? `?${search.toString()}` : ''
+  const url = resolveApiUrl(`/weather/tiles/${layerId}/${z}/${x}/${y}${suffix}`)
+
+  // 组合外部 signal 和超时 signal，任一触发都会 abort fetch
+  const timeoutController = new AbortController()
+  const timeoutId = setTimeout(() => timeoutController.abort(), TILE_FETCH_TIMEOUT_MS)
+  const externalSignal = options.signal
+
+  // 外部 abort 传播到 timeoutController，保持错误类型一致
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      clearTimeout(timeoutId)
+      timeoutController.abort(externalSignal.reason)
+    } else {
+      externalSignal.addEventListener(
+        'abort',
+        () => timeoutController.abort(externalSignal.reason),
+        { once: true },
+      )
+    }
+  }
+
+  try {
+    const response = await fetch(url, applyApiFetchDefaults({ signal: timeoutController.signal }))
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '')
+      const summary = summarizeHttpErrorDetail(response.status, detail)
+      throw new Error(`Weather tile request failed: ${response.status} ${url} - ${summary}`)
+    }
+
+    return (await response.json()) as WindGeoJSON
+  } catch (err) {
+    // 区分超时和外部取消：超时时 externalSignal 未 abort，但 timeoutController 已 abort
+    if (err instanceof DOMException && err.name === 'AbortError' && !externalSignal?.aborted) {
+      throw new Error(
+        `Weather tile request timeout after ${TILE_FETCH_TIMEOUT_MS / 1000}s: ${url}`,
+        { cause: err },
+      )
+    }
+    throw err
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}

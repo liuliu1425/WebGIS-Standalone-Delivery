@@ -1,0 +1,789 @@
+"""Python provider bridge service: algorithm workflow bridge protocol.
+
+Historically a ~789-line god class mixing orchestration, metadata API,
+request payload building, result ref construction, and validation
+diagnostics. Split (Phase 2 of the architecture review) keeps this file
+as the bridge protocol surface (``execute`` / ``supports`` / metadata
+API methods / job service loading) and delegates pre-submit and
+post-submit concerns to two focused modules:
+
+- :mod:`python_provider_request_builder` — :meth:`build_job_request_payload`,
+  :meth:`validate_algorithm_request_shape`,
+  :meth:`build_validation_error_message`,
+  :meth:`normalize_algorithm_request`.
+- :mod:`python_provider_result_builder` — :meth:`build_result_refs`,
+  artifact ref construction, URI → local path resolution.
+
+The bridge service owns: stub interception (``_PENDING_IMPLEMENTATION_MODULES``),
+job service loading (``_get_job_service`` / ``_load_python_job_service``),
+submit/validate dispatch, event/diagnostics assembly, and the metadata
+API (list/describe/panel-schema/ui-schema/diagnostics).
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from datetime import datetime
+from functools import lru_cache
+import importlib
+import logging
+import os
+from pathlib import Path
+import sys
+import threading
+from typing import Any
+from collections.abc import Iterator
+
+from app.core.config import settings
+from app.services.python_provider_request_builder import (
+    ALGORITHM_REQUEST_ENTRY_KEYS,
+    PythonProviderRequestBuilder,
+    python_provider_request_builder,
+)
+from app.services.python_provider_result_builder import (
+    PythonProviderResultBuilder,
+    as_dict,
+    python_provider_result_builder,
+)
+from app.services.workflow_execution import WorkflowExecutionResult
+from app.services.workflow_request_resolver import describe_python_provider_resolution
+from shared.contracts.api_contracts import WorkflowSubmitRequest
+
+logger = logging.getLogger(__name__)
+
+# 已在节点模板中注册但尚未实现算法的模块。
+# 这些模块的 workflow 提交后会返回 pending_implementation 状态，而非调用 provider。
+# 2026-08 stub 完善：预处理 / 统计 / 融合 / 可视化 / GIS 基础已落地，集合清空。
+_PENDING_IMPLEMENTATION_MODULES: frozenset[str] = frozenset()
+
+
+@contextmanager
+def _python_provider_import_path(provider_root: Path) -> Iterator[None]:
+    """Ensure the in-process Python provider root is importable.
+
+    The path is left on ``sys.path`` after the context exits. Algorithm modules
+    lazily import top-level provider modules such as ``_backend_bridge`` during
+    ``execute()`` (portal credentials, remote storage). Removing the path here
+    undoes ``modules.registry``'s permanent insert and yields
+    ``ModuleNotFoundError: No module named '_backend_bridge'`` mid-run.
+    """
+    provider_path = str(provider_root)
+    if provider_path not in sys.path:
+        sys.path.insert(0, provider_path)
+    yield
+
+
+# ─── 线程局部事件转发上下文 ───────────────────────────────────────────────────
+# D2+D3 修复：算法模块通过 ctx.logger_adapter.emit_progress() 发送进度，
+# 但 ConsoleLoggerAdapter 只打印到 stdout。此处通过线程局部上下文将
+# bridge service 的 event_factory 注入到 LoggerAdapter 中，实现实时
+# node_progress 事件转发到前端。
+
+_thread_local = threading.local()
+
+
+def _set_event_context(event_factory: Any | None, run_id: str | None = None) -> None:
+    """设置当前线程的事件转发上下文。"""
+    _thread_local.event_factory = event_factory
+    _thread_local.run_id = run_id
+
+
+def _clear_event_context() -> None:
+    """清除当前线程的事件转发上下文。"""
+    _thread_local.event_factory = None
+    _thread_local.run_id = None
+
+
+_STAGE_PHASE_CACHE: dict[str, str | None] = {}
+
+
+def _declared_module_phase(stage: str) -> str | None:
+    """读模块 registry 的 phase 声明（stage 名即模块名/别名时命中）。
+
+    声明缺失、stage 为子步骤名或 provider 不可导入时返回 None，
+    由 substring 匹配兜底。同一 stage 只查询一次 registry。
+    """
+    if not stage:
+        return None
+    if stage in _STAGE_PHASE_CACHE:
+        return _STAGE_PHASE_CACHE[stage]
+    phase: str | None = None
+    try:
+        with _python_provider_import_path(Path(settings.python_provider_root)):
+            registry = importlib.import_module("modules.registry")
+            phase = registry.get_module_phase(stage)
+    except Exception:  # noqa: BLE001
+        phase = None
+    _STAGE_PHASE_CACHE[stage] = phase
+    return phase
+
+
+def _classify_stage(stage: str) -> str:
+    """将算法 stage 名称映射为前端阶段分类。
+
+    优先读模块 phase 声明（N4 声明化）；未声明或未注册的 stage
+    回退 substring 匹配（历史行为）。
+    """
+    declared = _declared_module_phase(stage)
+    if declared:
+        return declared
+    stage_lower = stage.lower()
+    if any(k in stage_lower for k in ("ssh_sync", "nsidc", "download", "sync")):
+        return "download"
+    if any(k in stage_lower for k in ("fy_preprocess", "preprocess", "geolocation")):
+        return "preprocess"
+    if any(
+        k in stage_lower
+        for k in ("omega_sf", "inversion", "sf_invert", "ddca", "block")
+    ):
+        return "inversion"
+    if any(k in stage_lower for k in ("output", "export", "write")):
+        return "output"
+    return "processing"
+
+
+class _EventForwardingLoggerAdapter:
+    """包装 ConsoleLoggerAdapter，同时将 emit_* 调用转发为 node_progress 事件。
+
+    当线程局部上下文中存在 event_factory 时，将 stage/progress/message
+    转发为前端可解析的 node_progress 事件；否则退化为纯控制台输出。
+    """
+
+    def __init__(self) -> None:
+        with _python_provider_import_path(Path(settings.python_provider_root)):
+            local_adapters = importlib.import_module("utils.local_adapters")
+            self._console = local_adapters.ConsoleLoggerAdapter()
+
+    def bind_context(self, job_id: str, run_id: str) -> None:
+        self._console.bind_context(job_id, run_id)
+
+    def emit_stage_start(self, stage: str, message: str) -> None:
+        self._console.emit_stage_start(stage, message)
+        self._forward(
+            stage,
+            0,
+            message,
+            ui_surface="operational",
+            channel="system",
+            operational_message=f"[{stage}] 开始 · {message}",
+        )
+
+    def emit_progress(
+        self,
+        stage: str,
+        progress: float,
+        message: str,
+        detail: dict | None = None,
+    ) -> None:
+        try:
+            self._console.emit_progress(stage, progress, message, detail=detail)
+        except TypeError:
+            self._console.emit_progress(stage, progress, message)
+        pct = round(progress * 100) if 0.0 <= progress <= 1.0 else round(progress)
+        self._forward(
+            stage,
+            pct,
+            message,
+            detail=detail,
+            ui_surface="node_progress",
+            channel="log",
+        )
+
+    def emit_warning(self, stage: str, message: str, extra: dict | None = None) -> None:
+        self._console.emit_warning(stage, message, extra=extra)
+        self._forward(
+            stage,
+            -1,
+            message,
+            level="warning",
+            detail=extra,
+            ui_surface="operational",
+            channel="log",
+            component="module",
+        )
+
+    def emit_error(self, stage: str, message: str, extra: dict | None = None) -> None:
+        self._console.emit_error(stage, message, extra=extra)
+        enriched = dict(extra or {})
+        enriched.setdefault("component", "module")
+        enriched.setdefault("module_name", stage)
+        self._forward(
+            stage,
+            -1,
+            message,
+            level="error",
+            detail=enriched,
+            ui_surface="operational",
+            channel="log",
+        )
+
+    def emit_artifact(self, stage: str, artifact_uri: str, artifact_type: str) -> None:
+        self._console.emit_artifact(stage, artifact_uri, artifact_type)
+        self._forward(
+            stage,
+            -1,
+            f"Artifact ready: {artifact_type}",
+            detail={
+                "artifact_uri": artifact_uri,
+                "artifact_type": artifact_type,
+                "product_tag": artifact_type,
+                "phase": "artifact",
+            },
+            ui_surface="operational",
+            channel="notification",
+        )
+
+    def emit_stage_end(self, stage: str, message: str) -> None:
+        self._console.emit_stage_end(stage, message)
+        # 节点进度条：stage_end 必须落 100%（operational 事件不含 node_progress）
+        self._forward(
+            stage,
+            100,
+            message,
+            ui_surface="node_progress",
+            channel="log",
+        )
+        self._forward(
+            stage,
+            100,
+            message,
+            ui_surface="operational",
+            channel="system",
+            operational_message=f"[{stage}] 完成 · {message}",
+        )
+
+    def _forward(
+        self,
+        stage: str,
+        progress: int,
+        message: str,
+        level: str = "info",
+        detail: dict | None = None,
+        *,
+        ui_surface: str = "node_progress",
+        channel: str = "log",
+        operational_message: str | None = None,
+        component: str | None = None,
+    ) -> None:
+        event_factory = getattr(_thread_local, "event_factory", None)
+        if event_factory is None:
+            return
+        try:
+            from shared.contracts.api_contracts import EventChannel, LogLevel
+
+            clamped = max(0, min(100, progress)) if progress >= 0 else -1
+            enriched = dict(detail or {})
+            graph_node_id = enriched.pop("graph_node_id", None)
+            node_id = (
+                f"{graph_node_id}:{stage}"
+                if graph_node_id and not str(stage).startswith("workflow.")
+                else stage
+            )
+            payload: dict[str, object] = {
+                "ui_surface": ui_surface,
+                "graph_node_id": graph_node_id,
+                "module_name": stage,
+            }
+            if component:
+                payload["component"] = component
+            node_progress: dict[str, object] = {
+                "node_id": node_id,
+                "node_label": stage,
+                "stage": _classify_stage(stage),
+                "progress": clamped,
+                "message": message,
+                "level": level,
+            }
+            if enriched:
+                if "module_name" not in enriched:
+                    enriched["module_name"] = stage
+                node_progress["detail"] = enriched
+            # stage_start/end 也须带 node_progress，否则快完成节点条卡在 0%。
+            # ui_surface 只控制「运行记录」是否收录文案，不控制节点条更新。
+            if clamped >= 0 or ui_surface == "node_progress":
+                payload["node_progress"] = node_progress
+            event_message = operational_message if operational_message else message
+            if ui_surface == "node_progress" and not operational_message:
+                event_message = message
+            resolved_channel = (
+                channel if isinstance(channel, EventChannel) else EventChannel(channel)
+            )
+            resolved_level = level if isinstance(level, LogLevel) else LogLevel(level)
+            event_factory(
+                channel=resolved_channel,
+                message=event_message,
+                progress=clamped if clamped >= 0 else None,
+                level=resolved_level,
+                payload=payload,
+            )
+        except Exception:
+            logger.debug("Failed to forward node_progress event", exc_info=True)
+
+
+@lru_cache(maxsize=1)
+def _load_python_job_service():
+    """M7 修复：与其他 bridge 一致，使用无参 lru_cache 单例。
+
+    D2+D3 修复：加载后覆盖 logger_adapter_factory 为 _EventForwardingLoggerAdapter，
+    使算法执行期间的 emit_progress/emit_stage_start 等调用能通过线程局部上下文
+    转发为前端可解析的 node_progress 事件。
+    """
+    provider_root = Path(settings.python_provider_root)
+    workspace = Path(settings.python_provider_workspace)
+    workspace.mkdir(parents=True, exist_ok=True)
+    with _python_provider_import_path(provider_root):
+        job_api_module = importlib.import_module("service.job_api")
+        build_local_persistent_job_service = getattr(
+            job_api_module, "build_local_persistent_job_service"
+        )
+        service = build_local_persistent_job_service(
+            workspace=workspace, start_worker=False
+        )
+        # Eager-load boundary bridge so mid-run lazy imports resolve even if a
+        # future change reintroduces temporary sys.path scoping.
+        importlib.import_module("_backend_bridge")
+    # 覆盖 logger_adapter_factory：用事件转发适配器替代纯控制台适配器
+    service._logger_adapter_factory = _EventForwardingLoggerAdapter
+    return service
+
+
+class PythonProviderBridgeService:
+    """Bridge protocol entry point for Python algorithm workflow layers.
+
+    Delegates request building to :class:`PythonProviderRequestBuilder`
+    and result building to :class:`PythonProviderResultBuilder`; this
+    class owns stub interception, job service loading, submit/validate
+    dispatch, and the metadata API.
+    """
+
+    def __init__(
+        self,
+        *,
+        request_builder: PythonProviderRequestBuilder | None = None,
+        result_builder: PythonProviderResultBuilder | None = None,
+    ) -> None:
+        # Injected to allow tests to swap builders; defaults to the
+        # module-level singletons to preserve original behaviour.
+        self._request_builder = request_builder or python_provider_request_builder
+        self._result_builder = result_builder or python_provider_result_builder
+
+    # ------------------------------------------------------------------
+    # Bridge protocol: supports / execute
+    # ------------------------------------------------------------------
+
+    def supports(self, payload: WorkflowSubmitRequest) -> bool:
+        # M8 修复：与其他 bridge 对齐 enabled flag 检查
+        if not settings.python_provider_enabled:
+            return False
+        algorithm_request = self._request_builder.normalize_algorithm_request(
+            payload.algorithm_request
+        )
+        return any(key in algorithm_request for key in ALGORITHM_REQUEST_ENTRY_KEYS)
+
+    def execute(
+        self,
+        *,
+        run_id: str,
+        payload: WorkflowSubmitRequest,
+        requested_at: datetime,
+        event_factory,
+    ) -> WorkflowExecutionResult:
+        # Stub 拦截：尚未实现的模块返回 pending_implementation 状态，不调用 provider
+        algorithm_request = self._request_builder.normalize_algorithm_request(
+            payload.algorithm_request
+        )
+        module_name = (
+            algorithm_request.get("module_name")
+            or algorithm_request.get("workflow_name")
+            or ""
+        )
+        if module_name in _PENDING_IMPLEMENTATION_MODULES:
+            return self._build_pending_implementation_result(
+                run_id=run_id,
+                module_name=module_name,
+                requested_at=requested_at,
+                event_factory=event_factory,
+            )
+
+        request_payload = self._request_builder.build_job_request_payload(
+            run_id=run_id, payload=payload
+        )
+        service = self._get_job_service()
+
+        # Provider 标准契约模板修复：在 submit_job 前调用 validate_job 做语义校验
+        # 修复前：只做 _validate_algorithm_request_shape 结构校验，语义错误要到 run_job 深处才暴露
+        # 修复后：调用 provider manifest 的 validate_job_response 提前发现参数错误
+        validation_response = service.validate_job_response(request_payload)
+        if validation_response.status_code == 200:
+            validation_body = dict(validation_response.body)
+            if not validation_body.get("is_valid", True):
+                errors = validation_body.get("errors", [])
+                resolution_diagnostics = describe_python_provider_resolution(payload)
+                from app.services.bridge_protocol import BridgeExecutionError
+                from shared.contracts.api_contracts import FailureCategory
+
+                raise BridgeExecutionError(
+                    category=FailureCategory.validation_error,
+                    message=self._request_builder.build_validation_error_message(
+                        errors=errors,
+                        resolution_diagnostics=resolution_diagnostics,
+                    ),
+                    details={
+                        "validation_errors": errors,
+                        "validation_template": validation_body.get("template"),
+                        "resolution_diagnostics": resolution_diagnostics,
+                    },
+                )
+
+        # 注入并发配置到当前进程 env，供算法包 _parallel.auto_process_count 与
+        # dispatch.WorkflowRunner 读取。热更新：每次 execute 读最新 effective_config
+        # （前端 PATCH 后下次算法执行立即生效）。CGDA_MAX_PARALLEL_WORKERS=0/删除=自动。
+        try:
+            from app.services.effective_config import (
+                get_algorithm_max_parallel_workers,
+                get_workflow_node_parallelism,
+            )
+
+            _ampw = get_algorithm_max_parallel_workers()
+            if _ampw > 0:
+                os.environ["CGDA_MAX_PARALLEL_WORKERS"] = str(_ampw)
+            else:
+                os.environ.pop("CGDA_MAX_PARALLEL_WORKERS", None)
+            os.environ["CGDA_WORKFLOW_NODE_PARALLELISM"] = str(
+                get_workflow_node_parallelism()
+            )
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "Failed to apply concurrency env from effective_config", exc_info=True
+            )
+
+        # D2+D3 修复：设置线程局部事件上下文，使 _EventForwardingLoggerAdapter
+        # 能在算法执行期间将 emit_progress/emit_stage_start 等调用转发为
+        # 前端可解析的 node_progress 事件。
+        _set_event_context(event_factory, run_id)
+        try:
+            from app.services.bridge_protocol import BridgeExecutionError
+            from app.services.failure_classifier import FailureClassifier
+            from shared.contracts.api_contracts import FailureCategory
+
+            try:
+                response = service.submit_job(request_payload)
+            except BridgeExecutionError:
+                raise
+            except Exception as exc:
+                # Stub/GIS 校验与 IO 异常 → FailureCategory，供 lifecycle 决定是否重试
+                category = FailureClassifier.classify(exc)
+                details: dict[str, object] = {
+                    "exception_type": type(exc).__name__,
+                    "module_name": module_name,
+                }
+                if category == FailureCategory.terminal_failure and isinstance(
+                    exc, (MemoryError, OSError)
+                ):
+                    details["hint"] = (
+                        "Reduce resolution, clip extent, or free disk/memory"
+                    )
+                raise BridgeExecutionError(
+                    category=category,
+                    message=str(exc) or type(exc).__name__,
+                    cause=exc,
+                    details=details,
+                ) from exc
+        finally:
+            _clear_event_context()
+        response_body = dict(response.body)
+        if response.status_code >= 400:
+            developer_message = str(
+                response_body.get("developer_message")
+                or response_body.get("user_message")
+                or "Python provider job service returned an error."
+            )
+            # 失败分类：优先按响应文案判定缺数/校验等终态，避免「本地无文件」
+            # 被 job HTTP 500 一律打成 transient_upstream → hub 空转重试 3 次、
+            # 前端永远等不到 coverage_gap 恢复卡 / 计划框。
+            from app.services.bridge_protocol import BridgeExecutionError
+            from app.services.failure_classifier import FailureClassifier
+            from shared.contracts.api_contracts import FailureCategory
+
+            msg_category = FailureClassifier.classify(RuntimeError(developer_message))
+            if msg_category in (
+                FailureCategory.coverage_gap,
+                FailureCategory.not_found,
+                FailureCategory.validation_error,
+                FailureCategory.permission_denied,
+                FailureCategory.contract_violation,
+            ):
+                category = msg_category
+            else:
+                category = FailureClassifier._classify_http_status(response.status_code)
+            raise BridgeExecutionError(
+                category=category,
+                message=developer_message,
+                details={
+                    "status_code": response.status_code,
+                    "response_body": response_body,
+                },
+            ) from None
+
+        job_result = as_dict(response_body.get("job_result"))
+        result_dto = as_dict(response_body.get("result_dto"))
+        result_refs = self._result_builder.build_result_refs(
+            run_id=run_id,
+            payload=payload,
+            requested_at=requested_at,
+            request_payload=request_payload,
+            job_result=job_result,
+            result_dto=result_dto,
+        )
+        # 协议统一修复：优先使用调用方透传的 workflow_entry_name，避免信息损失
+        # 仅当调用方未设置时，才回退到 workflow_name/module_name/"workflow_definition" 重算
+        entry_name = (
+            request_payload.get("workflow_entry_name")
+            or request_payload.get("workflow_name")
+            or request_payload.get("module_name")
+            or "workflow_definition"
+        )
+        result_dto["workflow_entry_name"] = entry_name
+        events = [
+            event_factory(
+                channel="log",
+                message="Python 算法任务已完成执行。",
+                progress=74,
+                payload={
+                    "job_id": job_result.get("job_id"),
+                    "run_id": job_result.get("run_id"),
+                    "entry_name": entry_name,
+                    "job_status": job_result.get("status"),
+                },
+            ),
+            event_factory(
+                channel="data",
+                message="算法 result_dto 已映射为 workflow 结果引用。",
+                progress=95,
+                payload={
+                    "result_count": len(result_refs),
+                    "manifest_loaded": bool(result_dto.get("manifest_loaded")),
+                    "product_count": len(result_dto.get("products") or []),
+                    "entry_name": entry_name,
+                },
+            ),
+        ]
+        diagnostics = [
+            "python_provider_bridge_service 已接入 workflow-runs 主链。",
+            f"python_provider_root={settings.python_provider_root}",
+            f"python_provider_workspace={settings.python_provider_workspace}",
+            f"job_id={job_result.get('job_id')}",
+            f"algorithm_status={job_result.get('status')}",
+            f"entry_name={entry_name}",
+            f"manifest_loaded={bool(result_dto.get('manifest_loaded'))}",
+            f"product_count={len(result_dto.get('products') or [])}",
+        ]
+        manifest_summary = as_dict(result_dto.get("manifest_summary"))
+        if manifest_summary:
+            diagnostics.extend(
+                [
+                    f"manifest_product_count={manifest_summary.get('product_count', 0)}",
+                    f"conversion_trace_dataset_count={manifest_summary.get('conversion_trace_dataset_count', 0)}",
+                    f"conversion_trace_resource_count={manifest_summary.get('conversion_trace_resource_count', 0)}",
+                ]
+            )
+
+        return WorkflowExecutionResult(
+            message=(
+                f"Python 算法任务 {entry_name} 执行完成，"
+                f"已生成 {len(result_refs)} 个结果引用。"
+            ),
+            result_refs=result_refs,
+            result_dto={
+                "workflow_entry_name": entry_name,
+                "run_id": run_id,
+                "engine_run_id": job_result.get("run_id"),
+                "job_id": job_result.get("job_id"),
+                "job_status": job_result.get("status"),
+                "manifest_loaded": bool(result_dto.get("manifest_loaded")),
+                "manifest_summary": manifest_summary,
+                "products": result_dto.get("products") or [],
+                "main_layers": result_dto.get("main_layers") or [],
+                "qc_layers": result_dto.get("qc_layers") or [],
+                "tables": result_dto.get("tables") or [],
+                "extra": result_dto.get("extra") or {},
+                "artifacts": result_dto.get("artifacts") or {},
+            },
+            diagnostics=diagnostics,
+            events=events,
+        )
+
+    # ------------------------------------------------------------------
+    # Stub interception
+    # ------------------------------------------------------------------
+
+    def _build_pending_implementation_result(
+        self,
+        *,
+        run_id: str,
+        module_name: str,
+        requested_at: datetime,
+        event_factory,
+    ) -> WorkflowExecutionResult:
+        """为尚未实现的模块返回 pending_implementation 状态结果。"""
+        message = f"模块 {module_name} 正在开发中，暂不可执行。"
+        return WorkflowExecutionResult(
+            message=message,
+            result_refs=[],
+            result_dto={
+                "workflow_entry_name": module_name,
+                "run_id": run_id,
+                "engine_run_id": None,
+                "job_id": None,
+                "job_status": "pending_implementation",
+                "manifest_loaded": False,
+                "manifest_summary": {},
+                "products": [],
+                "main_layers": [],
+                "qc_layers": [],
+                "tables": [],
+                "extra": {"pending_implementation": True, "module_name": module_name},
+                "artifacts": {},
+            },
+            diagnostics=[
+                f"module {module_name} is pending implementation",
+                f"run_id={run_id}",
+            ],
+            events=[
+                event_factory(
+                    channel="log",
+                    message=message,
+                    progress=100,
+                    payload={
+                        "module_name": module_name,
+                        "status": "pending_implementation",
+                        "run_id": run_id,
+                    },
+                ),
+            ],
+        )
+
+    # ------------------------------------------------------------------
+    # Metadata API (Bridge Protocol)
+    # ------------------------------------------------------------------
+
+    def list_workflows_response(self):
+        # m25 修复：归一化返回结构，确保包含 workflows/workflow_count/source 字段
+        response = self._get_job_service().list_workflows_response()
+        return self._normalize_list_response(response, source="python_provider")
+
+    def describe_workflow_response(self, workflow_name: str):
+        # m25 修复：归一化返回结构，确保包含 name/node_type/category/source 字段
+        response = self._get_job_service().describe_workflow_response(workflow_name)
+        return self._normalize_describe_response(
+            response, source="python_provider", workflow_name=workflow_name
+        )
+
+    @staticmethod
+    def _normalize_list_response(response: dict, *, source: str) -> dict:
+        """归一化 list_workflows_response 返回结构。"""
+        if not isinstance(response, dict) or "status_code" not in response:
+            return response  # 非 {status_code, body} 结构，原样返回
+        body = response.get("body") or {}
+        workflows = body.get("workflows") or body.get("items") or []
+        # 若 workflows 为 list[str]，转换为 list[dict]
+        normalized_workflows = []
+        for item in workflows:
+            if isinstance(item, str):
+                normalized_workflows.append(
+                    {
+                        "name": item,
+                        "node_type": item,
+                        "category": "algorithm",
+                    }
+                )
+            elif isinstance(item, dict):
+                if "name" not in item and "workflow_name" in item:
+                    item = {**item, "name": item["workflow_name"]}
+                if "node_type" not in item and "name" in item:
+                    item = {**item, "node_type": item["name"]}
+                if "category" not in item:
+                    item = {**item, "category": "algorithm"}
+                normalized_workflows.append(item)
+            else:
+                normalized_workflows.append(
+                    {"name": str(item), "node_type": str(item), "category": "algorithm"}
+                )
+        return {
+            "status_code": response.get("status_code", 200),
+            "body": {
+                "workflows": normalized_workflows,
+                "workflow_count": len(normalized_workflows),
+                "source": source,
+            },
+        }
+
+    @staticmethod
+    def _normalize_describe_response(
+        response: dict, *, source: str, workflow_name: str
+    ) -> dict:
+        """归一化 describe_workflow_response 返回结构。"""
+        if not isinstance(response, dict) or "status_code" not in response:
+            return response
+        body = response.get("body") or {}
+        if "name" not in body:
+            body = {**body, "name": workflow_name}
+        if "node_type" not in body:
+            body = {**body, "node_type": workflow_name}
+        if "category" not in body:
+            body = {**body, "category": "algorithm"}
+        if "source" not in body:
+            body = {**body, "source": source}
+        return {"status_code": response.get("status_code", 200), "body": body}
+
+    def get_workflow_panel_schema_response(self, workflow_name: str):
+        return self._get_job_service().get_workflow_panel_schema_response(workflow_name)
+
+    def get_workflow_ui_schema_response(self, workflow_name: str):
+        return self._get_job_service().get_workflow_ui_schema_response(workflow_name)
+
+    def get_diagnostics_response(self):
+        """返回 Python provider 诊断信息。"""
+        try:
+            from app.core.config import settings as app_settings
+
+            return {
+                "status_code": 200,
+                "body": {
+                    "source": "python_provider",
+                    "python_provider_enabled": app_settings.python_provider_enabled,
+                    "python_provider_root": app_settings.python_provider_root,
+                    "python_provider_workspace": app_settings.python_provider_workspace,
+                },
+            }
+        except Exception as exc:
+            return {
+                "status_code": 500,
+                "body": {
+                    "error_type": "internal_error",
+                    "error_code": "python_provider_diagnostics_failed",
+                    "user_message": "无法获取 Python provider 诊断信息。",
+                    "developer_message": str(exc),
+                },
+            }
+
+    # ------------------------------------------------------------------
+    # Job service loading
+    # ------------------------------------------------------------------
+
+    def _get_job_service(self):
+        provider_root = Path(settings.python_provider_root)
+        if not provider_root.exists():
+            raise RuntimeError(f"Python provider root does not exist: {provider_root}")
+        try:
+            return _load_python_job_service()
+        except Exception as exc:  # pragma: no cover - depends on runtime environment
+            logger.exception("Failed to initialize Python provider job service")
+            raise RuntimeError(
+                f"Failed to initialize Python provider job service: {exc}"
+            ) from exc
+
+
+# Module-level singleton preserved for backward compatibility with
+# ``from app.services.python_provider_bridge_service import python_provider_bridge_service``.
+python_provider_bridge_service = PythonProviderBridgeService()

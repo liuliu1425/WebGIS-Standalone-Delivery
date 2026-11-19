@@ -1,0 +1,160 @@
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from collections.abc import Iterable
+
+
+SMAP_DATE_PATTERN = re.compile(r"(\d{8})")
+
+
+@dataclass(frozen=True, slots=True)
+class SmapFieldSpec:
+    output_name: str
+    hdf5_path: str
+    min_valid: float | None = None
+    max_valid: float | None = None
+    invalid_fill: float = -9999.0
+    # SPL3SMP_E 9 km HDF5 原生即为 (1624, 3856)；勿默认转置。
+    # 旧默认 True 曾把日 .mat 写成 (3856, 1624)，与辅料网格错位。
+    transpose: bool = False
+
+
+SMAP_AM_FIELD_SPECS: tuple[SmapFieldSpec, ...] = (
+    SmapFieldSpec(
+        "TBh", "/Soil_Moisture_Retrieval_Data_AM/tb_h_corrected", max_valid=330.0
+    ),
+    SmapFieldSpec(
+        "TBv", "/Soil_Moisture_Retrieval_Data_AM/tb_v_corrected", max_valid=330.0
+    ),
+    SmapFieldSpec(
+        "Ts",
+        "/Soil_Moisture_Retrieval_Data_AM/surface_temperature",
+        min_valid=253.15,
+        max_valid=313.15,
+    ),
+    SmapFieldSpec(
+        "vwc",
+        "/Soil_Moisture_Retrieval_Data_AM/vegetation_water_content",
+        min_valid=0.0,
+        max_valid=30.0,
+    ),
+    SmapFieldSpec("IA", "/Soil_Moisture_Retrieval_Data_AM/boresight_incidence"),
+    SmapFieldSpec("sm_dca", "/Soil_Moisture_Retrieval_Data_AM/soil_moisture_dca"),
+    SmapFieldSpec("sm_scav", "/Soil_Moisture_Retrieval_Data_AM/soil_moisture_scav"),
+    SmapFieldSpec("vod_dca", "/Soil_Moisture_Retrieval_Data_AM/vegetation_opacity_dca"),
+    SmapFieldSpec(
+        "vod_sca", "/Soil_Moisture_Retrieval_Data_AM/vegetation_opacity_scav"
+    ),
+)
+
+
+def extract_date_from_smap_filename(file_path: str | Path) -> str:
+    match = SMAP_DATE_PATTERN.search(Path(file_path).name)
+    if match is None:
+        raise ValueError(f"Cannot parse date from SMAP filename: {file_path}")
+    return match.group(1)
+
+
+def _sanitize_array(data: Any, spec: SmapFieldSpec) -> Any:
+    import numpy as np
+
+    from data_access.ease_grid_constants import ensure_ease2_9km_shape
+    from data_access.numeric_sanitize import mask_common_fill_values, mask_value_range
+
+    result = np.array(data, dtype=np.float64, copy=True)
+    if spec.transpose:
+        result = result.T
+    # 无论是否手动 transpose，9 km 场最终必须落在 (1624, 3856)
+    result = ensure_ease2_9km_shape(result)
+    result = mask_common_fill_values(result)
+    # 保留字段专属 invalid_fill（可能不是常见哨兵列表中的值）
+    result[result == spec.invalid_fill] = np.nan
+    result = mask_value_range(
+        result, min_valid=spec.min_valid, max_valid=spec.max_valid
+    )
+    return result
+
+
+def read_smap_am_fields(
+    file_path: str | Path,
+    field_specs: Iterable[SmapFieldSpec] | None = None,
+) -> dict[str, Any]:
+    import h5py
+
+    specs = tuple(field_specs or SMAP_AM_FIELD_SPECS)
+    file_path = Path(file_path)
+    outputs: dict[str, Any] = {}
+    with h5py.File(file_path, "r") as h5_file:
+        for spec in specs:
+            raw = h5_file[spec.hdf5_path][()]
+            outputs[spec.output_name] = _sanitize_array(raw, spec)
+    return outputs
+
+
+def convert_smap_l3_file_to_mat(
+    file_path: str | Path,
+    output_dir: str | Path,
+    field_specs: Iterable[SmapFieldSpec] | None = None,
+) -> Path:
+    from scipy.io import savemat
+
+    file_path = Path(file_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    date_key = extract_date_from_smap_filename(file_path)
+    output_path = output_dir / f"{date_key}.mat"
+    outputs = read_smap_am_fields(file_path, field_specs=field_specs)
+    savemat(output_path, outputs, do_compression=True)
+    return output_path
+
+
+def convert_smap_l3_directory_to_mat(
+    input_dir: str | Path,
+    output_dir: str | Path,
+    pattern: str = "*.h5",
+    field_specs: Iterable[SmapFieldSpec] | None = None,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+) -> list[Path]:
+    input_dir = Path(input_dir)
+    files = sorted(input_dir.glob(pattern))
+    if start_time is not None or end_time is not None:
+        # 文件名解析出 naive datetime——调用方可能传 aware（如
+        # WorkflowSubmitRequest.time_range 自动转 ISO+UTC）：统一剥 tz
+        # 再比较，避免 naive/aware 混比 TypeError（2026-08-25 实测）。
+        _start = start_time.replace(tzinfo=None) if start_time is not None else None
+        _end = end_time.replace(tzinfo=None) if end_time is not None else None
+        filtered_files: list[Path] = []
+        for file_path in files:
+            date_key = extract_date_from_smap_filename(file_path)
+            file_time = datetime.strptime(date_key, "%Y%m%d")
+            if _start is not None and file_time < _start:
+                continue
+            if _end is not None and file_time > _end:
+                continue
+            filtered_files.append(file_path)
+        files = filtered_files
+    if not files:
+        raise FileNotFoundError(f"No SMAP HDF5 files found in {input_dir}")
+    outputs: list[Path] = []
+    failed_files: list[str] = []
+    for file_path in files:
+        # 容错（2026-08-25）：磁盘混入损坏 HDF5（metadata checksum 错）时
+        # 跳过该文件继续转换其余——单个坏文件不应炸整条自动链；全部失败
+        # 才抛错（保留原 FileNotFoundError 语义）。
+        try:
+            outputs.append(
+                convert_smap_l3_file_to_mat(file_path, output_dir, field_specs)
+            )
+        except Exception:
+            failed_files.append(file_path.name)
+    if failed_files and not outputs:
+        raise RuntimeError(
+            f"All {len(failed_files)} SMAP HDF5 files failed to convert: "
+            f"{failed_files[:3]}{'…' if len(failed_files) > 3 else ''}"
+        )
+    return outputs

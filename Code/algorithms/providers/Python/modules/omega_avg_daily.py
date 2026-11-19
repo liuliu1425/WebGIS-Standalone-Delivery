@@ -1,0 +1,914 @@
+"""D2 avg-omega 逐日反演模块编排。
+
+``OmegaAvgDailyModule`` 编排 D2 四阶段流水线（见 ``algorithms/omega_avg.py``）：
+Stage A 逐日 OMEGA 缓存 → Stage B DOY 气候态 → Stage C h/alpha 提取 →
+Stage D 逐日 DDCA 回代（omega 固定为 OMEGA_AVG）。
+
+数据源解析复用 ``modules/bundles.py`` 的 daily bundle 键映射（anc_root /
+smap_folder / ndvi_folder 等），并追加 omega_avg 专有键（omega_block_dir /
+avg_omega_doy_dir / omega_block_mat）。
+"""
+
+from __future__ import annotations
+
+import calendar
+from collections.abc import Mapping, Sequence
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from contracts.product import ProductManifest, ProductRef
+from data_access import resolve_prepared_local_path
+from modules.base import BaseModule
+from modules.registry import register_module_decorator
+from workflow.schemas import ArtifactRef, NodeExecutionContext, PortSpec
+
+
+def _store_manifest(
+    ctx: NodeExecutionContext,
+    *,
+    module_name: str,
+    manifest: ProductManifest,
+    metadata: dict[str, object],
+) -> dict[object, object]:
+    artifact = ArtifactRef(
+        artifact_id=f"{ctx.runtime_context.run_id}:{ctx.node_id}:manifest",
+        artifact_type="product_manifest",
+        format="python_object",
+        uri=None,
+        producer_node_id=ctx.node_id,
+        schema_name="ProductManifest",
+        metadata={"module_name": module_name, **metadata},
+    )
+    ctx.artifact_store.put(artifact, payload=manifest)
+    return {"manifest": artifact}
+
+
+# omega_avg 专有数据源键映射（daily bundle 键复用 bundles.py 的映射）
+_OMEGA_AVG_DATASOURCE_KEY_MAP: dict[str, tuple[str, ...]] = {
+    "omega_block_dir": ("omega_block_dir", "omega_block_output", "daily_omega_dir"),
+    "avg_omega_doy_dir": ("avg_omega_doy_dir", "avg_omega_cache"),
+    "omega_block_mat": ("omega_block_mat", "omega_block_result"),
+    # DUAL 双温度：GLDAS 三温度目录 + 可选 UTC 过境模板（与 omega_sf_fenkuai 对齐）
+    "gldas_mat_folder": ("gldas_mat_folder", "gldas_mat", "daily_mat_sources"),
+    "gldas_template_mat": ("gldas_template_mat", "gldas_template", "daily_mat_sources"),
+}
+
+
+def _resolve_omega_avg_datasource_selection(
+    datasource_selection: dict[str, object],
+) -> dict[str, object]:
+    """解析 D2 数据源选择：先复用 daily bundle 键映射，再解析 omega_avg 专有键。"""
+    from modules.bundles import (
+        _path_from_datasource_value,
+        _resolve_bundle_datasource_selection,
+    )
+
+    # 1. 复用 daily bundle 键映射（anc_root / smap_folder / ndvi_folder / lin_pix_mat 等）
+    resolved = _resolve_bundle_datasource_selection(dict(datasource_selection))
+
+    # 2. 解析 omega_avg 专有键（omega_block_dir / avg_omega_doy_dir / omega_block_mat）
+    for target_key, dataset_names in _OMEGA_AVG_DATASOURCE_KEY_MAP.items():
+        if resolved.get(target_key):
+            continue
+        for name in dataset_names:
+            path = _path_from_datasource_value(resolved.get(name))
+            if path:
+                resolved[target_key] = path
+                break
+        if resolved.get(target_key):
+            continue
+        local_path = resolve_prepared_local_path(
+            resolved,
+            dataset_names,
+            preferred_resource_keys=(target_key,),
+        )
+        if local_path is not None:
+            resolved[target_key] = str(local_path)
+    return resolved
+
+
+def _resolve_grid_shape(
+    algorithm_params: dict[str, object],
+    datasource_selection: dict[str, object],
+) -> tuple[int, int]:
+    """解析 grid_shape：优先 algorithm_params，否则从 landcover 辅助 mat 推断。"""
+    import numpy as np
+
+    raw = algorithm_params.get("grid_shape")
+    if raw is not None:
+        values = list(raw)
+        if len(values) >= 2:
+            return int(values[0]), int(values[1])
+
+    # 从 landcover 辅助 mat 推断（IGBP_9km_12.mat 存 2D grid）
+    anc_root = datasource_selection.get("anc_root")
+    if anc_root:
+        lc_path = Path(str(anc_root)) / "IGBP_9km_12.mat"
+        if lc_path.exists():
+            from ingest.mat_bundle import load_mat_file
+
+            payload = load_mat_file(lc_path)
+            for alias in ("IGBP_9km_12", "LC", "landcover"):
+                if alias in payload:
+                    arr = np.asarray(payload[alias])
+                    if arr.ndim == 2:
+                        return int(arr.shape[0]), int(arr.shape[1])
+    raise ValueError(
+        "grid_shape could not be resolved: provide algorithm_params['grid_shape'] "
+        "or ensure anc_root/IGBP_9km_12.mat exists with a 2D landcover grid"
+    )
+
+
+def _find_omega_block_mat(omega_block_dir: str | Path) -> Path | None:
+    """在 omega_block 输出目录中查找 omega_block_{start}_{end}.mat 文件。"""
+    omega_block_dir = Path(omega_block_dir)
+    if not omega_block_dir.exists():
+        return None
+    # 优先直接在目录下查找
+    candidates = sorted(omega_block_dir.glob("omega_block_*.mat"))
+    if candidates:
+        return candidates[-1]
+    # 退化：查找 daily_omega 父目录
+    parent = omega_block_dir.parent
+    candidates = sorted(parent.glob("omega_block_*.mat"))
+    if candidates:
+        return candidates[-1]
+    return None
+
+
+def _redirect_omega_block_for_tb_source(
+    omega_block_dir: Path,
+    omega_block_mat_path: Path | None,
+    tb_source: str,
+    *,
+    logger_adapter: object = None,
+) -> tuple[Path, Path | None]:
+    """tb_source != SMAP 时优先使用 tb 专属 omega_block 目录（2026-10-07）。
+
+    历史问题：D1(FY) 与 D1(SMAP) 共写同一 ``Inversion_Results/omega_block``，
+    交替跑两条链会互相覆盖 daily_omega 与 h/alpha（``_find_omega_block_mat``
+    恒取字典序最新块）⇒ SMAP 在线链拿到 FY 的产物（或反之）。D1 侧已按
+    tb_source 分目录落盘（见 ``modules/omega.py``）；本函数在 D2 消费侧做
+    同步重定向：tb 专属目录**存在**才切换（兼容尚无 FY 专属目录的存量环境，
+    此时保持原路径并原样工作）。
+    """
+    tb = tb_source.strip().upper()
+    if tb in ("", "SMAP"):
+        return omega_block_dir, omega_block_mat_path
+    candidate = omega_block_dir.with_name(f"{omega_block_dir.name}_{tb.lower()}")
+    if candidate.is_dir() and candidate != omega_block_dir:
+        if logger_adapter is not None:
+            try:
+                logger_adapter.emit_stage_start(
+                    "omega_avg_daily",
+                    f"omega_block dir redirected for tb_source={tb}: "
+                    f"{omega_block_dir} -> {candidate}",
+                )
+            except Exception:  # noqa: BLE001 - 日志失败不阻断主链
+                pass
+        redirected_mat = omega_block_mat_path
+        if redirected_mat is not None:
+            try:
+                rel = redirected_mat.relative_to(omega_block_dir)
+                redirected_mat = candidate / rel
+            except ValueError:
+                pass  # mat 不在共享目录下（显式指定），保持原样
+        return candidate, redirected_mat
+    return omega_block_dir, omega_block_mat_path
+
+
+def _doy_cache_stale(omega_block_dir: Path, avg_omega_doy_dir: Path) -> bool:
+    """daily_omega 比已缓存 DOY 气候态新 → 需要增量重建（2026-10-07）。
+
+    持久缓存（Fix：DOY 气候态不再放 run workspace）引入的新语义：缓存命中后
+    D1 新产出的 daily_omega 不应被无视。以 ``daily_omega/*.mat`` 的最大 mtime
+    对比 ``doy_*.mat`` 的最小 mtime 判断是否过期；目录缺失按"未过期"处理
+    （调用方已有 missing 分支）。
+    """
+    daily_dir = Path(omega_block_dir) / "daily_omega"
+    if not daily_dir.is_dir() or not avg_omega_doy_dir.is_dir():
+        return False
+    newest_daily = 0.0
+    try:
+        for entry in daily_dir.iterdir():
+            if entry.suffix.lower() == ".mat":
+                newest_daily = max(newest_daily, entry.stat().st_mtime)
+    except OSError:
+        return False
+    if newest_daily <= 0.0:
+        return False
+    oldest_doy = None
+    try:
+        for entry in avg_omega_doy_dir.iterdir():
+            if entry.name.startswith("doy_") and entry.suffix.lower() == ".mat":
+                mtime = entry.stat().st_mtime
+                oldest_doy = mtime if oldest_doy is None else min(oldest_doy, mtime)
+    except OSError:
+        return False
+    if oldest_doy is None:
+        return False
+    return newest_daily > oldest_doy + 1.0  # 1s 容差，抗拷贝时间戳抖动
+
+
+# ── 自然月合成（2026-10-18）────────────────────────────────────────────────
+# 产品口径：评估侧要求「半月或整月」，最终定自然月（1 日～月末）。
+# 逐日 DDCA 结果按自然月做像元级平均，另存 ``YYYYMM01_YYYYMM末.mat``；
+# 日帧保留不动。物化侧检测到整月块时优先登记月块（见
+# ``backend/app/services/python_provider_result_builder.py``）。
+_MONTHLY_COMPOSITE_VARIABLES = ("SM", "VOD", "OMEGA")
+
+#: 允许触发月合成的 ``composite_period`` 取值
+_MONTHLY_COMPOSITE_ALIASES = {"month", "monthly", "1m", "calendar-month"}
+
+#: 允许触发「任意窗口合成」（季节/自定义区间）的 ``composite_period`` 取值。
+#: 与月合成互斥：同一 token 不会同时命中两套别名。
+_COMPOSITE_WINDOW_ALIASES = {"window", "custom", "season", "range"}
+
+
+def monthly_composite_label(year: int, month: int) -> str:
+    """自然月块标签：``20251201_20251231``。"""
+    last_day = calendar.monthrange(year, month)[1]
+    return f"{year:04d}{month:02d}01_{year:04d}{month:02d}{last_day:02d}"
+
+
+def build_monthly_composites(
+    output_dir: Path,
+    *,
+    logger_adapter: object | None = None,
+    force: bool = False,
+    min_coverage: float = 0.8,
+) -> list[str]:
+    """把 ``output_dir`` 下的日帧 ``YYYYMMDD.mat`` 按自然月聚合成整月块。
+
+    聚合规则：同一自然月内所有日帧，逐像元取**有效值**（有限值）平均；
+    整月全 NaN 的像元保持 NaN。只读日帧、只增月块，不删除任何原文件。
+
+    完整性门槛：某月日帧数不足 ``min_coverage × 当月天数`` 时不产出月块
+    （避免「跑了 5 天就发布成月产品」这种误导）。已存在的月块不受门槛影响，
+    也不会被不足月的重跑覆盖。
+
+    Args:
+        output_dir: D2 产物目录（含 ``YYYYMMDD.mat``）。
+        logger_adapter: 可选，用于 ``emit_progress`` 上报。
+        force: 已存在的月块是否重算覆盖。
+        min_coverage: 月内日帧覆盖率下限（0~1）。
+
+    Returns:
+        产出的月块标签列表，例如 ``["20251201_20251231"]``。
+    """
+    import math
+
+    import numpy as np
+    from scipy.io import loadmat, savemat
+
+    output_dir = Path(output_dir)
+    if not output_dir.is_dir():
+        return []
+
+    buckets: dict[tuple[int, int], list[Path]] = {}
+    for path in sorted(output_dir.iterdir()):
+        # 只认 8 位纯日期日帧，跳过月块/半截临时文件
+        if not path.is_file() or path.suffix.lower() != ".mat":
+            continue
+        stem = path.stem
+        if len(stem) != 8 or not stem.isdigit():
+            continue
+        try:
+            year, month = int(stem[:4]), int(stem[4:6])
+        except ValueError:
+            continue
+        if not 1 <= month <= 12:
+            continue
+        buckets.setdefault((year, month), []).append(path)
+
+    labels: list[str] = []
+    for (year, month), paths in sorted(buckets.items()):
+        label = monthly_composite_label(year, month)
+        target = output_dir / f"{label}.mat"
+        if target.exists() and not force:
+            labels.append(label)
+            continue
+        # 完整性门槛：日帧不足当月 80% 不发布，避免「几天数据冒充月产品」
+        required = max(
+            1, math.ceil(calendar.monthrange(year, month)[1] * float(min_coverage))
+        )
+        if len(paths) < required:
+            if logger_adapter is not None:
+                try:
+                    logger_adapter.emit_progress(
+                        "monthly-composite",
+                        100.0,
+                        f"skip {label}: {len(paths)}/{required} daily frames "
+                        "(below coverage threshold)",
+                    )
+                except Exception:
+                    pass
+            continue
+
+        stacks: dict[str, list[np.ndarray]] = {}
+        for path in paths:
+            try:
+                mat = loadmat(str(path))
+            except Exception:  # 单个坏帧不阻断整月合成
+                continue
+            for variable in _MONTHLY_COMPOSITE_VARIABLES:
+                value = mat.get(variable)
+                if value is None:
+                    continue
+                stacks.setdefault(variable, []).append(
+                    np.asarray(value, dtype=np.float32)
+                )
+        if not stacks:
+            continue
+
+        payload: dict[str, np.ndarray] = {}
+        for variable, arrays in stacks.items():
+            shape = arrays[0].shape
+            usable = [item for item in arrays if item.shape == shape]
+            if not usable:
+                continue
+            cube = np.stack(usable, axis=0)
+            finite = np.isfinite(cube)
+            count = finite.sum(axis=0)
+            total = np.where(finite, cube, 0.0).sum(axis=0, dtype=np.float64)
+            merged = np.full(shape, np.nan, dtype=np.float32)
+            has_value = count > 0
+            merged[has_value] = (total[has_value] / count[has_value]).astype(np.float32)
+            payload[variable] = merged
+        if not payload:
+            continue
+
+        tmp = target.with_name(f".{target.name}.tmp")
+        savemat(str(tmp), payload, do_compression=True)
+        tmp.replace(target)
+        labels.append(label)
+        if logger_adapter is not None:
+            try:
+                logger_adapter.emit_progress(
+                    "monthly-composite",
+                    100.0,
+                    f"natural month composite {label} from {len(paths)} daily frames",
+                )
+            except Exception:
+                pass
+
+    return labels
+
+
+def _normalize_window_key(value: object) -> str:
+    """``2025-06-01`` / ``20250601`` / ``20250601T00:00:00`` → ``20250601``。"""
+    text = str(value or "").strip().replace("-", "")[:8]
+    return text if len(text) == 8 and text.isdigit() else ""
+
+
+def resolve_composite_windows(
+    params: Mapping[str, Any] | dict[str, Any],
+) -> list[tuple[str, str]]:
+    """从 ``algorithm_params`` 解析待合成的日期窗口列表。
+
+    优先级：``composite_windows``（多窗口）> ``composite_window_start`` +
+    ``composite_window_end``（单窗口）。多窗口支持三种写法：
+    ``[["20250601","20250831"]]``、``["20250601_20250831"]``、
+    以及 JSON 字符串形式。解析不出来就返回空列表（不合成，不报错）。
+    """
+    raw = params.get("composite_windows")
+    if isinstance(raw, str):
+        text = raw.strip()
+        if text:
+            try:
+                import json
+
+                raw = json.loads(text)
+            except (ValueError, TypeError):
+                raw = [text]
+        else:
+            raw = None
+
+    windows: list[tuple[str, str]] = []
+    if isinstance(raw, (list, tuple)):
+        for item in raw:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                start = _normalize_window_key(item[0])
+                end = _normalize_window_key(item[1])
+            else:
+                # 单项写成 "20250601_20250831" 时，JSON 解析会得到单元素列表
+                text = str(item[0] if isinstance(item, (list, tuple)) else item or "")
+                parts = text.replace("~", "_").split("_")
+                if len(parts) != 2:
+                    continue
+                start = _normalize_window_key(parts[0])
+                end = _normalize_window_key(parts[1])
+            if start and end:
+                windows.append((start, end) if start <= end else (end, start))
+        if windows:
+            return windows
+
+    start = _normalize_window_key(params.get("composite_window_start"))
+    end = _normalize_window_key(params.get("composite_window_end"))
+    if start and end:
+        return [(start, end) if start <= end else (end, start)]
+    return []
+
+
+def window_composite_label(start_key: str, end_key: str) -> str:
+    """任意窗口块标签：``20250601_20250831``。"""
+    return f"{start_key}_{end_key}"
+
+
+def build_window_composites(
+    output_dir: Path,
+    *,
+    windows: Sequence[tuple[str, str]],
+    logger_adapter: object | None = None,
+    force: bool = False,
+    min_coverage: float = 0.8,
+) -> list[str]:
+    """把 ``output_dir`` 下的日帧按**任意日期窗口**聚合成一块（季节平均等）。
+
+    与 :func:`build_monthly_composites` 的区别只在「分桶方式」：那个按自然月
+    切，这个按调用方给定的 ``[start_key, end_key]``（含两端，``YYYYMMDD``）切。
+    聚合规则完全相同：窗口内所有日帧**逐像元取有效值（有限值）平均**，全 NaN
+    的像元保持 NaN。只读日帧、只增块，不删除任何原文件。
+
+    产物命名 ``{start}_{end}.mat``（如 ``20250601_20250831.mat``），物化侧
+    ``_BLOCK_MAT_RE`` 天生认这种「起_止」标签，无需改后端。
+
+    Args:
+        output_dir: D2 产物目录（含 ``YYYYMMDD.mat`` 日帧）。
+        windows: ``[(start_key, end_key), ...]``，可为空列表表示不合成。
+        logger_adapter: 可选，用于 ``emit_progress`` 上报。
+        force: 已存在的块是否重算覆盖。
+        min_coverage: 窗口内日帧覆盖率下限（0~1）。低于门槛不发布，避免
+            「只有十几天数据就冒充季节产品」；已存在的块不受门槛影响。
+
+    Returns:
+        产出的窗口块标签列表，例如 ``["20250601_20250831"]``。
+    """
+    import math
+
+    import numpy as np
+    from scipy.io import loadmat, savemat
+
+    output_dir = Path(output_dir)
+    if not output_dir.is_dir() or not windows:
+        return []
+
+    # 先把日帧按日期收一遍，避免每个窗口都扫目录
+    daily: dict[str, Path] = {}
+    for path in sorted(output_dir.iterdir()):
+        if not path.is_file() or path.suffix.lower() != ".mat":
+            continue
+        stem = path.stem
+        if len(stem) != 8 or not stem.isdigit():
+            continue
+        daily[stem] = path
+
+    labels: list[str] = []
+    for start_key, end_key in windows:
+        start = str(start_key or "").strip().replace("-", "")
+        end = str(end_key or "").strip().replace("-", "")
+        if len(start) != 8 or len(end) != 8 or not (start.isdigit() and end.isdigit()):
+            continue
+        if start > end:
+            start, end = end, start
+        label = window_composite_label(start, end)
+        target = output_dir / f"{label}.mat"
+        if target.exists() and not force:
+            labels.append(label)
+            continue
+
+        paths = [path for key, path in daily.items() if start <= key <= end]
+        try:
+            span_days = (
+                datetime.strptime(end, "%Y%m%d") - datetime.strptime(start, "%Y%m%d")
+            ).days + 1
+        except ValueError:
+            continue
+        if span_days <= 0:
+            continue
+        required = max(1, math.ceil(span_days * float(min_coverage)))
+        if len(paths) < required:
+            if logger_adapter is not None:
+                try:
+                    logger_adapter.emit_progress(
+                        "window-composite",
+                        100.0,
+                        f"skip {label}: {len(paths)}/{required} daily frames "
+                        "(below coverage threshold)",
+                    )
+                except Exception:
+                    pass
+            continue
+
+        # 增量累加而非整窗 np.stack：一个季节 90+ 帧、3 个变量、
+        # 4.19M 像元时，整窗堆叠要 6GB+ 内存，累加只要两个数组。
+        sums: dict[str, np.ndarray] = {}
+        counts: dict[str, np.ndarray] = {}
+        used = 0
+        for path in paths:
+            try:
+                mat = loadmat(str(path))
+            except Exception:  # 单个坏帧不阻断整块合成
+                continue
+            used += 1
+            for variable in _MONTHLY_COMPOSITE_VARIABLES:
+                value = mat.get(variable)
+                if value is None:
+                    continue
+                array = np.asarray(value, dtype=np.float32)
+                if variable not in sums:
+                    sums[variable] = np.zeros(array.shape, dtype=np.float64)
+                    counts[variable] = np.zeros(array.shape, dtype=np.int32)
+                elif array.shape != sums[variable].shape:
+                    continue
+                finite = np.isfinite(array)
+                sums[variable][finite] += array[finite]
+                counts[variable][finite] += 1
+        if not sums or used == 0:
+            continue
+
+        payload: dict[str, np.ndarray] = {}
+        for variable, total in sums.items():
+            count = counts[variable]
+            merged = np.full(total.shape, np.nan, dtype=np.float32)
+            has_value = count > 0
+            merged[has_value] = (total[has_value] / count[has_value]).astype(np.float32)
+            payload[variable] = merged
+        if not payload:
+            continue
+
+        tmp = target.with_name(f".{target.name}.tmp")
+        savemat(str(tmp), payload, do_compression=True)
+        tmp.replace(target)
+        labels.append(label)
+        if logger_adapter is not None:
+            try:
+                logger_adapter.emit_progress(
+                    "window-composite",
+                    100.0,
+                    f"window composite {label} from {used} daily frames",
+                )
+            except Exception:
+                pass
+
+    return labels
+
+
+@register_module_decorator(
+    name="omega_avg_daily",
+    aliases=["omega_avg_daily_pipeline"],
+    template_overrides={"phase": "inversion"},
+)
+class OmegaAvgDailyModule(BaseModule):
+    name = "omega_avg_daily"
+    description = (
+        "Native module that runs D2 avg-omega daily retrieval: build DOY climatology "
+        "from D1 omega_block output, then per-day DDCA with averaged omega."
+    )
+    mode_required_inputs = {
+        "omega_avg_daily": (
+            "omega_block_dir",
+            "anc_root",
+            "smap_folder",
+            "ndvi_folder",
+        ),
+    }
+    input_ports = [
+        PortSpec(
+            name="datasource_selection",
+            kind="config",
+            data_class="dict",
+            required=False,
+        ),
+        PortSpec(
+            name="algorithm_params", kind="config", data_class="dict", required=False
+        ),
+        PortSpec(
+            name="output_spec_extra", kind="config", data_class="dict", required=False
+        ),
+        PortSpec(
+            name="smap_daily_mat",
+            kind="data",
+            data_class="mat",
+            required=False,
+            severity="soft",
+            description=(
+                "SMAP 日常 mat 上游产物（smap_daily 转换后落盘目录；与模板 data:mat 对齐）；"
+                "用于建立转换→反演执行序依赖，数据读取仍走 datasource_selection。"
+            ),
+        ),
+        PortSpec(
+            name="fy_daily_mat",
+            kind="data",
+            data_class="mat",
+            required=False,
+            severity="soft",
+            description=(
+                "FY 日常 mat 上游产物（fy_daily 转换后落盘目录；与模板 data:mat 对齐）；"
+                "用于建立转换→反演执行序依赖，数据读取仍走 datasource_selection。"
+            ),
+        ),
+        PortSpec(
+            name="gldas_mat",
+            kind="data",
+            data_class="mat",
+            required=False,
+            severity="soft",
+            description=(
+                "GLDAS 温度 mat 上游产物（gldas_nc4_to_mat 转换后落盘目录；与模板 data:mat 对齐）；"
+                "用于建立转换→反演执行序依赖，数据读取仍走 datasource_selection。"
+            ),
+        ),
+    ]
+    output_ports = [
+        PortSpec(name="manifest", kind="artifact", data_class="product_manifest")
+    ]
+
+    def execute(
+        self,
+        inputs: dict[str, object],
+        params: dict[str, object],
+        ctx: NodeExecutionContext,
+    ) -> dict[object, object]:
+        from algorithms.omega_avg import (
+            build_doy_omega_climatology,
+            build_omega_avg_config,
+            build_raw_omega_daily_cache,
+            extract_halpha_maps,
+            retrieve_daily_with_avg_omega,
+        )
+        from ingest.daily_bundle import (
+            build_daily_bundle_config,
+            load_lin_pix_selection,
+        )
+
+        datasource_selection = _resolve_omega_avg_datasource_selection(
+            dict(inputs.get("datasource_selection", {}))
+        )
+        algorithm_params = dict(inputs.get("algorithm_params", {}))
+        output_spec_extra = dict(inputs.get("output_spec_extra", {}))
+
+        # 必需键校验
+        missing_keys = [
+            key
+            for key in ("omega_block_dir", "anc_root", "smap_folder", "ndvi_folder")
+            if not datasource_selection.get(key)
+        ]
+        if missing_keys:
+            raise ValueError(
+                f"omega_avg_daily requires datasource_selection keys: "
+                f"{', '.join(sorted(missing_keys))}"
+            )
+
+        # 构建 D2 + daily bundle 配置
+        config = build_omega_avg_config(algorithm_params)
+        daily_bundle_config = build_daily_bundle_config(algorithm_params)
+        target_year = int(
+            algorithm_params.get("target_year", config.avg_build_end_year)
+        )
+
+        # 解析 lin_pix
+        lin_pix = load_lin_pix_selection(
+            lin_pix=algorithm_params.get("lin_pix"),
+            lin_pix_mat=datasource_selection.get("lin_pix_mat"),
+        )
+
+        # 解析 grid_shape
+        grid_shape = _resolve_grid_shape(algorithm_params, datasource_selection)
+
+        # 解析输出目录：显式 reuse_output_dir（失败重试复用）优先，
+        # 其次节点属性 output_dir、request output_spec_extra，缺省 run 工作区。
+        # 按 tb_source 分目录，避免 FY 误 resume SMAP 旧日产物（地图空白 / 点查 N/A）。
+        tb_source = (
+            str(
+                getattr(daily_bundle_config, "tb_source", None)
+                or algorithm_params.get("tb_source")
+                or "SMAP"
+            )
+            .strip()
+            .upper()
+            or "SMAP"
+        )
+        product_subdir = f"omega_avg_daily_{tb_source.lower()}"
+        reuse_output_dir = algorithm_params.get("reuse_output_dir")
+        if isinstance(reuse_output_dir, str) and reuse_output_dir.strip():
+            output_dir = Path(reuse_output_dir.strip())
+        else:
+            output_dir = Path(
+                str(params.get("output_dir") or "").strip()
+                or output_spec_extra.get("output_dir")
+                or (ctx.workspace / "products" / product_subdir)
+            )
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 解析 omega_block 目录与 .mat 文件（先探测，tb 重定向后再做硬校验）
+        omega_block_dir = Path(str(datasource_selection["omega_block_dir"]))
+        omega_block_mat_path = datasource_selection.get("omega_block_mat")
+        if omega_block_mat_path:
+            omega_block_mat_path = Path(str(omega_block_mat_path))
+        else:
+            omega_block_mat_path = _find_omega_block_mat(omega_block_dir)
+
+        # tb_source != SMAP 时重定向到 tb 专属 omega_block 目录（与 D1 侧
+        # modules/omega.py 的分目录落盘配对，消除 FY/SMAP 互相覆盖）。
+        omega_block_dir, omega_block_mat_path = _redirect_omega_block_for_tb_source(
+            omega_block_dir,
+            omega_block_mat_path,
+            tb_source,
+            logger_adapter=ctx.logger_adapter,
+        )
+        if omega_block_mat_path is None or not omega_block_mat_path.exists():
+            omega_block_mat_path = _find_omega_block_mat(omega_block_dir)
+        if omega_block_mat_path is None or not omega_block_mat_path.exists():
+            raise FileNotFoundError(
+                f"omega_block_*.mat not found under {omega_block_dir}; "
+                "ensure D1 omega_block has run"
+            )
+
+        # DOY 气候态缓存目录：默认挂到 omega_block 输出目录下（**持久共享**，
+        # 按 tb_source + 构建年份窗口键控），跨 run 复用；2026-10-07 之前默认
+        # 在 run workspace 下导致每次全新 run 全量重建 Stage A+B。
+        avg_omega_doy_dir = datasource_selection.get("avg_omega_doy_dir")
+        if avg_omega_doy_dir:
+            avg_omega_doy_dir = Path(str(avg_omega_doy_dir))
+        else:
+            avg_omega_doy_dir = (
+                omega_block_dir
+                / "doy_clim"
+                / f"{tb_source.lower()}_{config.avg_build_start_year}_{config.avg_build_end_year}"
+            )
+
+        if ctx.logger_adapter is not None:
+            ctx.logger_adapter.emit_stage_start(
+                "omega_avg_daily",
+                f"D2 avg-omega daily retrieval for year {target_year}",
+            )
+
+        # Stage A+B: 构建 DOY 气候态。持久缓存语义：缓存存在即跳过重建，
+        # 但 daily_omega 有比缓存更新的产物时增量重建（_doy_cache_stale）。
+        build_years = list(
+            range(config.avg_build_start_year, config.avg_build_end_year + 1)
+        )
+        doy_files_exist = any(avg_omega_doy_dir.glob("doy_*.mat"))
+        cache_stale = (not config.force_rebuild_avg) and _doy_cache_stale(
+            omega_block_dir, avg_omega_doy_dir
+        )
+        if config.force_rebuild_avg or not doy_files_exist or cache_stale:
+            if not doy_files_exist or config.force_rebuild_avg or cache_stale:
+                cache_dir = (
+                    omega_block_dir
+                    / "raw_omega_cache"
+                    / f"{tb_source.lower()}_{config.avg_build_start_year}_{config.avg_build_end_year}"
+                )
+                build_raw_omega_daily_cache(
+                    omega_block_dir=omega_block_dir,
+                    output_cache_dir=cache_dir,
+                    years=build_years,
+                    grid_shape=grid_shape,
+                )
+                build_doy_omega_climatology(
+                    cache_dir=cache_dir,
+                    output_doy_dir=avg_omega_doy_dir,
+                    years=build_years,
+                    grid_shape=grid_shape,
+                )
+
+        # Stage C: 提取 h/alpha map
+        h_map, alpha_map = extract_halpha_maps(omega_block_mat_path, grid_shape)
+
+        # Stage D: 逐日 DDCA 回代
+        cancel_flag_path = algorithm_params.get("cancel_flag_path")
+        if not cancel_flag_path:
+            cancel_flag_path = ctx.runtime_context.env.get("cancel_flag_path")
+        if not cancel_flag_path:
+            cancel_flag_path = str(ctx.runtime_context.tmp_dir / "cancel.requested")
+
+        stage_d_result = retrieve_daily_with_avg_omega(
+            target_year=target_year,
+            omega_avg_doy_dir=avg_omega_doy_dir,
+            h_map=h_map,
+            alpha_map=alpha_map,
+            datasource_selection=datasource_selection,
+            config=config,
+            daily_bundle_config=daily_bundle_config,
+            lin_pix=lin_pix,
+            grid_shape=grid_shape,
+            output_dir=output_dir,
+            logger_adapter=ctx.logger_adapter,
+            cancel_flag_path=cancel_flag_path,
+        )
+
+        # 自然月合成（默认关闭，仅 algorithm_params.composite_period=month 时启用；
+        # SMAP 链路不传该参数，行为保持逐日，完全不受影响）
+        composite_period = (
+            str(algorithm_params.get("composite_period") or "").strip().lower()
+        )
+        monthly_labels: list[str] = []
+        window_labels: list[str] = []
+        if composite_period in _MONTHLY_COMPOSITE_ALIASES:
+            try:
+                monthly_labels = build_monthly_composites(
+                    Path(output_dir),
+                    logger_adapter=ctx.logger_adapter,
+                    force=bool(algorithm_params.get("composite_force")),
+                )
+            except Exception:  # 月合成失败不拖垮日产品发布
+                monthly_labels = []
+                if ctx.logger_adapter is not None:
+                    try:
+                        ctx.logger_adapter.emit_progress(
+                            "monthly-composite", 100.0, "monthly composite failed"
+                        )
+                    except Exception:
+                        pass
+        elif composite_period in _COMPOSITE_WINDOW_ALIASES:
+            # 任意窗口合成（季节平均等）：composite_window_start/end 单窗口，
+            # 或 composite_windows 多窗口。失败同样不拖垮日产品发布。
+            try:
+                window_labels = build_window_composites(
+                    Path(output_dir),
+                    windows=resolve_composite_windows(algorithm_params),
+                    logger_adapter=ctx.logger_adapter,
+                    force=bool(algorithm_params.get("composite_force")),
+                )
+            except Exception:
+                window_labels = []
+                if ctx.logger_adapter is not None:
+                    try:
+                        ctx.logger_adapter.emit_progress(
+                            "window-composite", 100.0, "window composite failed"
+                        )
+                    except Exception:
+                        pass
+
+        # 构建 manifest
+        days_processed = int(stage_d_result.get("days_processed", 0))
+        days_resumed = int(stage_d_result.get("days_resumed", 0))
+        products: list[ProductRef] = []
+        # 全量 resume（processed=0, resumed>0）也必须发布三图层，否则前端
+        # materialize 只有 SM/VOD 或缺产物，cleanup 会删掉 OMEGA 占位。
+        has_daily_mats = False
+        try:
+            has_daily_mats = any(
+                path.is_file() and path.suffix.lower() == ".mat" and path.stem.isdigit()
+                for path in Path(output_dir).iterdir()
+            )
+        except OSError:
+            has_daily_mats = False
+        if days_processed > 0 or days_resumed > 0 or has_daily_mats:
+            # 目标年逐日 SM/VOD/OMEGA 目录：复用 omega_sf_*_block_dir 类型，
+            # 单日 YYYYMMDD.mat 由物化链按一天块发布为时间序列图层。
+            for variable, layer in (("SM", "SM"), ("VOD", "VOD"), ("OMEGA", "OMEGA")):
+                products.append(
+                    ProductRef(
+                        name=f"omega_avg_{variable.lower()}_{target_year}",
+                        type=f"omega_sf_{variable.lower()}_block_dir",
+                        uri=str(output_dir),
+                        variable=variable,
+                        tags={"module": self.name, "layer": layer},
+                    )
+                )
+
+        if ctx.logger_adapter is not None:
+            for product in products:
+                ctx.logger_adapter.emit_artifact(
+                    "omega_avg_daily", product.uri, product.type
+                )
+            ctx.logger_adapter.emit_stage_end(
+                "omega_avg_daily",
+                f"Generated avg-omega daily products for {days_processed} days",
+            )
+
+        manifest = ProductManifest(
+            job_id=ctx.request.job_id,
+            run_id=ctx.runtime_context.run_id,
+            products=products,
+            main_layers=["SM", "VOD", "OMEGA"],
+            metadata_uri=None,
+            extra={
+                "module_name": self.name,
+                "output_dir": str(output_dir),
+                "target_year": target_year,
+                "days_processed": days_processed,
+                "days_skipped": int(stage_d_result.get("days_skipped", 0)),
+                "freq_ghz": config.freq_ghz,
+                "lambda_tau": config.lambda_tau,
+                "temp_scheme": str(
+                    getattr(daily_bundle_config, "temp_scheme", "ORIG_TS")
+                ),
+                "avg_build_years": build_years,
+                "stage_d_start_date": config.stage_d_start_date,
+                "stage_d_end_date": config.stage_d_end_date,
+                "stage_d_max_days": int(config.stage_d_max_days),
+                "composite_period": composite_period or "none",
+                "monthly_composites": monthly_labels,
+                "window_composites": window_labels,
+            },
+        )
+        return _store_manifest(
+            ctx,
+            module_name=self.name,
+            manifest=manifest,
+            metadata={"product_count": len(products), "days_processed": days_processed},
+        )

@@ -1,0 +1,174 @@
+from __future__ import annotations
+
+import logging
+from typing import Any
+from collections.abc import Callable
+
+from modules.base import BaseModule
+
+_logger = logging.getLogger(__name__)
+
+
+MODULE_REGISTRY: dict[str, BaseModule] = {}
+MODULE_ALIASES: dict[str, str] = {}
+# 模板覆盖项：module_name → 覆盖字段 dict
+# 由 @register_module(template_overrides=...) 注册，供自动推导使用
+_TEMPLATE_OVERRIDES: dict[str, dict[str, Any]] = {}
+_DEFAULT_MODULES_LOADED = False
+
+
+def _ensure_default_modules_loaded() -> None:
+    global _DEFAULT_MODULES_LOADED
+    if _DEFAULT_MODULES_LOADED:
+        return
+    import importlib
+    import logging
+    import pkgutil
+    import sys
+    from pathlib import Path
+
+    _logger = logging.getLogger(__name__)
+    modules_dir = Path(__file__).parent
+    # 模块顶层有 ``from output import ...`` 等绝对导入；调用方（backend bridge）
+    # 的 import path 上下文可能已退出，须由 registry 自行保证 provider root 可解析，
+    # 否则模块加载失败、被 compat shim 静默顶班（原生端口签名与行为失效）。
+    provider_root = str(modules_dir.parent)
+    if provider_root not in sys.path:
+        sys.path.insert(0, provider_root)
+    # 扫描 modules/ 目录下所有 .py 文件（排除特殊文件）
+    exclude = {"__init__", "base", "compat", "registry"}
+    for _finder, name, _ispkg in pkgutil.iter_modules([str(modules_dir)]):
+        if name in exclude:
+            continue
+        try:
+            importlib.import_module(f"modules.{name}")
+        except Exception as e:  # noqa: BLE001
+            _logger.warning(f"Failed to load module {name}: {e}")
+    # 兜底：注册未被原生实现覆盖的兼容 shim。懒导入避免循环依赖。
+    from modules.compat import register_default_compat_modules
+
+    register_default_compat_modules()
+    _DEFAULT_MODULES_LOADED = True
+
+
+def register_module(
+    module: BaseModule,
+    aliases: list[str] | None = None,
+    template_overrides: dict[str, Any] | None = None,
+    name_override: str | None = None,
+) -> None:
+    """注册 module 到全局注册表。
+
+    Args:
+        module: BaseModule 实例
+        aliases: 别名列表（如 ["ndvi_daily_pipeline"]）
+        template_overrides: RequestTemplateSpec 覆盖字段
+            支持的 key: accepted_data_access_datasets / allowed_task_types /
+            allowed_algorithm_values / notes / required_algorithm_keys /
+            phase（节点阶段分类声明，如 "download" / "preprocess" /
+            "inversion" / "output" / "processing"；bridge 的
+            _classify_stage 优先读取此声明，substring 匹配为回退）等
+            未覆盖的字段由 ModuleSpec 自动推导
+        name_override: 注册名覆盖。若提供，使用此名称作为注册表 key，
+            而非 module.name。供 @register_module_decorator(name=...) 使用。
+    """
+    registry_key = name_override or module.name
+    existing = MODULE_REGISTRY.get(registry_key)
+    if existing is not None and existing is not module:
+        _logger.warning(
+            "Module '%s' is already registered (existing=%s, new=%s); "
+            "the new module will silently overwrite the previous one. "
+            "If this is intentional (e.g. compat shim override), ignore this warning.",
+            registry_key,
+            type(existing).__name__,
+            type(module).__name__,
+        )
+    MODULE_REGISTRY[registry_key] = module
+    for alias in aliases or []:
+        prev_alias_target = MODULE_ALIASES.get(alias)
+        if prev_alias_target is not None and prev_alias_target != registry_key:
+            _logger.warning(
+                "Alias '%s' was previously mapped to '%s'; remapping to '%s'.",
+                alias,
+                prev_alias_target,
+                registry_key,
+            )
+        MODULE_ALIASES[alias] = registry_key
+    if template_overrides:
+        _TEMPLATE_OVERRIDES[registry_key] = dict(template_overrides)
+
+
+def register_module_decorator(
+    *,
+    name: str | None = None,
+    aliases: list[str] | None = None,
+    template_overrides: dict[str, Any] | None = None,
+) -> Callable[[type[BaseModule]], type[BaseModule]]:
+    """类装饰器：声明式注册 module。
+
+    用法：
+        @register_module_decorator(name="ndvi_daily", aliases=["ndvi_daily_pipeline"])
+        class NdviDailyModule(BaseModule):
+            ...
+
+    等价于：
+        class NdviDailyModule(BaseModule):
+            ...
+        register_module(NdviDailyModule(), aliases=["ndvi_daily_pipeline"], name_override="ndvi_daily")
+    """
+
+    def _decorator(cls: type[BaseModule]) -> type[BaseModule]:
+        instance = cls()
+        # 若未指定 name，使用类属性 name
+        module_name = name or cls.name
+        # 修复：传入 name_override 使注册表使用 decorator 指定的 name 作为 key，
+        # 而非 instance.name。此前此参数失效，传入 name='ndvi_daily' 但类属性
+        # name='ndvi' 时仍以 'ndvi' 注册。
+        name_override = module_name if name and name != instance.name else None
+        register_module(
+            instance,
+            aliases=aliases,
+            template_overrides=template_overrides,
+            name_override=name_override,
+        )
+        return cls
+
+    return _decorator
+
+
+# 暴露更短的别名
+register_module_dec = register_module_decorator
+
+
+def get_module(name: str) -> BaseModule:
+    _ensure_default_modules_loaded()
+    canonical_name = MODULE_ALIASES.get(name, name)
+    if canonical_name not in MODULE_REGISTRY:
+        _logger.warning(
+            "Module not registered: '%s' (tried alias resolution → '%s'). "
+            "Registered modules: %s",
+            name,
+            canonical_name,
+            sorted(MODULE_REGISTRY),
+        )
+        raise KeyError(f"Module not registered: {name}")
+    return MODULE_REGISTRY[canonical_name]
+
+
+def list_modules() -> list[str]:
+    _ensure_default_modules_loaded()
+    return sorted(MODULE_REGISTRY)
+
+
+def get_template_overrides(name: str) -> dict[str, Any]:
+    """获取 module 的模板覆盖字段。"""
+    _ensure_default_modules_loaded()
+    canonical_name = MODULE_ALIASES.get(name, name)
+    return _TEMPLATE_OVERRIDES.get(canonical_name, {})
+
+
+def get_module_phase(name: str) -> str | None:
+    """获取 module 声明的阶段分类（phase 声明缺失时返回 None）。"""
+    overrides = get_template_overrides(name)
+    phase = overrides.get("phase")
+    return str(phase) if phase else None

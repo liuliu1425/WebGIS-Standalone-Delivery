@@ -1,0 +1,618 @@
+/**
+ * 图层工作区持久化：刷新后恢复已添加图层；用户移除后不再自动恢复。
+ * 矢量仅持久化 backendLayerId 等元数据（不写入 GeoJSON）；刷新后从后端 preview 拉取。
+ */
+import type { ActiveLayer, ActiveRunLayerGroup } from './types'
+import type { ImportedRasterPayload } from './imported-raster'
+import type { ImportedVectorPayload } from './imported-vector'
+import {
+  readScopedItem,
+  removeScopedItem,
+  writeScopedItem,
+} from '../../services/user-local-isolation'
+import { getApiStorageScope } from '../../services/_http'
+import { clearAttachRetry } from './workflow-attach-retry'
+import {
+  filterDismissedWorkspace,
+  recordWorkspaceDismissal,
+  mergeWorkspaceDismissals,
+  type DismissedLayerKind,
+} from './workspace-dismissals'
+
+const STORAGE_KEY = 'geo:active-layers-workspace:v1'
+const DISMISSED_STORAGE_KEY = 'geo:dismissed-layers:v1'
+const MAX_LAYERS = 80
+const MAX_DISMISSED = 240
+
+/**
+ * 工作区「出厂配置版本」。
+ *
+ * 与 `WorkspaceSnapshot.version` 的分工必须分清：
+ * - `version: 1` —— **序列化格式**版本。改动 `PersistedActiveLayer` 等结构时才升，
+ *   升了等于丢弃所有历史快照，代价很大；
+ * - `WORKSPACE_SCHEMA_VERSION` —— **出厂默认配置**的版本。只要 `DEFAULT_LAYERS`、
+ *   默认透明度、默认勾选策略这类「用户没碰过就该长这样」的东西变了，就 +1。
+ *
+ * 为什么需要它：工作区快照存在**每台浏览器本地**（按账号 + API 入口分桶），
+ * 服务器从不下发。以前改默认图层只对「本地还没有快照」的机器生效，已有快照的
+ * 机器永远停在旧样子，只能靠人工清站点数据。
+ * 2026-10-21 导师电脑上「有些地方改了、有些没改」正是这个原因。
+ *
+ * 版本一升的连锁反应（已由 `workspace-sync.ts` 配套处理）：
+ *   本地旧快照作废 → `ensureDefaultLayers` 按当前默认重新挂载 →
+ *   非空快照随即推送覆盖远端分桶 ⇒ 两端一起对齐。
+ * 用户自己拖的布局会重置一次，但**后端数据目录与产物一概不动**。
+ */
+/**
+ * 版本变更记录：
+ * - 2：2026-10-21，图层透明度统一 0.9 + 默认勾选口径调整；
+ * - 3：2026-10-27，**默认图层由 2 组扩到 4 组**（新增风云动态 / SMAP动态），
+ *      侧栏默认只展开「风云平均」一组，组头新增「平均/动态散射约束」小字。
+ */
+export const WORKSPACE_SCHEMA_VERSION = 3
+
+export interface PersistedActiveLayer {
+  instanceId: string
+  catalogId: string
+  name?: string
+  visible: boolean
+  opacity: number
+  order: number
+  runGroupId?: string
+  runGroupProductTag?: string
+  runGroupLocked?: boolean
+  importedRaster?: ImportedRasterPayload
+  accentColor?: string
+  accentGlow?: string
+  chipTone?: string
+  paletteOverride?: string | null
+  vminOverride?: number | null
+  vmaxOverride?: number | null
+  nodataMode?: 'transparent' | 'solid' | null
+  nodataColor?: string | null
+}
+
+/** 导入矢量（仅 backend 登记层；刷新后按需拉取 GeoJSON） */
+export interface PersistedVectorLayer {
+  instanceId: string
+  catalogId: string
+  backendLayerId: string
+  name?: string
+  fileName?: string
+  visible: boolean
+  opacity: number
+  order: number
+  truncated?: boolean
+  style?: ImportedVectorPayload['style']
+  accentColor?: string
+  accentGlow?: string
+  chipTone?: string
+}
+
+/** 目录/天气/分析图层（无 overlay 文件）；含计算中占位（runGroupLocked） */
+export interface PersistedCatalogLayer {
+  instanceId: string
+  catalogId: string
+  name?: string
+  visible: boolean
+  opacity: number
+  order: number
+  dataState?: 'catalog' | 'real'
+  runGroupId?: string
+  runGroupProductTag?: string
+  /** 计算组占位锁定：刷新后需保留，避免多图层组丢失 */
+  runGroupLocked?: boolean
+  accentColor?: string
+  accentGlow?: string
+  chipTone?: string
+  paletteOverride?: string | null
+  vminOverride?: number | null
+  vmaxOverride?: number | null
+  nodataMode?: 'transparent' | 'solid' | null
+  nodataColor?: string | null
+}
+
+export interface WorkspaceSnapshot {
+  version: 1
+  /**
+   * 写入这份快照时的**出厂配置版本**（见 `WORKSPACE_SCHEMA_VERSION`）。
+   * 缺失 = 该字段引入之前的历史快照，按版本 1 处理。
+   */
+  schemaVersion?: number
+  savedAt: string
+  /** 写入时的 API/页面作用域；跨环境接管时用于剥离无效工作流状态 */
+  apiScope?: string
+  /** Snapshot instance ID; hydration remaps it to this session's instance. */
+  selectedInstanceId?: string | null
+  layers: PersistedActiveLayer[]
+  catalogLayers?: PersistedCatalogLayer[]
+  vectorLayers?: PersistedVectorLayer[]
+  groups: ActiveRunLayerGroup[]
+}
+
+/**
+ * 入参快照是否由**当前**出厂配置版本写出。
+ *
+ * 本地读取与远端接管共用这一处判定，避免两边标准不一致：
+ * 过期快照既不能落地本地，也不能从 `/workspace` 拉回来覆盖重建结果。
+ */
+export function isSnapshotSchemaCurrent(snapshot: WorkspaceSnapshot | null | undefined): boolean {
+  if (!snapshot) return false
+  return (snapshot.schemaVersion ?? 1) === WORKSPACE_SCHEMA_VERSION
+}
+
+export interface DismissedLayersRegistry {
+  overlayLayerIds: string[]
+  catalogIds: string[]
+  vectorBackendLayerIds: string[]
+  runIds: string[]
+  /** Explicit remove/re-add operations; legacy arrays remain readable by older clients. */
+  operations?: Record<string, { removed: boolean; changedAt: number }>
+}
+
+function emptyDismissed(): DismissedLayersRegistry {
+  return { overlayLayerIds: [], catalogIds: [], runIds: [], vectorBackendLayerIds: [] }
+}
+
+function pushUnique(list: string[], value: string | undefined | null) {
+  const v = String(value || '').trim()
+  if (!v || list.includes(v)) return
+  list.unshift(v)
+  if (list.length > MAX_DISMISSED) list.length = MAX_DISMISSED
+}
+
+function loadLayerRegistry(key: string): DismissedLayersRegistry {
+  if (typeof window === 'undefined') return emptyDismissed()
+  try {
+    const raw = readScopedItem(key)
+    if (!raw) return emptyDismissed()
+    const parsed = JSON.parse(raw) as Partial<DismissedLayersRegistry>
+    const registry: DismissedLayersRegistry = {
+      overlayLayerIds: Array.isArray(parsed.overlayLayerIds)
+        ? parsed.overlayLayerIds.filter((x) => typeof x === 'string')
+        : [],
+      catalogIds: Array.isArray(parsed.catalogIds)
+        ? parsed.catalogIds.filter((x) => typeof x === 'string')
+        : [],
+      runIds: Array.isArray(parsed.runIds)
+        ? parsed.runIds.filter((x) => typeof x === 'string')
+        : [],
+      vectorBackendLayerIds: Array.isArray(parsed.vectorBackendLayerIds)
+        ? parsed.vectorBackendLayerIds.filter((x) => typeof x === 'string')
+        : [],
+    }
+    if (parsed.operations && typeof parsed.operations === 'object') {
+      registry.operations = parsed.operations
+      return mergeWorkspaceDismissals(emptyDismissed(), registry)
+    }
+    return registry
+  } catch {
+    return emptyDismissed()
+  }
+}
+
+export function loadDismissedLayers(): DismissedLayersRegistry {
+  return loadLayerRegistry(DISMISSED_STORAGE_KEY)
+}
+
+function saveLayerRegistry(key: string, registry: DismissedLayersRegistry): void {
+  if (typeof window === 'undefined') return
+  try {
+    writeScopedItem(key, JSON.stringify(registry))
+  } catch {
+    /* quota / private mode */
+  }
+}
+
+function saveDismissedLayers(registry: DismissedLayersRegistry): void {
+  saveLayerRegistry(DISMISSED_STORAGE_KEY, registry)
+}
+
+/** 服务端工作区同步：整体替换移除登记（远端为准）。 */
+export function writeDismissedLayers(registry: DismissedLayersRegistry): void {
+  saveDismissedLayers(registry)
+}
+
+export function rememberDismissedLayer(entry: {
+  overlayLayerId?: string | null
+  catalogId?: string | null
+  vectorBackendLayerId?: string | null
+  runId?: string | null
+}): void {
+  const reg = loadDismissedLayers()
+  pushUnique(reg.overlayLayerIds, entry.overlayLayerId)
+  pushUnique(reg.catalogIds, entry.catalogId)
+  pushUnique(reg.vectorBackendLayerIds, entry.vectorBackendLayerId)
+  pushUnique(reg.runIds, entry.runId)
+  for (const [kind, rawId] of [
+    ['overlayLayerIds', entry.overlayLayerId], ['catalogIds', entry.catalogId],
+    ['vectorBackendLayerIds', entry.vectorBackendLayerId], ['runIds', entry.runId],
+  ] as const) {
+    const id = String(rawId || '').trim()
+    if (id) recordWorkspaceDismissal(reg, kind, id, true)
+  }
+  saveDismissedLayers(reg)
+  if (entry.runId) {
+    clearAttachRetry(entry.runId)
+  }
+}
+
+/** 从移除清单中解除指定 run / overlay / catalog / vector 的标记。 */
+export function forgetDismissedLayer(entry: {
+  overlayLayerId?: string | null
+  catalogId?: string | null
+  vectorBackendLayerId?: string | null
+  runId?: string | null
+}): void {
+  const reg = loadDismissedLayers()
+  const remove = (key: DismissedLayerKind, value: string | undefined | null) => {
+    const v = String(value || '').trim()
+    if (!v) return
+    const list = reg[key]
+    const idx = list.indexOf(v)
+    if (idx >= 0) {
+      list.splice(idx, 1)
+      recordWorkspaceDismissal(reg, key, v, false)
+    }
+  }
+  remove('overlayLayerIds', entry.overlayLayerId)
+  remove('catalogIds', entry.catalogId)
+  remove('vectorBackendLayerIds', entry.vectorBackendLayerId)
+  remove('runIds', entry.runId)
+  saveDismissedLayers(reg)
+}
+
+export function isOverlayDismissed(overlayLayerId: string | undefined | null): boolean {
+  const id = String(overlayLayerId || '').trim()
+  if (!id) return false
+  return loadDismissedLayers().overlayLayerIds.includes(id)
+}
+
+export function isCatalogDismissed(catalogId: string | undefined | null): boolean {
+  const id = String(catalogId || '').trim()
+  if (!id) return false
+  return loadDismissedLayers().catalogIds.includes(id)
+}
+
+export function isRunDismissed(runId: string | undefined | null): boolean {
+  const id = String(runId || '').trim()
+  if (!id) return false
+  return loadDismissedLayers().runIds.includes(id)
+}
+
+export function isVectorDismissed(backendLayerId: string | undefined | null): boolean {
+  const id = String(backendLayerId || '').trim()
+  if (!id) return false
+  return loadDismissedLayers().vectorBackendLayerIds.includes(id)
+}
+
+function isPersistableRasterLayer(layer: ActiveLayer): boolean {
+  if (layer.isAdminBoundary) return false
+  return Boolean(layer.importedRaster?.overlayLayerId)
+}
+
+function isPersistableCatalogLayer(layer: ActiveLayer): boolean {
+  if (layer.isAdminBoundary) return false
+  if (layer.importedRaster?.overlayLayerId) return false
+  if (layer.importedVector) return false
+  // 计算中占位（无 overlay）必须持久化，否则刷新后多图层组整组消失
+  return true
+}
+
+function isPersistableVectorLayer(layer: ActiveLayer): boolean {
+  if (layer.isAdminBoundary) return false
+  return Boolean(layer.importedVector?.backendLayerId)
+}
+
+function serializeImportedRaster(
+  importedRaster: NonNullable<ActiveLayer['importedRaster']>,
+): ImportedRasterPayload {
+  return {
+    overlayLayerId: importedRaster.overlayLayerId,
+    bounds: importedRaster.bounds,
+    fileName: importedRaster.fileName,
+    sourceCrs: importedRaster.sourceCrs,
+    lngOffset: importedRaster.lngOffset,
+    latOffset: importedRaster.latOffset,
+    nativeStep:
+      typeof importedRaster.nativeStep === 'string'
+        ? importedRaster.nativeStep
+        : importedRaster.nativeStep
+          ? `${importedRaster.nativeStep.value}${importedRaster.nativeStep.unit === 'hour' ? 'h' : importedRaster.nativeStep.unit === 'day' ? 'd' : importedRaster.nativeStep.unit === 'month' ? 'm' : 'yr'}`
+          : null,
+    timeList: importedRaster.timeList,
+    followPolicy: importedRaster.followPolicy,
+    effectiveTimeLabel: importedRaster.effectiveTimeLabel,
+  }
+}
+
+export function buildWorkspaceSnapshot(
+  activeLayers: ActiveLayer[],
+  runLayerGroups: ActiveRunLayerGroup[],
+  selectedInstanceId?: string | null,
+): WorkspaceSnapshot {
+  const dismissed = loadDismissedLayers()
+  const withOverlay = activeLayers.filter(
+    (l) => isPersistableRasterLayer(l) && !isOverlayDismissed(l.importedRaster?.overlayLayerId),
+  )
+  const catalogLayers = activeLayers
+    .filter((l) => isPersistableCatalogLayer(l) && !isCatalogDismissed(l.catalogId))
+    .slice(0, MAX_LAYERS)
+    .map((l): PersistedCatalogLayer => ({
+      instanceId: l.instanceId,
+      catalogId: l.catalogId,
+      name: l.name,
+      visible: l.visible,
+      opacity: l.opacity,
+      order: l.order,
+      dataState: l.dataState === 'real' ? 'real' : 'catalog',
+      runGroupId: l.runGroupId,
+      runGroupProductTag: l.runGroupProductTag,
+      runGroupLocked: Boolean(l.runGroupLocked),
+      accentColor: l.accentColor,
+      accentGlow: l.accentGlow,
+      chipTone: l.chipTone,
+      paletteOverride: l.paletteOverride ?? null,
+      vminOverride: l.vminOverride ?? null,
+      vmaxOverride: l.vmaxOverride ?? null,
+      nodataMode: l.nodataMode ?? null,
+      nodataColor: l.nodataColor ?? null,
+    }))
+
+  const vectorLayers = activeLayers
+    .filter(
+      (l) => isPersistableVectorLayer(l) && !isVectorDismissed(l.importedVector?.backendLayerId),
+    )
+    .slice(0, MAX_LAYERS)
+    .map((l): PersistedVectorLayer => ({
+      instanceId: l.instanceId,
+      catalogId: l.catalogId,
+      backendLayerId: l.importedVector!.backendLayerId!,
+      name: l.name,
+      fileName: l.importedVector?.fileName,
+      visible: l.visible,
+      opacity: l.opacity,
+      order: l.order,
+      truncated: l.importedVector?.truncated,
+      style: l.importedVector?.style,
+      accentColor: l.accentColor,
+      accentGlow: l.accentGlow,
+      chipTone: l.chipTone,
+    }))
+
+  if (!withOverlay.length && !catalogLayers.length && !vectorLayers.length) {
+    return {
+      version: 1,
+      schemaVersion: WORKSPACE_SCHEMA_VERSION,
+      savedAt: new Date().toISOString(),
+      apiScope: getApiStorageScope(),
+      layers: [],
+      catalogLayers: [],
+      vectorLayers: [],
+      groups: [],
+    }
+  }
+
+  const persistedInstanceIds = new Set([
+    ...withOverlay.map((l) => l.instanceId),
+    ...catalogLayers.map((l) => l.instanceId),
+    ...vectorLayers.map((l) => l.instanceId),
+  ])
+  const keepGroupIds = new Set<string>()
+  for (const l of activeLayers) {
+    if (l.runGroupId && persistedInstanceIds.has(l.instanceId)) {
+      keepGroupIds.add(l.runGroupId)
+    }
+  }
+  for (const g of runLayerGroups) {
+    if (g.memberInstanceIds.some((id) => persistedInstanceIds.has(id))) {
+      keepGroupIds.add(g.groupId)
+    }
+  }
+
+  const layers = withOverlay.slice(0, MAX_LAYERS).map((l): PersistedActiveLayer => ({
+    instanceId: l.instanceId,
+    catalogId: l.catalogId,
+    name: l.name,
+    visible: l.visible,
+    opacity: l.opacity,
+    order: l.order,
+    runGroupId: l.runGroupId,
+    runGroupProductTag: l.runGroupProductTag,
+    runGroupLocked: Boolean(l.runGroupLocked),
+    importedRaster: l.importedRaster ? serializeImportedRaster(l.importedRaster) : undefined,
+    accentColor: l.accentColor,
+    accentGlow: l.accentGlow,
+    chipTone: l.chipTone,
+    paletteOverride: l.paletteOverride ?? null,
+    vminOverride: l.vminOverride ?? null,
+    vmaxOverride: l.vmaxOverride ?? null,
+    nodataMode: l.nodataMode ?? null,
+    nodataColor: l.nodataColor ?? null,
+  }))
+
+  const groups = runLayerGroups
+    .filter((g) => keepGroupIds.has(g.groupId) && (!g.runId || !dismissed.runIds.includes(g.runId)))
+    .map((g) => {
+      const computing = g.status === 'computing'
+      return {
+        ...g,
+        memberInstanceIds: g.memberInstanceIds.filter((id) => persistedInstanceIds.has(id)),
+        dissolvable: computing ? false : true,
+        status: g.status,
+      }
+    })
+    .filter((g) => g.memberInstanceIds.length > 0)
+
+  return {
+    version: 1,
+    schemaVersion: WORKSPACE_SCHEMA_VERSION,
+    savedAt: new Date().toISOString(),
+    apiScope: getApiStorageScope(),
+    selectedInstanceId,
+    layers,
+    catalogLayers,
+    vectorLayers,
+    groups,
+  }
+}
+
+/**
+ * 跨 API 入口（局域网 / 公网同账号）接管快照时，剥离另一环境的工作流 run 组与
+ * 「运行中」占位，保留静态目录/导入图层，避免侧栏悬挂「运行中」而指示器为空。
+ */
+export function sanitizeSnapshotForCurrentApi(snapshot: WorkspaceSnapshot): WorkspaceSnapshot {
+  const current = getApiStorageScope()
+  const reconciled = reconcileSnapshotGroupRefs(snapshot)
+
+  if (!reconciled.apiScope || reconciled.apiScope === current) {
+    return { ...reconciled, apiScope: current }
+  }
+
+  const stripRunFields = <
+    T extends {
+      runGroupId?: string
+      runGroupProductTag?: string
+      runGroupLocked?: boolean
+      catalogId?: string
+    },
+  >(
+    layer: T,
+  ): T | null => {
+    const catalogId = String(layer.catalogId || '')
+    // 另一环境的 wf-run 占位层无意义，直接丢弃
+    if (layer.runGroupLocked || /^wf-run-/i.test(catalogId)) {
+      return null
+    }
+    return {
+      ...layer,
+      runGroupId: undefined,
+      runGroupProductTag: undefined,
+      runGroupLocked: false,
+    }
+  }
+
+  const layers = reconciled.layers
+    .map(stripRunFields)
+    .filter((l): l is (typeof reconciled.layers)[number] => l != null)
+  const catalogLayers = (reconciled.catalogLayers || [])
+    .map(stripRunFields)
+    .filter((l): l is PersistedCatalogLayer => l != null)
+
+  return {
+    ...reconciled,
+    apiScope: current,
+    groups: [],
+    layers,
+    catalogLayers,
+    vectorLayers: reconciled.vectorLayers || [],
+  }
+}
+
+/** 图层 runGroupId 无对应 group 时清锁，避免「运行中」幽灵占位。 */
+export function reconcileSnapshotGroupRefs(snapshot: WorkspaceSnapshot): WorkspaceSnapshot {
+  const groupIds = new Set((snapshot.groups || []).map((g) => g.groupId))
+  // 约束放宽为 `T extends object`：原约束（{runGroupId?} 等全可选属性）构成 TS 的
+  // "weak type"，而 PersistedVectorLayer 等载体没有这些属性 → 触发 "no properties in
+  // common" 报错。改为在函数体内做结构读取，语义不变。
+  const clearOrphan = <T extends object>(layer: T): T => {
+    const g = layer as {
+      runGroupId?: string
+      runGroupProductTag?: string
+      runGroupLocked?: boolean
+    }
+    if (!g.runGroupId || groupIds.has(g.runGroupId)) return layer
+    return {
+      ...layer,
+      runGroupId: undefined,
+      runGroupProductTag: undefined,
+      runGroupLocked: false,
+    }
+  }
+  return {
+    ...snapshot,
+    layers: snapshot.layers.map(clearOrphan),
+    catalogLayers: (snapshot.catalogLayers || []).map(clearOrphan),
+    vectorLayers: (snapshot.vectorLayers || []).map(clearOrphan),
+  }
+}
+
+export function saveWorkspaceSnapshot(snapshot: WorkspaceSnapshot): void {
+  if (typeof window === 'undefined') return
+  try {
+    writeScopedItem(STORAGE_KEY, JSON.stringify(snapshot))
+  } catch {
+    /* quota / private mode */
+  }
+}
+
+export function loadWorkspaceSnapshot(): WorkspaceSnapshot | null {
+  if (typeof window === 'undefined') return null
+  try {
+    const raw = readScopedItem(STORAGE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as WorkspaceSnapshot
+    if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.layers)) return null
+    // 出厂配置版本已升级 ⇒ 旧快照作废并清空，让 `ensureDefaultLayers` 按当前默认
+    // 重新挂载。不在这里删掉的话，`hydrateWorkspaceFromSnapshot` 会继续按旧布局
+    // 恢复图层，改动依旧只对"本来就没快照"的机器生效。
+    if (!isSnapshotSchemaCurrent(parsed)) {
+      clearWorkspaceSnapshot()
+      return null
+    }
+    if (!Array.isArray(parsed.catalogLayers)) parsed.catalogLayers = []
+    if (!Array.isArray(parsed.vectorLayers)) parsed.vectorLayers = []
+    if (!Array.isArray(parsed.groups)) parsed.groups = []
+    return filterDismissedWorkspace(
+      sanitizeSnapshotForCurrentApi(migrateSnapshot(reconcileSnapshotGroupRefs(parsed))),
+      loadDismissedLayers(),
+    )
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 一次性迁移：删除英文占位 / 技术 id 游离层。
+ * - 裸 workflow id：omega_sf_fenkuai_* / omega_avg_daily_*
+ * - 稳定 overlay 派生：imported-omega_sf_fenkuai_*（附加产物未建组时的泄漏）
+ * 产物恢复改经 restoreActiveWorkflows 映射到「风云/SMAP 散射约束产品」合并组。
+ */
+const ENGLISH_PLACEHOLDER_CATALOG_PATTERN =
+  /(?:^|[/\\-])(?:imported-)?omega[-_](?:sf[-_]fenkuai|avg[-_]daily)/i
+
+function migrateSnapshot(snapshot: WorkspaceSnapshot): WorkspaceSnapshot {
+  const drop = (catalogId: string | undefined | null): boolean =>
+    Boolean(catalogId) && ENGLISH_PLACEHOLDER_CATALOG_PATTERN.test(String(catalogId))
+  const dropLayer = (layer: { catalogId?: string; name?: string | null }): boolean => {
+    if (drop(layer.catalogId)) return true
+    // 显示名整段仍是技术 id（旧游离层）一并剔除
+    const name = String(layer.name || '').trim()
+    return Boolean(name) && ENGLISH_PLACEHOLDER_CATALOG_PATTERN.test(name)
+  }
+  const catalogLayers = snapshot.catalogLayers ?? []
+  const vectorLayers = snapshot.vectorLayers ?? []
+  const beforeLayers = snapshot.layers.length + catalogLayers.length
+  snapshot.layers = snapshot.layers.filter((l) => !dropLayer(l))
+  snapshot.catalogLayers = catalogLayers.filter((l) => !dropLayer(l))
+  if (snapshot.layers.length + snapshot.catalogLayers.length === beforeLayers) return snapshot
+  const keptInstanceIds = new Set([
+    ...snapshot.layers.map((l) => l.instanceId),
+    ...snapshot.catalogLayers.map((l) => l.instanceId),
+    ...vectorLayers.map((l) => l.instanceId),
+  ])
+  for (const group of snapshot.groups) {
+    group.memberInstanceIds = group.memberInstanceIds.filter((id) => keptInstanceIds.has(id))
+  }
+  snapshot.groups = snapshot.groups.filter((g) => g.memberInstanceIds.length > 0)
+  return snapshot
+}
+
+export function clearWorkspaceSnapshot(): void {
+  if (typeof window === 'undefined') return
+  try {
+    removeScopedItem(STORAGE_KEY)
+  } catch {
+    /* ignore */
+  }
+}

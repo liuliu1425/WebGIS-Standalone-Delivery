@@ -1,0 +1,177 @@
+.mode-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-3);
+  /* 2026-10-20：顶栏改造。原为 flex-wrap: wrap，控件太多时右半边整体掉到
+     第二行（用户反馈"不要两行"）。数据 / 地图工具 / 底图三组已合并成下拉，
+     控件从 13 组降到 9 组，这里改为强制单行。
+     窄屏（≤1024px）仍回落到换行，见文件末尾媒体查询。 */
+  flex-wrap: nowrap;
+  padding: 6px var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  background: var(--surface-1);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  box-shadow: var(--elevation-2);
+  min-height: 42px;
+}
+
+/* 左侧 */
+.toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+  flex-wrap: nowrap;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: none;
+}
+
+.brand-logo-img {
+  width: 30px;
+  height: 30px;
+  object-fit: contain;
+  border-radius: 6px;
+  flex: none;
+}
+
+/* 品牌 Logo 由 BrandMark.vue 组件渲染（自带深空底与辉光） */
+
+.brand-copy {
+  min-width: 0;
+}
+
+.brand-eyebrow {
+  margin: 0 0 2px;
+  color: var(--accent);
+  font-size: var(--font-size-caption);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  line-height: 1;
+}
+
+.brand-name {
+  margin: 0;
+  font-size: clamp(0.9rem, 1.2vw, 1.1rem);
+  font-weight: var(--font-weight-medium);
+  color: var(--text-strong);
+  white-space: nowrap;
+}
+
+.toolbar-divider {
+  width: 1px;
+  height: 24px;
+  background: var(--border-subtle);
+  flex: none;
+}
+
+.toolbar-tools {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  /* 2026-10-20：同上，改为不再折行（数据/地图工具/底图已合并成 3 个下拉） */
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+
+/* 统一工具按钮 — 已迁移至 AppButton */
+
+/* 日志按钮包装器（用于 badge 定位） */
+.log-btn-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+/* 日志徽章 - 仅显示错误数，小字号，99+ 截断 */
+.log-badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  min-width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+  border-radius: var(--radius-pill);
+  background: var(--danger);
+  color: var(--text-strong);
+  font-size: var(--font-size-caption);
+  font-weight: var(--font-weight-bold);
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  box-shadow: 0 0 0 2px var(--badge-ring);
+  border: 1px solid var(--surface-3);
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* 右侧 */
+.toolbar-right {
+  display: flex;
+  align-items: center;
+  flex: none;
+}
+
+.status-cluster {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+/* 来源选择器 / 底图风格分段控件：2026-10-20 起已并入「底图」下拉
+   （components/toolbar/BasemapMenu.vue），此处不再保留相关样式 */
+
+/* 2D/3D 视图切换 — 已迁移至 SegmentedControl（.dim-seg），交互态由组件自身提供 */
+
+/* Chip 在 ModeToolbar 中的定制 */
+:deep([data-ui='chip']) {
+  height: 24px;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 响应式 */
+@media (max-width: 1180px) {
+  /* 品牌文字收起，只留 logo，保证单行放得下 */
+  .brand-copy {
+    display: none;
+  }
+}
+
+@media (max-width: 1024px) {
+  .mode-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-2);
+  }
+  .toolbar-left {
+    flex-wrap: wrap;
+    row-gap: var(--space-2);
+  }
+  .toolbar-tools {
+    flex-wrap: wrap;
+  }
+  .toolbar-right {
+    width: 100%;
+  }
+  .status-cluster {
+    justify-content: flex-start;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .source-btn {
+    transition: none;
+  }
+}

@@ -1,0 +1,433 @@
+"""Follow-up dispatch service.
+
+Handles download follow-up task dispatch (Celery or inline) and stale workflow
+cleanup on backend startup. Extracted from interaction_hub.py.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, UTC
+import logging
+from uuid import uuid4
+
+from app.core.logging import log_context
+from app.services.workflow_repository import SQLiteWorkflowRepository
+from app.services.workflow.persistence_service import WorkflowPersistenceService
+from app.services.workflow.transition_builder import (
+    WorkflowTransitionBuilder,
+    use_celery_executor,
+)
+from app.tasks.download_tasks import (
+    dispatch_download_follow_up_task,
+    execute_download_follow_up_task,
+)
+from app.tasks.workflow_tasks import resolve_workflow_queue
+from shared.contracts.api_contracts import (
+    EventChannel,
+    ExecutionStatus,
+    LogLevel,
+    WorkflowPriority,
+    WorkflowSubmitRequest,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class FollowUpDispatchService:
+    """Dispatches follow-up download tasks and cleans up stale workflow runs."""
+
+    def __init__(
+        self,
+        repository: SQLiteWorkflowRepository | None = None,
+        persistence: WorkflowPersistenceService | None = None,
+        transitions: WorkflowTransitionBuilder | None = None,
+    ) -> None:
+        self._repository = repository or SQLiteWorkflowRepository()
+        self._persistence = persistence or WorkflowPersistenceService(self._repository)
+        self._transitions = transitions or WorkflowTransitionBuilder()
+
+    def dispatch_follow_up_tasks(
+        self,
+        *,
+        run_id: str,
+        payload: WorkflowSubmitRequest,
+        follow_up_tasks: list[dict[str, object]],
+        created_at: datetime,
+    ) -> None:
+        priority = {
+            WorkflowPriority.low: 1,
+            WorkflowPriority.normal: 5,
+            WorkflowPriority.high: 8,
+            WorkflowPriority.critical: 9,
+        }[payload.priority]
+        queue_name = resolve_workflow_queue(payload)
+        for task_data in follow_up_tasks:
+            # P0 修复：task_type 过滤条件与 download_service.build_follow_up_task 产出的值对齐
+            if task_data.get("task_type") not in {
+                "download_fetch",
+                "download_fetch_placeholder",
+            }:
+                continue
+            with log_context(run_id=run_id):
+                try:
+                    if use_celery_executor():
+                        task_id = dispatch_download_follow_up_task(
+                            task_data=task_data,
+                            queue_name=queue_name,
+                            priority=priority,
+                        )
+                        self._persistence.record_event(
+                            run_id=run_id,
+                            channel=EventChannel.system,
+                            message="下载 follow-up task 已派发到 Celery。",
+                            progress=100,
+                            payload={
+                                "task_type": task_data.get("task_type"),
+                                "task_id": task_id,
+                                "queue_name": queue_name,
+                            },
+                            created_at=created_at,
+                        )
+                    else:
+                        inline_task_id = f"download-task-{uuid4().hex[:10]}"
+                        execute_download_follow_up_task(
+                            task_data={**task_data, "task_id": inline_task_id},
+                        )
+                        self._persistence.record_event(
+                            run_id=run_id,
+                            channel=EventChannel.system,
+                            message="下载 follow-up task 已在本地执行完成。",
+                            progress=100,
+                            payload={
+                                "task_type": task_data.get("task_type"),
+                                "task_id": inline_task_id,
+                            },
+                            created_at=datetime.now(UTC),
+                        )
+                except Exception:
+                    logger.exception("Download follow-up dispatch failed")
+                    self._persistence.record_event(
+                        run_id=run_id,
+                        channel=EventChannel.log,
+                        level=LogLevel.error,
+                        message="下载 follow-up task 派发失败。",
+                        progress=100,
+                        payload={
+                            "task_type": task_data.get("task_type"),
+                            "error_code": "download_follow_up_dispatch_failed",
+                        },
+                        created_at=datetime.now(UTC),
+                    )
+
+    def cleanup_stale_workflow_runs(self) -> int:
+        """后端启动时清理真正无法继续的僵尸工作流。
+
+        重要：仅重启 FastAPI **不会** 停止 Celery worker。此前把所有非终态
+        run 一律标 failed，会导致 worker 仍在跑、前端却显示失败/超时，且新
+        任务被卡在队列（worker 仍被旧任务占用）。
+
+        策略：
+        - ``running``：永不因 FastAPI 启动清理（worker 可能仍在执行）。
+        - ``accepted`` / ``queued`` / ``retry_pending``：仅当 Celery 侧已无
+          对应 task（不在 active/reserved/unacked/队列中）且超过宽限时间
+          时才标记失败。
+        """
+        from datetime import timedelta
+
+        non_terminal_queue_statuses = {
+            ExecutionStatus.accepted,
+            ExecutionStatus.queued,
+            ExecutionStatus.retry_pending,
+        }
+        now = datetime.now(UTC)
+        grace = timedelta(minutes=15)
+        live_task_ids, live_run_ids = self._collect_live_celery_tasks()
+        cleaned = 0
+        for run in self._repository.list_runs():
+            if run.status == ExecutionStatus.running:
+                # Worker may still be computing after an API-only restart.
+                continue
+            if run.status not in non_terminal_queue_statuses:
+                continue
+            age = now - (
+                run.updated_at
+                if run.updated_at.tzinfo
+                else run.updated_at.replace(tzinfo=UTC)
+            )
+            if age < grace:
+                continue
+            # run_id 直接命中队列驻留消息：重派发曾产生多个 task_id 副本时，
+            # executor_metadata 里记录的只是最后一次的 task_id，可能已被去重
+            # 清理；只要队列里还有该 run 的任意消息即视为存活。
+            if run.run_id in live_run_ids:
+                continue
+            task_id = str((run.executor_metadata or {}).get("task_id") or "").strip()
+            if task_id and task_id in live_task_ids:
+                continue
+            with log_context(run_id=run.run_id):
+                logger.warning(
+                    "Cleaning up stale queued workflow run (status=%s, updated_at=%s, task_id=%s)",
+                    run.status.value,
+                    run.updated_at.isoformat(),
+                    task_id or "-",
+                )
+                payload = WorkflowSubmitRequest(
+                    command_type=run.command_type,
+                    command_label=run.command_label,
+                    priority=run.priority,
+                    resource_profile=run.resource_profile,
+                    realtime_preferred=run.realtime_preferred,
+                    queue_tag=run.queue_tag,
+                    spatial_filter=run.spatial_filter,
+                    time_range=run.time_range,
+                    requested_outputs=run.requested_outputs,
+                    client=run.client,
+                    map_context=run.map_context,
+                    config_overrides=run.config_overrides,
+                )
+                self._persistence.save_run_status(
+                    run_status=self._transitions.build_execution_transition(
+                        run_id=run.run_id,
+                        payload=payload,
+                        status=ExecutionStatus.failed,
+                        progress=100,
+                        message="工作流排队超时且 Celery 侧已无对应任务（僵尸任务清理）。",
+                        created_at=run.created_at,
+                        updated_at=now,
+                        result_refs=run.result_refs,
+                        result_dto=run.result_dto,
+                        diagnostics=[
+                            f"工作流在 {run.status.value} 状态下超过 {int(grace.total_seconds())}s 且无活跃 Celery 任务。",
+                            "error_code=workflow_orphaned_stale_queue",
+                            f"last_status={run.status.value}",
+                            f"last_updated_at={run.updated_at.isoformat()}",
+                        ],
+                        executor_metadata={
+                            **run.executor_metadata,
+                            "orphaned_at": now.isoformat(),
+                            "cleanup_reason": "stale_queue_no_celery_task",
+                        },
+                    )
+                )
+                self._persistence.record_event(
+                    run_id=run.run_id,
+                    channel=EventChannel.log,
+                    level=LogLevel.warning,
+                    message="工作流排队超时且无 Celery 任务，已标记为失败。可点击重试重新提交。",
+                    progress=100,
+                    payload={
+                        "cleanup_reason": "stale_queue_no_celery_task",
+                        "previous_status": run.status.value,
+                    },
+                    created_at=now,
+                )
+                cleaned += 1
+        if cleaned > 0:
+            logger.info("Cleaned up %d stale workflow run(s) on startup", cleaned)
+        return cleaned
+
+    def fail_stuck_running_workflows(self, *, max_running_seconds: int) -> int:
+        """把 running 且**长时间无活动**的 run 标记为 failed。
+
+        发布就绪修复（P1-4 solo 池看门狗）：``worker_pool=solo`` 时 ``time_limit``
+        无法强杀卡死的任务（无子进程可 kill），卡死任务会让 run 永远停在 running。
+        本方法供周期性 Beat 任务调用，纠正 UI/DB 状态。
+
+        活动时钟 = ``max(run.updated_at, 最近一条 workflow_events.created_at)``。
+        中途进度事件通常只写 events、不 bump ``updated_at``（例如 NSIDC 下载每
+        数秒一条 progress）；因此**绝不能**用「启动后的墙钟总时长」判死，否则会
+        误杀仍在干活的长下载 / 长反演。
+
+        ``max_running_seconds`` 语义为**空闲阈值**（无活动秒数），保留参数名以
+        兼容既有 Beat / 配置键。
+
+        注意：仅纠正状态，**无法**释放被卡任务占用的 solo worker 线程——资源恢复
+        仍需重启该 worker。
+        """
+        from datetime import timedelta
+
+        now = datetime.now(UTC)
+        threshold = timedelta(seconds=max_running_seconds)
+        failed = 0
+        for run in self._repository.list_runs():
+            if run.status != ExecutionStatus.running:
+                continue
+            updated = (
+                run.updated_at
+                if run.updated_at.tzinfo
+                else run.updated_at.replace(tzinfo=UTC)
+            )
+            last_event_at = self._repository.get_latest_event_created_at(run.run_id)
+            last_activity = updated
+            if last_event_at is not None and last_event_at > last_activity:
+                last_activity = last_event_at
+            idle_for = now - last_activity
+            if idle_for < threshold:
+                continue
+            with log_context(run_id=run.run_id):
+                logger.warning(
+                    "Marking stuck running workflow run as failed "
+                    "(last_activity_at=%s, idle_s=%.0f, threshold=%ss)",
+                    last_activity.isoformat(),
+                    idle_for.total_seconds(),
+                    max_running_seconds,
+                )
+                payload = WorkflowSubmitRequest(
+                    command_type=run.command_type,
+                    command_label=run.command_label,
+                    priority=run.priority,
+                    resource_profile=run.resource_profile,
+                    realtime_preferred=run.realtime_preferred,
+                    queue_tag=run.queue_tag,
+                    spatial_filter=run.spatial_filter,
+                    time_range=run.time_range,
+                    requested_outputs=run.requested_outputs,
+                    client=run.client,
+                    map_context=run.map_context,
+                    config_overrides=run.config_overrides,
+                )
+                self._persistence.save_run_status(
+                    run_status=self._transitions.build_execution_transition(
+                        run_id=run.run_id,
+                        payload=payload,
+                        status=ExecutionStatus.failed,
+                        progress=100,
+                        message="工作流长时间无进度更新（疑似卡死），已标记失败。",
+                        created_at=run.created_at,
+                        updated_at=now,
+                        result_refs=run.result_refs,
+                        result_dto=run.result_dto,
+                        diagnostics=[
+                            f"无活动超过 {max_running_seconds}s（solo 池 time_limit 无法强杀）。",
+                            "error_code=workflow_stuck_running_watchdog",
+                            f"last_updated_at={run.updated_at.isoformat()}",
+                            f"last_activity_at={last_activity.isoformat()}",
+                            f"idle_seconds={int(idle_for.total_seconds())}",
+                        ],
+                        executor_metadata={
+                            **run.executor_metadata,
+                            "watchdog_failed_at": now.isoformat(),
+                            "cleanup_reason": "stuck_running_watchdog",
+                            "last_activity_at": last_activity.isoformat(),
+                            "idle_seconds": int(idle_for.total_seconds()),
+                        },
+                    )
+                )
+                self._persistence.record_event(
+                    run_id=run.run_id,
+                    channel=EventChannel.log,
+                    level=LogLevel.warning,
+                    message="工作流长时间无进度（疑似卡死），已被看门狗标记失败。",
+                    progress=100,
+                    payload={
+                        "cleanup_reason": "stuck_running_watchdog",
+                        "previous_status": run.status.value,
+                        "last_activity_at": last_activity.isoformat(),
+                        "idle_seconds": int(idle_for.total_seconds()),
+                    },
+                    created_at=now,
+                )
+                failed += 1
+        if failed > 0:
+            logger.info(
+                "Watchdog marked %d stuck running workflow run(s) as failed", failed
+            )
+        return failed
+
+    @staticmethod
+    def _collect_live_celery_tasks() -> tuple[set[str], set[str]]:
+        """Return (live_task_ids, live_run_ids) for tasks in the broker.
+
+        覆盖三类位置：worker active/reserved（inspect）、broker unacked 哈希、
+        以及队列驻留消息（含 kombu 优先级键 ``<queue>\\x06\\x16<step>``）。
+        run_ids 仅从队列驻留的 process_workflow_run 消息体解析，用于
+        run_id 级存活判定（task_id 副本与 metadata 记录可能不一致）。
+        """
+        live: set[str] = set()
+        live_run_ids: set[str] = set()
+        try:
+            from app.core.celery_app import celery_app
+
+            inspector = celery_app.control.inspect(timeout=2.0)
+            if inspector is not None:
+                for bucket in (inspector.active() or {}, inspector.reserved() or {}):
+                    for tasks in bucket.values():
+                        for task in tasks or []:
+                            task_id = str(task.get("id") or "").strip()
+                            if task_id:
+                                live.add(task_id)
+        except Exception:
+            logger.debug("Celery inspect failed during stale cleanup", exc_info=True)
+
+        try:
+            import json
+            from urllib.parse import urlparse
+
+            import redis
+
+            from app.core.config import settings
+
+            parsed = urlparse(settings.redis_url)
+            client = redis.Redis(
+                host=parsed.hostname or "127.0.0.1",
+                port=parsed.port or 6379,
+                db=int((parsed.path or "/0").lstrip("/") or "0"),
+            )
+            unacked = client.hgetall("unacked") or {}
+            for raw in unacked.values():
+                try:
+                    payload = json.loads(raw)
+                    # kombu format: [message_dict, ...] or nested
+                    msg = (
+                        payload[0] if isinstance(payload, list) and payload else payload
+                    )
+                    headers = (
+                        (msg or {}).get("headers") if isinstance(msg, dict) else {}
+                    )
+                    task_id = str((headers or {}).get("id") or "").strip()
+                    if task_id:
+                        live.add(task_id)
+                except Exception:
+                    continue
+            # 队列驻留消息（含 kombu 优先级键 ``<queue>\x06\x16<step>``）不属于
+            # active/reserved/unacked——worker 忙碌积压时合法 run 的消息只在
+            # 队列里等待，不扫描会把它们误标 orphaned failed。跳过 pidbox /
+            # metrics 等非任务列表；每队列最多扫 2000 条足以覆盖正常积压。
+            import base64
+
+            for key in client.scan_iter(match=b"*"):
+                kb = key if isinstance(key, bytes) else key.encode()
+                if b"pidbox" in kb or kb.startswith(b"metrics"):
+                    continue
+                if client.type(kb) != b"list":
+                    continue
+                for raw in client.lrange(kb, 0, 1999):
+                    try:
+                        env = json.loads(raw)
+                        if not isinstance(env, dict):
+                            continue
+                        task_id = str(
+                            ((env.get("properties") or {}).get("correlation_id"))
+                            or ((env.get("headers") or {}).get("id"))
+                            or ""
+                        ).strip()
+                        if task_id:
+                            live.add(task_id)
+                        if (env.get("headers") or {}).get(
+                            "task"
+                        ) != "app.tasks.workflow_tasks.process_workflow_run":
+                            continue
+                        body = env.get("body")
+                        if not body:
+                            continue
+                        args, kwargs, _ = json.loads(base64.b64decode(body))
+                        run_id = (args or [None])[0] if args else None
+                        if not run_id and isinstance(kwargs, dict):
+                            run_id = kwargs.get("run_id") or kwargs.get("runId")
+                        if run_id:
+                            live_run_ids.add(str(run_id))
+                    except Exception:
+                        continue
+        except Exception:
+            logger.debug("Redis broker scan failed during stale cleanup", exc_info=True)
+        return live, live_run_ids

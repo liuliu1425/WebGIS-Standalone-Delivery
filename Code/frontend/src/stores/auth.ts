@@ -1,0 +1,382 @@
+import { defineStore } from 'pinia'
+import { computed, ref, watch } from 'vue'
+
+import {
+  createUser,
+  deleteUser,
+  fetchAuthConfig,
+  fetchAuthMe,
+  fetchPrimaryThemePublic,
+  fetchThemesPublic,
+  listThemes,
+  listUsers,
+  loginRequest,
+  logoutRequest,
+  updateUser,
+  type AuthConfig,
+  type AuthUser,
+  type ThemePublic,
+  type ThemePublicBrand,
+  type UserRole,
+} from '../services/auth-api'
+import { clearBackendWriteApiKey } from '../services/backend-auth'
+import {
+  applyDocumentTitle,
+  brandFromTheme,
+  staticBrand,
+  type ResolvedBrand,
+} from '../composables/useResolvedBrand'
+import { clearUserLocalState, setActiveStorageUserId } from '../services/user-local-isolation'
+
+export const useAuthStore = defineStore('auth', () => {
+  const user = ref<AuthUser | null>(null)
+  const config = ref<AuthConfig | null>(null)
+  const bootstrapped = ref(false)
+  const bootstrapError = ref<string | null>(null)
+  const users = ref<AuthUser[]>([])
+  const usersLoading = ref(false)
+  const primaryTheme = ref<ThemePublic | null>(null)
+  const publicThemes = ref<ThemePublicBrand[]>([])
+  const loginPreviewSlug = ref<string | null>(null)
+  const themes = ref<ThemePublic[]>([])
+  const themesLoading = ref(false)
+
+  const LOGIN_THEME_SLUG_KEY = 'cgda-login-theme-slug'
+
+  const isAuthenticated = computed(() => user.value !== null)
+  const isAdmin = computed(() => user.value?.role === 'admin')
+  const isDemo = computed(() => user.value?.role === 'demo')
+  const canWrite = computed(() => user.value?.role === 'admin' || user.value?.role === 'standard')
+  /** 可提交/运行工作流（含 demo；创建定义仍看 canWrite） */
+  const canRunWorkflow = computed(
+    () =>
+      user.value?.role === 'admin' ||
+      user.value?.role === 'standard' ||
+      user.value?.role === 'demo',
+  )
+  const authRequired = computed(() => {
+    if (bootstrapError.value) return true
+    return config.value?.auth_required ?? true
+  })
+
+  /**
+   * 受限登录态：已登录、但角色既不是 admin 也不是 standard（典型：demo 游客）。
+   *
+   * 用途只有一个 —— 让前端**提前跳过「必然失败」的请求**：后端对这类身份读取系统
+   * 配置一律返回 403，继续请求只会「失败 → 自动重试 → 每次失败再写一条日志」，
+   * 一开设置面板就刷出几十条报错。
+   *
+   * ⚠️ 这**不是权限判定**。真实权限永远由后端裁决，这里只是不去明知故问；
+   * 跳过请求不会让任何人「多看到」任何东西（界面反而更少）。
+   *
+   * ⚠️ 必须带上 `authRequired`：无鉴权部署（auth_required=false）下前端拿不到有效
+   * 角色，只按角色判断会把本应可读的配置一起跳过、弄坏正常部署。
+   */
+  const isRestrictedRole = computed(
+    () => authRequired.value && user.value !== null && !canWrite.value,
+  )
+
+  const activeTheme = computed<ThemePublic | null>(() => {
+    const fromUser = user.value?.theme
+    if (fromUser) return fromUser
+    return primaryTheme.value
+  })
+
+  const loginPreviewTheme = computed<ThemePublicBrand | null>(() => {
+    if (user.value) return null
+    const slug = loginPreviewSlug.value
+    if (!slug) return null
+    return publicThemes.value.find((t) => t.slug === slug) ?? null
+  })
+
+  const resolvedBrand = computed<ResolvedBrand>(() => {
+    if (loginPreviewTheme.value) {
+      return brandFromTheme(loginPreviewTheme.value) ?? staticBrand()
+    }
+    return brandFromTheme(activeTheme.value) ?? brandFromTheme(primaryTheme.value) ?? staticBrand()
+  })
+
+  watch(
+    resolvedBrand,
+    (brand) => {
+      applyDocumentTitle(brand.fullName)
+    },
+    { immediate: true },
+  )
+
+  watch(
+    () => user.value?.id ?? null,
+    (userId) => {
+      setActiveStorageUserId(userId)
+    },
+    { immediate: true },
+  )
+
+  async function loadPrimaryTheme() {
+    try {
+      const brand = await fetchPrimaryThemePublic()
+      primaryTheme.value = {
+        ...brand,
+        default_permission_mode: 'open',
+        is_primary: true,
+      }
+    } catch {
+      primaryTheme.value = null
+    }
+  }
+
+  async function loadPublicThemes() {
+    try {
+      const list = await fetchThemesPublic()
+      publicThemes.value = Array.isArray(list) ? list : []
+      if (!loginPreviewSlug.value && publicThemes.value.length === 1) {
+        const only = publicThemes.value[0]?.slug
+        if (only) setLoginPreviewSlug(only)
+      }
+    } catch {
+      publicThemes.value = []
+    }
+  }
+
+  function readStoredLoginThemeSlug(): string | null {
+    if (typeof window === 'undefined') return null
+    try {
+      const raw = window.sessionStorage.getItem(LOGIN_THEME_SLUG_KEY)
+      return raw && raw.trim() ? raw.trim() : null
+    } catch {
+      return null
+    }
+  }
+
+  function setLoginPreviewSlug(slug: string | null) {
+    const next = slug?.trim() || null
+    loginPreviewSlug.value = next
+    if (typeof window === 'undefined') return
+    try {
+      if (next) window.sessionStorage.setItem(LOGIN_THEME_SLUG_KEY, next)
+      else window.sessionStorage.removeItem(LOGIN_THEME_SLUG_KEY)
+    } catch {
+      /* private mode */
+    }
+  }
+
+  function initLoginPreviewSlug(routeSlug?: string | null) {
+    const fromRoute = routeSlug?.trim() || null
+    const fromStorage = readStoredLoginThemeSlug()
+    const primary = publicThemes.value.find((t) => t.slug === primaryTheme.value?.slug)
+    const fallback =
+      primary?.slug ?? publicThemes.value[0]?.slug ?? primaryTheme.value?.slug ?? null
+    if (publicThemes.value.length === 0) {
+      setLoginPreviewSlug(fallback)
+      return
+    }
+    const candidate = fromRoute ?? fromStorage ?? fallback
+    if (!candidate) return
+    if (!publicThemes.value.some((t) => t.slug === candidate)) {
+      setLoginPreviewSlug(fallback)
+      return
+    }
+    setLoginPreviewSlug(candidate)
+  }
+
+  async function applyDevAutoLogin() {
+    const prefill = config.value?.dev_prefill
+    if (!import.meta.env.DEV || !prefill || user.value) return
+    const username = prefill.username
+    const password = prefill.password
+    if (!username || !password) return
+    try {
+      await login(username, password)
+    } catch {
+      // Manual login fallback.
+    }
+  }
+
+  /**
+   * 访客（demo 角色）一键进入的凭据，来自构建期环境变量：
+   *   VITE_GUEST_USERNAME / VITE_GUEST_PASSWORD
+   * 两者都填才启用；任一为空 ⇒ 整条功能静默关闭，行为与改造前完全一致（必须先登录）。
+   * 注意：这里只提供「登录页上的一个按钮」，**不做任何自动登录**，管理员路径不受影响。
+   */
+  const guestCredentials = (() => {
+    const env = import.meta.env as Record<string, unknown>
+    const username = String(env.VITE_GUEST_USERNAME ?? '').trim()
+    const password = String(env.VITE_GUEST_PASSWORD ?? '').trim()
+    return username && password ? { username, password } : null
+  })()
+
+  /** 是否展示「以游客身份进入」入口（构建期凭据齐备时为 true）。 */
+  const guestLoginEnabled = computed(() => guestCredentials !== null)
+
+  /** 以访客身份直接进入系统（仅在登录页由用户主动点击时调用）。 */
+  async function enterAsGuest() {
+    if (!guestCredentials) {
+      throw new Error('未配置访客账号（VITE_GUEST_USERNAME / VITE_GUEST_PASSWORD）')
+    }
+    await login(guestCredentials.username, guestCredentials.password)
+  }
+
+  async function bootstrap() {
+    if (bootstrapped.value) return
+    bootstrapError.value = null
+    try {
+      void loadPrimaryTheme()
+      config.value = await fetchAuthConfig()
+      if (!config.value.auth_required) {
+        try {
+          user.value = await fetchAuthMe()
+        } catch {
+          user.value = null
+        }
+        bootstrapped.value = true
+        return
+      }
+      try {
+        user.value = await fetchAuthMe()
+      } catch {
+        user.value = null
+      }
+      if (!user.value) {
+        await applyDevAutoLogin()
+      }
+    } catch (err) {
+      bootstrapError.value = err instanceof Error ? err.message : String(err)
+    } finally {
+      bootstrapped.value = true
+    }
+  }
+
+  async function login(username: string, password: string) {
+    user.value = await loginRequest(username, password)
+  }
+
+  async function logout() {
+    const prevId = user.value?.id ?? null
+    try {
+      await logoutRequest()
+    } finally {
+      user.value = null
+      clearBackendWriteApiKey()
+      clearUserLocalState(prevId)
+      setActiveStorageUserId(null)
+    }
+  }
+
+  function clearSession() {
+    const prevId = user.value?.id ?? null
+    user.value = null
+    clearBackendWriteApiKey()
+    clearUserLocalState(prevId)
+    setActiveStorageUserId(null)
+  }
+
+  async function loadUsers() {
+    usersLoading.value = true
+    try {
+      users.value = await listUsers()
+    } finally {
+      usersLoading.value = false
+    }
+  }
+
+  async function loadThemes() {
+    themesLoading.value = true
+    try {
+      const data = await listThemes()
+      themes.value = Array.isArray(data) ? data : []
+    } catch (err) {
+      themes.value = []
+      throw err
+    } finally {
+      themesLoading.value = false
+    }
+  }
+
+  async function addUser(
+    username: string,
+    password: string,
+    role: UserRole,
+    themeId?: number | null,
+  ) {
+    const created = await createUser({
+      username,
+      password,
+      role,
+      theme_id: themeId ?? undefined,
+    })
+    users.value = [...users.value, created]
+    return created
+  }
+
+  async function patchUser(
+    userId: number,
+    patch: {
+      password?: string
+      role?: UserRole
+      enabled?: boolean
+      /** 必须绑定主题；禁止传 null 清除。 */
+      theme_id?: number
+    },
+  ) {
+    if ('theme_id' in patch && (patch.theme_id == null || !(patch.theme_id > 0))) {
+      throw new Error('每个用户必须绑定一个主题，不能清除 theme_id')
+    }
+    const updated = await updateUser(userId, patch)
+    users.value = users.value.map((u) => (u.id === userId ? updated : u))
+    if (user.value?.id === userId) {
+      user.value = updated
+    }
+    return updated
+  }
+
+  async function removeUser(userId: number) {
+    await deleteUser(userId)
+    users.value = users.value.filter((u) => u.id !== userId)
+  }
+
+  async function retryBootstrap() {
+    bootstrapped.value = false
+    bootstrapError.value = null
+    await bootstrap()
+  }
+
+  return {
+    user,
+    config,
+    bootstrapped,
+    bootstrapError,
+    users,
+    usersLoading,
+    primaryTheme,
+    publicThemes,
+    loginPreviewSlug,
+    loginPreviewTheme,
+    themes,
+    themesLoading,
+    activeTheme,
+    resolvedBrand,
+    isAuthenticated,
+    isAdmin,
+    isDemo,
+    canWrite,
+    canRunWorkflow,
+    authRequired,
+    isRestrictedRole,
+    bootstrap,
+    retryBootstrap,
+    login,
+    logout,
+    clearSession,
+    guestLoginEnabled,
+    enterAsGuest,
+    loadUsers,
+    loadThemes,
+    loadPrimaryTheme,
+    loadPublicThemes,
+    initLoginPreviewSlug,
+    setLoginPreviewSlug,
+    addUser,
+    patchUser,
+    removeUser,
+  }
+})

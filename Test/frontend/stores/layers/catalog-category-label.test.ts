@@ -1,0 +1,43 @@
+import { describe, expect, it } from 'vitest'
+
+import {
+  LAYER_CATEGORIES,
+  applyResearchGroupCategoryLabel,
+  resolveCategoryDisplayName,
+} from '@/stores/layers/catalog'
+import { resolveCategory } from '@/stores/layers/catalog-builders'
+
+describe('research-group 分类显示名', () => {
+  it('LAYER_CATEGORIES 中 research-group 默认显示为研发数据', () => {
+    const cat = LAYER_CATEGORIES.find((c) => c.id === 'research-group')
+    expect(cat?.name).toBe('研发数据')
+  })
+
+  it('applyResearchGroupCategoryLabel 覆盖 JSON 中的旧中文名', () => {
+    const patched = applyResearchGroupCategoryLabel([
+      { id: 'research-group', name: '课题组数据' },
+      { id: 'climate', name: '气候与灾害' },
+    ])
+    expect(patched[0]?.name).toBe('研发数据')
+    expect(patched[1]?.name).toBe('气候与灾害')
+  })
+
+  it('applyResearchGroupCategoryLabel 把 research-group 置顶', () => {
+    const patched = applyResearchGroupCategoryLabel([
+      { id: 'climate', name: '气候与灾害' },
+      { id: 'landcover', name: '土地利用' },
+      { id: 'research-group', name: '课题组数据' },
+    ])
+    expect(patched.map((c) => c.id)).toEqual(['research-group', 'climate', 'landcover'])
+  })
+
+  it('resolveCategoryDisplayName 解析 research-group', () => {
+    expect(resolveCategoryDisplayName('research-group')).toBe('研发数据')
+  })
+
+  it('历史中文类别别名归并到 research-group', () => {
+    expect(resolveCategory({ category: '课题组数据' } as never)).toBe('research-group')
+    expect(resolveCategory({ category: '研发数据' } as never)).toBe('research-group')
+    expect(resolveCategory({ category: '核心资产' } as never)).toBe('research-group')
+  })
+})

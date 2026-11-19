@@ -1,0 +1,69 @@
+{
+  "_meta": {
+    "kind": "system",
+    "engine": "common",
+    "name": "NASA Earthdata 开放数据样例",
+    "description": "目的：从 NASA Earthdata/LP DAAC 云端对象下载产品到静态缓存并解压。默认对象为 LP DAAC 公开浏览图（lp-prod-public，免登录），可直接跑通下载→缓存→透传提取；科学 granule（HDF5/NetCDF）需 earthdata 凭证并将 relative_path 换为具体对象键。产出：缓存/提取目录路径。",
+    "author": "system",
+    "readonly": true,
+    "is_template": true,
+    "linked_layer_id": null,
+    "tags": [
+      "sample",
+      "download"
+    ],
+    "category": "data_access"
+  },
+  "workflow_id": "open_data_nasa_earthdata_sample",
+  "name": "NASA Earthdata 开放数据样例",
+  "description": "nasa_earthdata（公开浏览对象或凭据下载）→ archive_extract 透传。",
+  "nodes": [
+    {
+      "id": 1,
+      "type": "download/http_open_data",
+      "pos": [
+        100,
+        140
+      ],
+      "properties": {
+        "preset": "nasa_earthdata",
+        "relative_path": "lp-prod-public/MCD43A4.061/MCD43A4.A2000055.h10v11.061.2020038135037/BROWSE.MCD43A4.A2000055.h10v11.061.2020038085120.1.jpg",
+        "cred_profile": "earthdata",
+        "force_refresh": false
+      }
+    },
+    {
+      "id": 2,
+      "type": "archive/extract",
+      "pos": [
+        420,
+        140
+      ],
+      "properties": {
+        "member_glob": "",
+        "recurse_once": true,
+        "output_dirname": "earthdata_extracted"
+      }
+    }
+  ],
+  "links": [
+    {
+      "0": 1,
+      "1": 1,
+      "2": 0,
+      "3": 2,
+      "4": 0,
+      "5": "value:string"
+    }
+  ],
+  "extra": {
+    "purpose": "open_portal_sample",
+    "portal": "nasa_earthdata",
+    "cred_profile": "earthdata",
+    "notes": "默认 relative_path 为 LP DAAC 公开浏览 JPG（lp-prod-public 前缀免登录，用于免凭据冒烟）；下载科学数据（如 MCD43A4 HDF5）需 earthdata 凭证并替换对象键，可在 extract 后接 extract/variable。nasa_cmr 预设仅作二期检索 base；下载请用 nasa_earthdata 或具体 CDN。",
+    "group_title": "NASA EarthData 数据样例",
+    "output_labels": {
+      "result": "EarthData 数据样例"
+    }
+  }
+}

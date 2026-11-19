@@ -1,0 +1,125 @@
+import { MAP_COPY } from '../../ui-copy'
+
+type MapContainerGetter = () => HTMLElement | null
+
+export interface MapStagePresentationModule {
+  prepareMount: () => Promise<void>
+  setLoadingLabel: (label: string) => void
+  syncNavigationControlTheme: () => void
+  scheduleNavigationThemeSync: () => void
+  revealMap: () => void
+  dispose: () => void
+}
+
+interface CreateMapStagePresentationModuleOptions {
+  getMapContainer: MapContainerGetter
+  getUsesLightNavigationTheme: () => boolean
+  setLoadingLabel: (label: string) => void
+  setMapVisible: (visible: boolean) => void
+  setSkeletonVisible: (visible: boolean) => void
+  dependencies?: {
+    requestAnimationFrame?: typeof requestAnimationFrame
+    setTimeout?: typeof setTimeout
+    clearTimeout?: typeof clearTimeout
+  }
+}
+
+export function createMapStagePresentationModule(
+  options: CreateMapStagePresentationModuleOptions,
+): MapStagePresentationModule {
+  const requestAnimationFrameImpl =
+    options.dependencies?.requestAnimationFrame ?? requestAnimationFrame
+  const setTimeoutImpl = options.dependencies?.setTimeout ?? setTimeout
+  const clearTimeoutImpl = options.dependencies?.clearTimeout ?? clearTimeout
+
+  let pendingThemeSyncHandle: ReturnType<typeof setTimeout> | null = null
+  let pendingSkeletonHideHandle: ReturnType<typeof setTimeout> | null = null
+
+  function setLoadingLabel(label: string) {
+    options.setLoadingLabel(label)
+  }
+
+  function syncNavigationControlTheme() {
+    const container = options.getMapContainer()
+    if (!container) return
+
+    const navCtrl =
+      typeof container.querySelector === 'function'
+        ? container.querySelector('.maplibregl-ctrl-bottom-right .map-custom-nav-ctrl')
+        : null
+
+    if (navCtrl) {
+      if (options.getUsesLightNavigationTheme()) {
+        navCtrl.classList.add('map-nav-ctrl--light')
+        navCtrl.classList.remove('map-nav-ctrl--dark')
+      } else {
+        navCtrl.classList.add('map-nav-ctrl--dark')
+        navCtrl.classList.remove('map-nav-ctrl--light')
+      }
+      return
+    }
+
+    const navButtons =
+      typeof container.querySelectorAll === 'function'
+        ? container.querySelectorAll('.maplibregl-ctrl-bottom-right .maplibregl-ctrl-group button')
+        : null
+    if (!navButtons?.length) return
+
+    const buttonBackground = options.getUsesLightNavigationTheme()
+      ? 'rgba(252, 253, 255, 0.94)'
+      : 'var(--surface-1)'
+
+    navButtons.forEach((button) => {
+      ;(button as HTMLElement).style.backgroundColor = buttonBackground
+    })
+  }
+
+  async function prepareMount() {
+    setLoadingLabel(MAP_COPY.loading)
+    await new Promise<void>((resolve) => requestAnimationFrameImpl(() => resolve()))
+    setLoadingLabel(MAP_COPY.loading)
+  }
+
+  function scheduleNavigationThemeSync() {
+    if (pendingThemeSyncHandle !== null) {
+      clearTimeoutImpl(pendingThemeSyncHandle)
+    }
+    pendingThemeSyncHandle = setTimeoutImpl(() => {
+      pendingThemeSyncHandle = null
+      syncNavigationControlTheme()
+    }, 0)
+  }
+
+  function revealMap() {
+    requestAnimationFrameImpl(() => {
+      options.setMapVisible(true)
+      if (pendingSkeletonHideHandle !== null) {
+        clearTimeoutImpl(pendingSkeletonHideHandle)
+      }
+      pendingSkeletonHideHandle = setTimeoutImpl(() => {
+        pendingSkeletonHideHandle = null
+        options.setSkeletonVisible(false)
+      }, 260)
+    })
+  }
+
+  function dispose() {
+    if (pendingThemeSyncHandle !== null) {
+      clearTimeoutImpl(pendingThemeSyncHandle)
+      pendingThemeSyncHandle = null
+    }
+    if (pendingSkeletonHideHandle !== null) {
+      clearTimeoutImpl(pendingSkeletonHideHandle)
+      pendingSkeletonHideHandle = null
+    }
+  }
+
+  return {
+    prepareMount,
+    setLoadingLabel,
+    syncNavigationControlTheme,
+    scheduleNavigationThemeSync,
+    revealMap,
+    dispose,
+  }
+}

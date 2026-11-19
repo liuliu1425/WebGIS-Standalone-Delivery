@@ -1,0 +1,405 @@
+"""Local user accounts (SQLite)."""
+
+from __future__ import annotations
+
+import sqlite3
+from datetime import datetime, UTC
+from pathlib import Path
+from typing import Any, Literal
+
+from app.core.config import settings
+from app.services._sqlite_pool import SQLiteConnectionPool
+from app.services.passwords import hash_password, validate_password, verify_password
+
+UserRole = Literal["admin", "standard", "demo"]
+VALID_ROLES: frozenset[str] = frozenset({"admin", "standard", "demo"})
+
+# Fixed hash for timing-equalization when username is missing.
+_DUMMY_PASSWORD_HASH = hash_password("dummy-timing-equalization-secret")
+
+#: ``update_user`` 可写字段白名单（f-string 拼接 SQL 列名时的注入防线：
+#: 未来新增可更新字段必须登记于此，否则断言失败而非静默拼接）。
+_UPDATABLE_COLUMNS = frozenset(
+    {
+        "updated_at",
+        "password_hash",
+        "role",
+        "enabled",
+        "max_concurrent_workflows",
+        "permission_mode",
+        "theme_id",
+    }
+)
+
+
+def _users_db_path() -> Path:
+    state_dir = Path(settings.workflow_state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir / "users.sqlite3"
+
+
+class UserRepository:
+    def __init__(self, db_path: str | Path | None = None) -> None:
+        self.db_path = Path(db_path or _users_db_path())
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._pool = SQLiteConnectionPool(self.db_path)
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        with self._pool.connection() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'standard',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sessions (
+                    token TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    username TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)"
+            )
+            # P2-3：过期会话主动清理按 expires_at 扫描，需索引避免全表扫。
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_expires "
+                "ON sessions(expires_at)"
+            )
+            # Phase C：按角色并发控制——为 users 表增量加列（additive-only 迁移）。
+            # 用 try/except 处理列已存在的情况（首次创建表时列已在 CREATE TABLE 中，
+            # 但旧库升级时需要 ALTER）。
+            try:
+                conn.execute(
+                    "ALTER TABLE users ADD COLUMN max_concurrent_workflows INTEGER DEFAULT NULL"
+                )
+            except sqlite3.OperationalError:
+                pass  # 列已存在
+            try:
+                conn.execute(
+                    "ALTER TABLE users ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'open'"
+                )
+            except sqlite3.OperationalError:
+                pass  # 列已存在
+            # Phase B：资源访问控制——权限记录表。
+            # permission_mode='open' 时为黑名单模式（无 deny 记录则允许），
+            # permission_mode='whitelist' 时为白名单模式（仅 allow 记录可访问）。
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_resource_permissions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    resource_type TEXT NOT NULL,
+                    resource_id TEXT NOT NULL,
+                    permission TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(user_id, resource_type, resource_id)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_permissions_user "
+                "ON user_resource_permissions(user_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_permissions_user_type "
+                "ON user_resource_permissions(user_id, resource_type)"
+            )
+            try:
+                conn.execute("ALTER TABLE users ADD COLUMN theme_id INTEGER")
+            except sqlite3.OperationalError:
+                pass
+            conn.commit()
+
+    def close(self) -> None:
+        self._pool.close_all()
+
+    def count_users(self) -> int:
+        with self._pool.connection() as conn:
+            row = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()
+        return int(row["c"]) if row else 0
+
+    def get_by_username(self, username: str) -> dict[str, Any] | None:
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE username=? COLLATE NOCASE",
+                (username.strip(),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_by_id(self, user_id: int) -> dict[str, Any] | None:
+        with self._pool.connection() as conn:
+            row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_users(self) -> list[dict[str, Any]]:
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT id, username, role, enabled, created_at, updated_at, "
+                "permission_mode, theme_id "
+                "FROM users ORDER BY id ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_admins(self) -> int:
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM users WHERE role='admin' AND enabled=1"
+            ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def verify_credentials(self, username: str, password: str) -> dict[str, Any] | None:
+        user = self.get_by_username(username)
+        stored = str(user["password_hash"]) if user else _DUMMY_PASSWORD_HASH
+        if not verify_password(password, stored):
+            return None
+        if not user or not user.get("enabled"):
+            return None
+        return user
+
+    def create_user(
+        self,
+        *,
+        username: str,
+        password: str,
+        role: UserRole = "standard",
+        theme_id: int | None = None,
+    ) -> dict[str, Any]:
+        name = username.strip()
+        if not name:
+            raise ValueError("username is required")
+        if role not in VALID_ROLES:
+            raise ValueError(f"invalid role: {role}")
+        # 强度校验放在仓储层：脚本/迁移等直接调用者同样受约束（不止 API 层 Pydantic）。
+        validate_password(password, username=name)
+        from app.services.theme_repository import get_theme_repository
+
+        theme_repo = get_theme_repository()
+        permission_mode = "open"
+        if theme_id is None:
+            primary = theme_repo.get_primary()
+            resolved_theme_id = int(primary.id)
+            permission_mode = primary.default_permission_mode
+        else:
+            theme = theme_repo.get_by_id(int(theme_id))
+            if theme is None:
+                raise ValueError(f"theme not found: {theme_id}")
+            resolved_theme_id = int(theme.id)
+            permission_mode = theme.default_permission_mode
+        now = datetime.now(UTC).isoformat()
+        pwd_hash = hash_password(password)
+        with self._pool.connection() as conn:
+            try:
+                cur = conn.execute(
+                    """
+                    INSERT INTO users (
+                        username, password_hash, role, enabled,
+                        created_at, updated_at, theme_id, permission_mode
+                    )
+                    VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+                    """,
+                    (
+                        name,
+                        pwd_hash,
+                        role,
+                        now,
+                        now,
+                        resolved_theme_id,
+                        permission_mode,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("username already exists") from exc
+            user_id = int(cur.lastrowid)
+            conn.commit()
+        user = self.get_by_id(user_id)
+        assert user is not None
+        return user
+
+    def update_user(
+        self,
+        user_id: int,
+        *,
+        password: str | None = None,
+        role: UserRole | None = None,
+        enabled: bool | None = None,
+        max_concurrent_workflows: int | None = None,
+        permission_mode: str | None = None,
+        theme_id: int | None = None,
+    ) -> dict[str, Any] | None:
+        user = self.get_by_id(user_id)
+        if not user:
+            return None
+        if role is not None and role not in VALID_ROLES:
+            raise ValueError(f"invalid role: {role}")
+        if password is not None:
+            # 同 create_user：仓储层兜底，避免绕过 API 直接改库时设回弱口令。
+            validate_password(password, username=str(user.get("username") or ""))
+        now = datetime.now(UTC).isoformat()
+        fields: list[str] = ["updated_at=?"]
+        params: list[Any] = [now]
+        if password is not None:
+            fields.append("password_hash=?")
+            params.append(hash_password(password))
+        if role is not None:
+            fields.append("role=?")
+            params.append(role)
+        if enabled is not None:
+            fields.append("enabled=?")
+            params.append(1 if enabled else 0)
+        if max_concurrent_workflows is not None:
+            fields.append("max_concurrent_workflows=?")
+            params.append(max_concurrent_workflows)
+        if permission_mode is not None:
+            fields.append("permission_mode=?")
+            params.append(permission_mode)
+        if theme_id is not None:
+            from app.services.theme_repository import get_theme_repository
+
+            if get_theme_repository().get_by_id(int(theme_id)) is None:
+                raise ValueError(f"theme not found: {theme_id}")
+            fields.append("theme_id=?")
+            params.append(int(theme_id))
+        # 注入防线：拼接的列名必须全部在白名单内（见模块级 _UPDATABLE_COLUMNS），
+        # 用显式检查而非 assert，避免 python -O 下失效。
+        if not set(fields) <= {f"{c}=?" for c in _UPDATABLE_COLUMNS}:
+            raise ValueError(f"unexpected update columns: {fields}")
+        params.append(user_id)
+        with self._pool.connection() as conn:
+            conn.execute(
+                f"UPDATE users SET {', '.join(fields)} WHERE id=?",
+                params,
+            )
+            conn.commit()
+        return self.get_by_id(user_id)
+
+    def delete_user(self, user_id: int) -> bool:
+        with self._pool.connection() as conn:
+            cur = conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+            deleted = cur.rowcount > 0
+            conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+            conn.commit()
+        # 权限表可能在独立连接/未启用 FK；显式清理避免孤儿 ACL
+        try:
+            from app.services.permission_repository import get_permission_repository
+
+            get_permission_repository().set_user_permissions(user_id, [])
+        except Exception:
+            logger = __import__("logging").getLogger(__name__)
+            logger.warning(
+                "Failed to clear resource permissions for deleted user %s",
+                user_id,
+                exc_info=True,
+            )
+        return deleted
+
+    def get_max_concurrent_workflows(self, user_id: int) -> int | None:
+        """Return the user-specific concurrent workflow limit, or ``None`` if unset.
+
+        When ``None``, the caller should fall back to the role-based default
+        (see ``submission_service._user_concurrency_limit``).
+        """
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                "SELECT max_concurrent_workflows FROM users WHERE id=?",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        value = row["max_concurrent_workflows"] if isinstance(row, dict) else row[0]
+        return int(value) if value is not None else None
+
+    def upsert_session(
+        self,
+        *,
+        token: str,
+        user_id: int,
+        username: str,
+        role: str,
+        expires_at: str,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self._pool.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO sessions (token, user_id, username, role, expires_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(token) DO UPDATE SET
+                    user_id=excluded.user_id,
+                    username=excluded.username,
+                    role=excluded.role,
+                    expires_at=excluded.expires_at
+                """,
+                (token, user_id, username, role, expires_at, now),
+            )
+            conn.commit()
+
+    def get_session(self, token: str) -> dict[str, Any] | None:
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                "SELECT token, user_id, username, role, expires_at FROM sessions WHERE token=?",
+                (token,),
+            ).fetchone()
+        if not row:
+            return None
+        expires = datetime.fromisoformat(str(row["expires_at"]))
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=UTC)
+        if expires <= datetime.now(UTC):
+            self.delete_session(token)
+            return None
+        return dict(row)
+
+    def delete_session(self, token: str) -> None:
+        with self._pool.connection() as conn:
+            conn.execute("DELETE FROM sessions WHERE token=?", (token,))
+            conn.commit()
+
+    def delete_sessions_for_user(self, user_id: int) -> None:
+        with self._pool.connection() as conn:
+            conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+            conn.commit()
+
+    def purge_expired_sessions(self) -> int:
+        """主动删除已过期的 SQLite 会话行（P2-3）。
+
+        Redis 侧会话靠 TTL 自动淘汰，但 **会话的 SQLite 兜底副本此前仅惰性删除**
+        （只在恰好有人拿该 token 查库时才删掉）。后果：Redis 不可用期间创建的会话
+        行会永久堆积（实测库中残留 8 月的过期行），既占空间又让「按 user_id 吊销」
+        每次都扫到一堆死行。
+
+        ``expires_at`` 由 ``datetime.now(UTC).isoformat()`` 写入，格式固定
+        （``YYYY-MM-DDTHH:MM:SS.ffffff+00:00``），字符串比较即等价于时间比较。
+        返回删除行数。
+        """
+        cutoff = datetime.now(UTC).isoformat()
+        with self._pool.connection() as conn:
+            cur = conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (cutoff,))
+            conn.commit()
+        return int(cur.rowcount or 0)
+
+
+_repo: UserRepository | None = None
+
+
+def get_user_repository() -> UserRepository:
+    global _repo
+    if _repo is None:
+        _repo = UserRepository()
+    return _repo

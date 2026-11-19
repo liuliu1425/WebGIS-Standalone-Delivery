@@ -1,0 +1,226 @@
+/**
+ * useWorkflowEditorRun — 从工作流编辑器提交运行。
+ *
+ * 从 DashboardView.vue 提取：handleRunWorkflowFromEditor（~200 行编译 + 提交逻辑）。
+ */
+import type { Ref } from 'vue'
+import type { useLogStore } from '../../stores/log'
+import {
+  useWorkflowOutputLayersStore,
+  WORKFLOW_OUTPUT_SUBCATEGORY,
+} from '../../stores/workflow-output-layers'
+import type { WorkflowRunTarget } from '../../components/workflow/WorkflowRunDialog.vue'
+import { useLayerWorkspace, useLayerViewport, useWorkflowRun } from '../../stores/layers/selectors'
+import { INVERSION_RUN_LAYER_PATTERN } from '../../stores/layers/inversion-catalog'
+import { resolveRunGroupTitle } from '../../utils/workflow-run-display-name'
+import { productTagLabel } from '../../utils/workflow-expected-outputs'
+import { WorkflowValidationError } from '../../services/_http'
+
+export function useWorkflowEditorRun(
+  logStore: ReturnType<typeof useLogStore>,
+  workflowOutputStore: ReturnType<typeof useWorkflowOutputLayersStore>,
+  workflowEditorOpen: Ref<boolean>,
+  workflowStatusOpen: Ref<boolean>,
+  workflowEditorRef: Ref<{
+    notifyRunOutcome?: (ok: boolean, message?: string) => void
+  } | null>,
+) {
+  const workspace = useLayerWorkspace()
+  const viewport = useLayerViewport()
+  const workflowRun = useWorkflowRun()
+  async function handleRunWorkflowFromEditor(
+    workflowId: string,
+    linkedLayerId: string | null,
+    target: WorkflowRunTarget,
+    canvasGraph?: {
+      nodes: import('../../services/workflow-definition-api').WorkflowDefinitionNode[]
+      links: import('../../services/workflow-definition-api').WorkflowDefinitionLink[]
+    } | null,
+  ) {
+    logStore.logWorkflow(
+      'workflow-editor-run',
+      `从编辑器运行工作流: ${workflowId} (目标: ${target.mode})`,
+    )
+    const sourceLayerId = target.layerId ?? linkedLayerId
+    if (!sourceLayerId) {
+      const msg = `工作流 ${workflowId} 未关联图层，无法运行`
+      logStore.logWorkflow('workflow-editor-error', msg)
+      workflowEditorRef.value?.notifyRunOutcome?.(false, msg)
+      return
+    }
+
+    const defaultTargets = INVERSION_RUN_LAYER_PATTERN.test(workflowId)
+      ? (['SM', 'VOD', 'OMEGA'] as const).map((productTag) => ({
+          name: productTagLabel(productTag),
+          productTag,
+        }))
+      : [{ name: target.name ?? '产出', productTag: 'result' }]
+    const targets = target.targets?.length ? target.targets : defaultTargets
+    const groupTitle = resolveRunGroupTitle({
+      configuredTitle: target.groupTitle,
+      workflowId,
+      jobName: target.name,
+      fallback: '反演产物',
+    })
+
+    let memberCatalogIds: string[] | undefined
+    if (target.mode === 'new') {
+      const engine =
+        workspace.layerLibrary.value.find((l) => l.catalogId === sourceLayerId)?.engine ?? 'general'
+      const entries = workflowOutputStore.createOutputLayers(
+        targets.map((t) => ({ name: t.name, group: WORKFLOW_OUTPUT_SUBCATEGORY })),
+        workflowId,
+        sourceLayerId,
+        engine,
+      )
+      memberCatalogIds = entries.map((e) => e.localId)
+      logStore.logWorkflow(
+        'workflow-output-create',
+        `创建 ${entries.length} 个产出图层 → ${WORKFLOW_OUTPUT_SUBCATEGORY}`,
+      )
+    }
+
+    const created = workflowRun.createRunLayerGroup({
+      title: groupTitle,
+      targets,
+      sourceLayerId,
+      workflowId,
+      memberCatalogIds,
+    })
+    const catalogId = created.memberCatalogIds[0] || sourceLayerId
+
+    workflowEditorOpen.value = false
+    workflowStatusOpen.value = true
+
+    try {
+      let algorithmRequest: Record<string, unknown> | undefined
+      let weatherRequest: Record<string, unknown> | undefined
+      let topLevelTimeRange: Record<string, unknown> | undefined
+      const nodes = canvasGraph?.nodes ?? []
+      const links = canvasGraph?.links ?? []
+      if (nodes.length > 0) {
+        const { dryValidateWorkflowGraph } = await import('../../services/workflow-definition-api')
+        const { WORKFLOW_COPY } = await import('../../ui-copy/workflow')
+        const { deriveJobTimeRangeFromGraph } =
+          await import('../../composables/workflow-pipeline-params')
+        const graphPayload = {
+          workflow_id: workflowId,
+          name: workflowId,
+          nodes,
+          links,
+        }
+        try {
+          const validated = await dryValidateWorkflowGraph(graphPayload)
+          const def = validated.workflow_definition as Record<string, unknown>
+          if (!def) {
+            throw new Error(WORKFLOW_COPY.dryValidateFailed)
+          }
+          const engine =
+            ((def.metadata as Record<string, unknown> | undefined)?.engine as string | undefined) ??
+            'python_provider'
+          const canvasNodes = ((def.nodes as unknown) ?? nodes) as Array<Record<string, unknown>>
+          // 流水线种子常无 data/time_range：从 download/algorithm_params 的
+          // start_date+end_date 推导，禁止回落主时间轴「今天」。
+          topLevelTimeRange = deriveJobTimeRangeFromGraph(canvasNodes) ?? undefined
+          if (!topLevelTimeRange) {
+            topLevelTimeRange =
+              deriveJobTimeRangeFromGraph(nodes as unknown as Array<Record<string, unknown>>) ??
+              undefined
+          }
+          if (engine === 'weather') {
+            weatherRequest = {
+              workflow_id: workflowId,
+              layer_id: sourceLayerId,
+              workflow: def,
+              context: {
+                latitude: viewport.currentMapCenter.value.lat,
+                longitude: viewport.currentMapCenter.value.lng,
+              },
+              priority: 'viewport',
+            }
+          } else {
+            const datasourceSelection: Record<string, unknown> = {}
+            const algorithmParams: Record<string, unknown> = {}
+            for (const node of canvasNodes) {
+              const props = (node.properties ?? node.params ?? {}) as Record<string, unknown>
+              const ntype = String(node.type ?? node.node_type ?? '')
+              const moduleName = String(props.module_name ?? '')
+              const isSource =
+                ntype === 'data/source' ||
+                ntype.endsWith('/source') ||
+                moduleName === 'data_source' ||
+                moduleName === 'source'
+              if (isSource) {
+                const key = String(props.dataset_key ?? props.key ?? '').trim()
+                const path = String(props.path ?? props.value ?? '').trim()
+                if (key && path) datasourceSelection[key] = path
+              }
+              const ap = props.algorithm_params
+              if (ap && typeof ap === 'object' && !Array.isArray(ap)) {
+                Object.assign(algorithmParams, ap as Record<string, unknown>)
+              }
+            }
+            algorithmRequest = {
+              workflow_definition: def,
+              workflow_entry_name: workflowId,
+              datasource_selection: datasourceSelection,
+              algorithm_params: algorithmParams,
+              output_spec: {},
+              tags: { source: 'workflow_editor', workflow_id: workflowId },
+            }
+            if (topLevelTimeRange) {
+              algorithmRequest.time_range = {
+                start: topLevelTimeRange.start_at,
+                end: topLevelTimeRange.end_at,
+              }
+            }
+          }
+          logStore.logWorkflow(
+            'workflow-editor-compile',
+            `${WORKFLOW_COPY.dryValidateOk}(${engine}): nodes=${(def.nodes as unknown[] | undefined)?.length ?? 0}`,
+          )
+        } catch (error) {
+          if (error instanceof WorkflowValidationError) {
+            const detail =
+              error.issues
+                .map((i) => i.message)
+                .filter(Boolean)
+                .join('；') ||
+              error.message ||
+              WORKFLOW_COPY.dryValidateFailed
+            throw new Error(`${WORKFLOW_COPY.dryValidateFailed}：${detail}`, { cause: error })
+          }
+          throw error
+        }
+      }
+      await workflowRun.runWorkflowForCatalog(catalogId, {
+        algorithmRequest,
+        weatherRequest,
+        timeRange: topLevelTimeRange,
+        commandLabel: `运行画布工作流 ${workflowId}`,
+        resourceProfile: /omega_sf|omega_block|omega_avg/i.test(workflowId) ? 'heavy' : undefined,
+      })
+      // runId 由 runWorkflowForCatalog → ensureRestoredRunGroup(submit) 写入计算组
+      workflowEditorRef.value?.notifyRunOutcome?.(true)
+    } catch (error) {
+      workflowRun.updateRunGroupFromJob('', {
+        status: 'failed',
+        progress: 0,
+        message: String(error),
+      })
+      const g = workflowRun.findRunGroupById(created.groupId)
+      if (g) {
+        g.status = 'failed'
+        g.dissolvable = true
+        g.message = (error as Error)?.message ?? String(error)
+      }
+      const msg = (error as Error)?.message ?? String(error)
+      workflowEditorRef.value?.notifyRunOutcome?.(false, msg)
+      if (/天气引擎|瓦片/.test(msg)) {
+        workflowStatusOpen.value = true
+      }
+    }
+  }
+
+  return { handleRunWorkflowFromEditor }
+}

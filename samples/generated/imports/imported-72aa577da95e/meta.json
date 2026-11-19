@@ -1,0 +1,19 @@
+{
+  "layer_id": "imported-72aa577da95e",
+  "label": "OMEGA",
+  "unit": "无量纲",
+  "description": "Synthetic delivery verification data, not satellite observations.",
+  "category": "time-series",
+  "published": true,
+  "time_list": [
+    "20240201_20240229",
+    "20240301_20240331",
+    "20240401_20240430"
+  ],
+  "default_time": "20240401_20240430",
+  "native_step": "1mo",
+  "palette": "wind-blue",
+  "vmin": 0.0,
+  "vmax": 0.5,
+  "crs": "EPSG:4326"
+}

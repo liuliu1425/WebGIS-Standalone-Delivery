@@ -1,0 +1,1377 @@
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    as_completed,
+    TimeoutError as FuturesTimeoutError,
+)
+import logging
+import time
+from threading import Lock
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+
+from app.api.deps import check_resource_access, get_request_user, require_admin
+from app.core.config import settings
+from app.api.error_codes import AUTH_ERROR, ApiError
+from app.services.crs import crs_transformer
+from app.services.crs.crs_registry import normalize_crs_code
+from app.services.layer_catalog import (
+    get_layer_catalog,
+    get_layer_category_response,
+    get_layer_descriptor,
+)
+from app.services.layer_group_repository import (
+    LayerGroupError,
+    get_layer_group_repository,
+    resolve_catalog_group_scope,
+)
+from app.services.overlay_registry import (
+    get_overlay_spec,
+    list_overlay_ids,
+    read_bounds,
+)
+from app.services.workflow_request_resolver import describe_layer_run_readiness
+from shared.contracts.api_contracts import (
+    LayerAssetStateResponse,
+    LayerCatalogResponse,
+    LayerCategoryDef,
+    LayerCategoryResponse,
+    LayerGroupCreateRequest,
+    LayerGroupMembersRequest,
+    LayerGroupReorderRequest,
+    LayerGroupUpdateRequest,
+    LayerLifecycleResponse,
+    LayerLifecycleRunSummary,
+    LayerOnlineSyncRequest,
+    LayerOnlineSyncResponse,
+    LayerThemeDisplayNamesRequest,
+    ThemeLayerGroupPresetDetail,
+    ThemeLayerGroupPresetMeta,
+    ThemeLayerGroupPresetPutRequest,
+    WorkflowTemplateListResponse,
+    WorkflowTemplateRunRequest,
+    WorkflowTemplateRunResponse,
+    WorkflowTemplateSummary,
+)
+
+_logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+_READINESS_TIMEOUT = 8.0  # 单图层就绪检查最大耗时（秒）
+
+# G1-06: 模块级共享 executor + 就绪结果短缓存，避免每请求新建线程池
+_readiness_executor = ThreadPoolExecutor(max_workers=8)
+_READINESS_CACHE_TTL = 30.0  # 秒
+_readiness_cache: dict[str, tuple[dict, float]] = {}
+_readiness_cache_lock = Lock()
+
+
+def _filter_accessible_layer_ids(layer_ids: list[str], cred: Any) -> list[str]:
+    """Apply resource ACL to overlay/layer id lists (fail-closed when auth on)."""
+    _cred = cred if hasattr(cred, "role") else None
+    if _cred is None:
+        if settings.user_auth_enabled:
+            raise ApiError(
+                AUTH_ERROR,
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication required.",
+            )
+        return list(layer_ids)
+    if _cred.role == "admin":
+        return list(layer_ids)
+    if _cred.user_id is None:
+        if getattr(_cred, "source", None) in {"service_key", "dev_bypass"}:
+            return list(layer_ids)
+        return []
+    from app.services.permission_repository import get_permission_repository
+    from app.services.overlay_registry import can_view_overlay, is_overlay_owner
+
+    owned_or_public = [
+        layer_id
+        for layer_id in layer_ids
+        if can_view_overlay(layer_id, role=_cred.role, user_id=_cred.user_id)
+    ]
+    owned = {
+        layer_id
+        for layer_id in owned_or_public
+        if is_overlay_owner(layer_id, _cred.user_id)
+    }
+    acl_visible = set(
+        get_permission_repository().batch_filter_accessible(
+            int(_cred.user_id), "layer", owned_or_public
+        )
+    )
+    return [layer_id for layer_id in owned_or_public if layer_id in owned | acl_visible]
+
+
+def _catalog_items_for_environment(items: list[Any]) -> list[Any]:
+    """非 development/test 隐藏 status=placeholder（实验室占位层，机构包可剔除）。"""
+    env = (settings.environment or "").strip().lower()
+    if env in {"development", "dev", "test", "testing"}:
+        return list(items)
+    return [item for item in items if getattr(item, "status", None) != "placeholder"]
+
+
+def _scope_for_cred(cred) -> Any:
+    if cred is None:
+        return resolve_catalog_group_scope(user_id=None, role=None)
+    return resolve_catalog_group_scope(
+        user_id=getattr(cred, "user_id", None),
+        role=getattr(cred, "role", None),
+    )
+
+
+def _owner_user_id(admin) -> int:
+    uid = getattr(admin, "user_id", None)
+    if uid is None:
+        raise ApiError(
+            AUTH_ERROR,
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin user id required for layer group management.",
+        )
+    return int(uid)
+
+
+def _require_theme_id(theme_id: int) -> int:
+    from app.services.theme_repository import get_theme_repository
+
+    tid = int(theme_id)
+    if get_theme_repository().get_by_id(tid) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="主题不存在")
+    return tid
+
+
+def _edit_scope_for_theme(theme_id: int):
+    """Admin edit/preview scope: theme preset if present, else shared seed baseline."""
+    from app.services.layer_group_repository import CatalogGroupScope
+
+    repo = get_layer_group_repository()
+    if repo.get_theme_preset(int(theme_id)) is not None:
+        return CatalogGroupScope.theme(int(theme_id))
+    return CatalogGroupScope.shared()
+
+
+def _category_response_after_write(
+    admin, theme_id: int | None
+) -> LayerCategoryResponse:
+    if theme_id is not None:
+        return get_layer_category_response(_edit_scope_for_theme(int(theme_id)))
+    return get_layer_category_response(_scope_for_cred(admin))
+
+
+@router.get("/layers", tags=["catalog"], response_model=LayerCatalogResponse)
+def list_layers(
+    cred=Depends(get_request_user),
+    theme_id: int | None = Query(
+        default=None,
+        description="Admin edit preview: catalog with that theme's group/display overlays.",
+    ),
+) -> LayerCatalogResponse:
+    if theme_id is not None:
+        if cred is None or getattr(cred, "role", None) != "admin":
+            raise ApiError(
+                AUTH_ERROR,
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Admin required to preview theme catalog.",
+            )
+        tid = _require_theme_id(theme_id)
+        catalog = get_layer_catalog(_edit_scope_for_theme(tid))
+    else:
+        catalog = get_layer_catalog(_scope_for_cred(cred))
+    visible_items = _catalog_items_for_environment(catalog.items)
+
+    # Phase B: 资源访问控制——鉴权开启时匿名 fail-closed；非 admin 按 ACL 过滤
+    accessible_ids = set(
+        _filter_accessible_layer_ids([desc.layer_id for desc in visible_items], cred)
+    )
+    visible_items = [d for d in visible_items if d.layer_id in accessible_ids]
+
+    def _check_readiness(item) -> tuple[str, dict]:
+        readiness = describe_layer_run_readiness(item.layer_id) or {}
+        return item.layer_id, readiness
+
+    layer_readiness: dict[str, dict[str, Any]] = {}
+    now = time.time()
+
+    # G1-06: 先查缓存，只对未命中/过期的图层执行就绪检查
+    items_to_check = []
+    for desc in visible_items:
+        cached = _readiness_cache.get(desc.layer_id)
+        if cached and now - cached[1] < _READINESS_CACHE_TTL:
+            layer_readiness[desc.layer_id] = cached[0]
+        else:
+            items_to_check.append(desc)
+
+    if items_to_check:
+        futures = {
+            _readiness_executor.submit(_check_readiness, desc): desc
+            for desc in items_to_check
+        }
+        try:
+            for future in as_completed(futures, timeout=_READINESS_TIMEOUT):
+                try:
+                    layer_id, readiness = future.result(timeout=_READINESS_TIMEOUT)
+                    layer_readiness[layer_id] = readiness
+                    with _readiness_cache_lock:
+                        _readiness_cache[layer_id] = (readiness, time.time())
+                except FuturesTimeoutError:
+                    _logger.warning("Layer readiness check timed out")
+                except Exception:
+                    _logger.warning("Layer readiness check failed", exc_info=True)
+        except FuturesTimeoutError:
+            # as_completed 整体超时：未完成的 future 直接跳过
+            _logger.warning(
+                "Layer readiness batch timed out after %.1fs", _READINESS_TIMEOUT
+            )
+
+    items = []
+    for descriptor in visible_items:
+        readiness = layer_readiness.get(descriptor.layer_id, {})
+        items.append(
+            descriptor.model_copy(
+                update={
+                    "run_readiness": readiness.get(
+                        "run_readiness", descriptor.run_readiness
+                    ),
+                    "run_readiness_summary": readiness.get(
+                        "run_readiness_summary", descriptor.run_readiness_summary
+                    ),
+                    "run_readiness_notes": readiness.get(
+                        "run_readiness_notes", descriptor.run_readiness_notes
+                    ),
+                    "online_ready": readiness.get(
+                        "online_ready", descriptor.online_ready
+                    ),
+                    "local_ready": readiness.get("local_ready", descriptor.local_ready),
+                }
+            )
+        )
+    return LayerCatalogResponse(items=items)
+
+
+@router.get(
+    "/layers/categories", tags=["catalog"], response_model=LayerCategoryResponse
+)
+def list_layer_categories(
+    cred=Depends(get_request_user),
+    theme_id: int | None = Query(
+        default=None,
+        description="Admin edit preview: load that theme's preset (or seed baseline).",
+    ),
+) -> LayerCategoryResponse:
+    """下发图层分类定义。
+
+    默认：按调用者绑定主题的预设（无则种子基线）。
+    管理员传 ``theme_id`` 时预览该主题预设（无预设则种子），不落库。
+    """
+    if cred is None and settings.user_auth_enabled:
+        raise ApiError(
+            AUTH_ERROR,
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required.",
+        )
+    if theme_id is not None:
+        if cred is None or getattr(cred, "role", None) != "admin":
+            raise ApiError(
+                AUTH_ERROR,
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Admin required to preview theme categories.",
+            )
+        tid = _require_theme_id(theme_id)
+        return get_layer_category_response(_edit_scope_for_theme(tid))
+    # Consumer path: hide top-level groups marked hidden (admin edit uses theme_id).
+    response = get_layer_category_response(_scope_for_cred(cred))
+    return LayerCategoryResponse(
+        items=[item for item in response.items if not item.hidden]
+    )
+
+
+# ── 图层分组管理（主题预设直写为主；省略 theme_id 时兼容个人工作区） ────────
+#
+# 种子 JSON（catalog_seeds/layer_categories.json）永不被运行时写操作修改。
+
+
+def _group_error(exc: LayerGroupError) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.post("/layers/categories", tags=["catalog"], response_model=LayerCategoryDef)
+def create_layer_group(
+    payload: LayerGroupCreateRequest,
+    admin=Depends(require_admin),
+    theme_id: int | None = Query(
+        default=None, description="Write into this theme preset when set."
+    ),
+) -> LayerCategoryDef:
+    """新建自定义分组（默认写入主题预设；省略 theme_id 则写个人工作区）。"""
+    repo = get_layer_group_repository()
+    try:
+        if theme_id is not None:
+            tid = _require_theme_id(theme_id)
+            raw = repo.create_group_in_theme(
+                tid,
+                payload.id,
+                payload.name,
+                icon=payload.icon,
+                accent_color=payload.accent_color,
+                chip_tone=payload.chip_tone,
+                sub_categories=payload.sub_categories,
+                hidden=payload.hidden,
+                hidden_sub_categories=payload.hidden_sub_categories,
+                updated_by_user_id=_owner_user_id(admin),
+            )
+            return LayerCategoryDef.model_validate(raw)
+        record = repo.create_group(
+            payload.id,
+            payload.name,
+            icon=payload.icon,
+            accent_color=payload.accent_color,
+            chip_tone=payload.chip_tone,
+            sub_categories=payload.sub_categories,
+            hidden=payload.hidden,
+            hidden_sub_categories=payload.hidden_sub_categories,
+            owner_user_id=_owner_user_id(admin),
+        )
+    except LayerGroupError as exc:
+        raise _group_error(exc) from exc
+    return LayerCategoryDef.model_validate(record.to_category_def_dict())
+
+
+@router.put(
+    "/layers/categories/order", tags=["catalog"], response_model=LayerCategoryResponse
+)
+def reorder_layer_groups(
+    payload: LayerGroupReorderRequest,
+    admin=Depends(require_admin),
+    theme_id: int | None = Query(default=None),
+) -> LayerCategoryResponse:
+    """按给定 id 顺序重排分组。"""
+    repo = get_layer_group_repository()
+    try:
+        if theme_id is not None:
+            tid = _require_theme_id(theme_id)
+            repo.reorder_groups_in_theme(
+                tid, payload.order, updated_by_user_id=_owner_user_id(admin)
+            )
+        else:
+            repo.reorder_groups(payload.order, owner_user_id=_owner_user_id(admin))
+    except LayerGroupError as exc:
+        raise _group_error(exc) from exc
+    return _category_response_after_write(admin, theme_id)
+
+
+@router.post(
+    "/layers/categories/sync-to-theme/{theme_id}",
+    tags=["catalog"],
+    response_model=ThemeLayerGroupPresetMeta,
+)
+def sync_layer_groups_to_theme(
+    theme_id: int, admin=Depends(require_admin)
+) -> ThemeLayerGroupPresetMeta:
+    """将当前管理员个人工作区快照导入到指定主题预设（一次性迁移）。"""
+    tid = _require_theme_id(theme_id)
+    try:
+        meta = get_layer_group_repository().sync_workspace_to_theme(
+            _owner_user_id(admin), tid
+        )
+    except LayerGroupError as exc:
+        raise _group_error(exc) from exc
+    return ThemeLayerGroupPresetMeta.model_validate(meta)
+
+
+def _seed_display_name_map() -> dict[str, str]:
+    from app.services.layer_catalog import _load_seed_descriptors
+
+    return {
+        d.layer_id: (d.display_name or d.layer_id) for d in _load_seed_descriptors()
+    }
+
+
+@router.get(
+    "/layers/categories/theme-preset/{theme_id}",
+    tags=["catalog"],
+    response_model=ThemeLayerGroupPresetDetail,
+)
+def get_theme_layer_group_preset(
+    theme_id: int, _admin=Depends(require_admin)
+) -> ThemeLayerGroupPresetDetail:
+    """读取主题图层分组预设详情（无预设时返回种子基线，不落库）。"""
+    tid = _require_theme_id(theme_id)
+    repo = get_layer_group_repository()
+    meta = repo.theme_preset_meta(tid)
+    payload = repo.get_theme_preset(tid)
+    seed_names = _seed_display_name_map()
+    if payload is None:
+        payload = repo.materialize_seed_preset()
+        groups_raw = payload.get("groups") or []
+        return ThemeLayerGroupPresetDetail(
+            theme_id=tid,
+            has_preset=False,
+            updated_at=None,
+            updated_by_user_id=None,
+            display_name_count=0,
+            groups=[
+                LayerCategoryDef.model_validate(g)
+                for g in groups_raw
+                if isinstance(g, dict)
+            ],
+            assignments={},
+            display_names={},
+            seed_display_names=seed_names,
+        )
+    groups: list[LayerCategoryDef] = []
+    for raw in payload.get("groups") or []:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            groups.append(LayerCategoryDef.model_validate(raw))
+        except Exception:
+            continue
+    display_names = {
+        str(k): str(v)
+        for k, v in (payload.get("display_names") or {}).items()
+        if str(k).strip() and str(v).strip()
+    }
+    assignments = {
+        str(k): str(v)
+        for k, v in (payload.get("assignments") or {}).items()
+        if str(k).strip() and str(v).strip()
+    }
+    base = meta or {
+        "theme_id": tid,
+        "has_preset": True,
+        "updated_at": None,
+        "updated_by_user_id": None,
+        "display_name_count": len(display_names),
+    }
+    return ThemeLayerGroupPresetDetail.model_validate(
+        {
+            **base,
+            "groups": groups,
+            "assignments": assignments,
+            "display_names": display_names,
+            "seed_display_names": seed_names,
+        }
+    )
+
+
+@router.put(
+    "/layers/categories/theme-preset/{theme_id}",
+    tags=["catalog"],
+    response_model=ThemeLayerGroupPresetMeta,
+)
+def put_theme_layer_group_preset(
+    theme_id: int,
+    payload: ThemeLayerGroupPresetPutRequest,
+    admin=Depends(require_admin),
+) -> ThemeLayerGroupPresetMeta:
+    """全量替换主题分组预设。"""
+    tid = _require_theme_id(theme_id)
+    body = {
+        "groups": [g.model_dump(mode="json") for g in payload.groups],
+        "assignments": dict(payload.assignments),
+        "display_names": dict(payload.display_names),
+    }
+    try:
+        meta = get_layer_group_repository().save_theme_preset(
+            tid, body, updated_by_user_id=_owner_user_id(admin)
+        )
+    except LayerGroupError as exc:
+        raise _group_error(exc) from exc
+    return ThemeLayerGroupPresetMeta.model_validate(meta)
+
+
+@router.put(
+    "/layers/categories/theme-preset/{theme_id}/display-names",
+    tags=["catalog"],
+    response_model=ThemeLayerGroupPresetMeta,
+)
+def put_theme_layer_display_names(
+    theme_id: int,
+    payload: LayerThemeDisplayNamesRequest,
+    admin=Depends(require_admin),
+) -> ThemeLayerGroupPresetMeta:
+    """合并写入主题图层显示名覆盖（空字符串清除）。"""
+    tid = _require_theme_id(theme_id)
+    try:
+        meta = get_layer_group_repository().merge_display_names_in_theme(
+            tid,
+            dict(payload.display_names),
+            updated_by_user_id=_owner_user_id(admin),
+        )
+    except LayerGroupError as exc:
+        raise _group_error(exc) from exc
+    return ThemeLayerGroupPresetMeta.model_validate(meta)
+
+
+@router.delete(
+    "/layers/categories/theme-preset/{theme_id}",
+    tags=["catalog"],
+    response_model=dict,
+)
+def delete_theme_layer_group_preset(
+    theme_id: int, _admin=Depends(require_admin)
+) -> dict[str, Any]:
+    """清除主题上的图层分组预设（绑定用户回落到共享种子分组）。"""
+    tid = _require_theme_id(theme_id)
+    deleted = get_layer_group_repository().delete_theme_preset(tid)
+    return {"theme_id": tid, "deleted": deleted}
+
+
+@router.patch(
+    "/layers/categories/{group_id}", tags=["catalog"], response_model=LayerCategoryDef
+)
+def update_layer_group(
+    group_id: str,
+    payload: LayerGroupUpdateRequest,
+    admin=Depends(require_admin),
+    theme_id: int | None = Query(default=None),
+) -> LayerCategoryDef:
+    """修改分组名称 / 样式 / 子分类。"""
+    repo = get_layer_group_repository()
+    try:
+        if theme_id is not None:
+            tid = _require_theme_id(theme_id)
+            raw = repo.update_group_in_theme(
+                tid,
+                group_id,
+                name=payload.name,
+                icon=payload.icon,
+                accent_color=payload.accent_color,
+                chip_tone=payload.chip_tone,
+                sub_categories=payload.sub_categories,
+                hidden=payload.hidden,
+                hidden_sub_categories=payload.hidden_sub_categories,
+                updated_by_user_id=_owner_user_id(admin),
+            )
+            return LayerCategoryDef.model_validate(raw)
+        record = repo.update_group(
+            group_id,
+            name=payload.name,
+            icon=payload.icon,
+            accent_color=payload.accent_color,
+            chip_tone=payload.chip_tone,
+            sub_categories=payload.sub_categories,
+            hidden=payload.hidden,
+            hidden_sub_categories=payload.hidden_sub_categories,
+            owner_user_id=_owner_user_id(admin),
+        )
+    except LayerGroupError as exc:
+        raise _group_error(exc) from exc
+    return LayerCategoryDef.model_validate(record.to_category_def_dict())
+
+
+@router.delete(
+    "/layers/categories/{group_id}",
+    tags=["catalog"],
+    response_model=LayerCategoryResponse,
+)
+def delete_layer_group(
+    group_id: str,
+    admin=Depends(require_admin),
+    theme_id: int | None = Query(default=None),
+) -> LayerCategoryResponse:
+    """删除自定义分组（种子组拒绝）。"""
+    repo = get_layer_group_repository()
+    try:
+        if theme_id is not None:
+            tid = _require_theme_id(theme_id)
+            repo.delete_group_in_theme(
+                tid, group_id, updated_by_user_id=_owner_user_id(admin)
+            )
+        else:
+            repo.delete_group(group_id, owner_user_id=_owner_user_id(admin))
+    except LayerGroupError as exc:
+        raise _group_error(exc) from exc
+    return _category_response_after_write(admin, theme_id)
+
+
+@router.put(
+    "/layers/categories/{group_id}/members",
+    tags=["catalog"],
+    response_model=LayerCategoryResponse,
+)
+def set_layer_group_members(
+    group_id: str,
+    payload: LayerGroupMembersRequest,
+    admin=Depends(require_admin),
+    theme_id: int | None = Query(default=None),
+) -> LayerCategoryResponse:
+    """全量替换分组内图层成员（theme 预设支持「取消勾选 = 从图层库移除」）。"""
+    repo = get_layer_group_repository()
+    try:
+        if theme_id is not None:
+            tid = _require_theme_id(theme_id)
+            repo.set_members_in_theme(
+                tid,
+                group_id,
+                payload.layer_ids,
+                excluded_layer_ids=payload.excluded_layer_ids,
+                updated_by_user_id=_owner_user_id(admin),
+            )
+        else:
+            # 个人工作区（兼容路径）：保留值需要 layer_groups 行承载，暂不支持
+            # 排除语义；管理端始终传 theme_id，正常不走到这里。
+            repo.set_layer_assignments(
+                group_id, payload.layer_ids, owner_user_id=_owner_user_id(admin)
+            )
+    except LayerGroupError as exc:
+        raise _group_error(exc) from exc
+    return _category_response_after_write(admin, theme_id)
+
+
+# ── 图层平台子系统 P0：资产状态与生命周期聚合接口（2026-08-24） ───────────────
+
+
+def _layer_asset_state_response(
+    layer_id: str, state: dict[str, Any]
+) -> LayerAssetStateResponse:
+    from app.services.overlay_asset_workflow_service import _layer_to_task
+
+    return LayerAssetStateResponse(
+        layer_id=layer_id,
+        asset_state=str(state.get("asset_state") or "missing"),
+        bake_version=state.get("bake_version"),
+        current_bake_version=int(state.get("current_bake_version") or 0),
+        png_exists=bool(state.get("png_exists")),
+        bounds_exists=bool(state.get("bounds_exists")),
+        category=str(state.get("category") or "static"),
+        time_list=[str(t) for t in (state.get("time_list") or [])],
+        default_time=state.get("default_time"),
+        asset_task=_layer_to_task().get(layer_id),
+    )
+
+
+def _compute_lifecycle_state(
+    asset_state: str, recent_runs: list[Any]
+) -> tuple[str, str | None]:
+    """由资产状态 + 最近 run 推导统一生命周期状态与提示文案。"""
+    active_statuses = {"accepted", "queued", "running", "retry_pending"}
+    if any(r.status in active_statuses for r in recent_runs):
+        return "updating", "图层资产正在检查或更新。"
+    if asset_state == "fresh":
+        return "fresh", "图层资产已就绪。"
+    if asset_state == "stale":
+        return "stale", "图层资产陈旧，可触发重新烘焙。"
+    if asset_state == "missing":
+        return "missing", "图层资产缺失，需要烘焙后显示。"
+    if any(r.status == "failed" for r in recent_runs[:3]):
+        return "failed", "最近一次资产/工作流运行失败。"
+    return asset_state, None
+
+
+@router.get(
+    "/layer-assets/{layer_id}",
+    tags=["layer-platform"],
+    response_model=LayerAssetStateResponse,
+)
+def get_layer_asset_state(
+    layer_id: str,
+    cred=Depends(get_request_user),
+) -> LayerAssetStateResponse:
+    """图层烘焙资产状态查询（图层平台子系统 P0）。
+
+    返回 asset_state（missing/unversioned/stale/fresh）、bake_version、
+    时间轴元数据与可用烘焙任务 key。前端 lifecycle 域以本接口为真源。
+    """
+    check_resource_access(cred, "layer", layer_id)
+    from app.services.overlay_asset_workflow_service import (
+        overlay_asset_workflow_service,
+    )
+
+    try:
+        state = overlay_asset_workflow_service.get_asset_state(layer_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    return _layer_asset_state_response(layer_id, state)
+
+
+@router.get(
+    "/layers/{layer_id}/lifecycle",
+    tags=["layer-platform"],
+    response_model=LayerLifecycleResponse,
+)
+def get_layer_lifecycle(
+    layer_id: str,
+    limit: int = Query(default=5, ge=1, le=20),
+    cred=Depends(get_request_user),
+) -> LayerLifecycleResponse:
+    """图层生命周期聚合视图（图层平台子系统 P0）。
+
+    聚合资产状态 + 最近 run（workflow_kind/layer_id 索引查询）+ 时间轴元数据，
+    前端不再自行拼接 jobLayer / overlayTimeStates / asset_state。
+    """
+    check_resource_access(cred, "layer", layer_id)
+    from app.services.overlay_asset_workflow_service import (
+        overlay_asset_workflow_service,
+    )
+
+    try:
+        state = overlay_asset_workflow_service.get_asset_state(layer_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+
+    asset = _layer_asset_state_response(layer_id, state)
+    from app.services.workflow_repository import SQLiteWorkflowRepository
+
+    repository = SQLiteWorkflowRepository()
+    runs = repository.list_runs_by_layer(layer_id, limit=limit)
+    recent = [
+        LayerLifecycleRunSummary(
+            run_id=r.run_id,
+            workflow_kind=(r.executor_metadata or {}).get("workflow_kind"),
+            status=r.status.value,
+            progress=r.progress,
+            message=r.message,
+            updated_at=r.updated_at,
+        )
+        for r in runs
+    ]
+    lifecycle_state, message = _compute_lifecycle_state(asset.asset_state, runs)
+    from datetime import UTC, datetime as _dt
+
+    return LayerLifecycleResponse(
+        layer_id=layer_id,
+        asset=asset,
+        recent_runs=recent,
+        lifecycle_state=lifecycle_state,
+        message=message,
+        updated_at=runs[0].updated_at if runs else _dt.now(UTC),
+    )
+
+
+@router.get("/layers/{layer_id}/online-temporal", tags=["catalog"])
+def get_layer_online_temporal(
+    layer_id: str,
+    cred=Depends(get_request_user),
+) -> dict[str, Any]:
+    """返回图层的在线时间获取能力与可获取范围。
+
+    前端时间轴据此判断哪些时间点可在线获取（标 'fetchable' 段），
+    以及获取参数（步长、预取深度、队列标签）。
+    """
+    check_resource_access(cred, "layer", layer_id)
+    descriptor = get_layer_descriptor(layer_id)
+    cap = descriptor.online_temporal if descriptor else None
+    if cap is None or not cap.enabled:
+        return {"layer_id": layer_id, "available": False}
+    return {"layer_id": layer_id, "available": True, **cap.model_dump()}
+
+
+@router.get("/layers/{layer_id}/data-coverage", tags=["catalog"])
+def get_layer_data_coverage(
+    layer_id: str,
+    cred=Depends(get_request_user),
+) -> dict[str, Any]:
+    """双通道可用性：在线覆盖窗 + 本地资产 time_list（计划会话 / 色带）。
+
+    - ``channels.online``：来自 descriptor.online_temporal（未启用则 available=false）
+    - ``channels.local``：来自 overlay 资产 state.time_list；取失败时 dates=[]
+    """
+    check_resource_access(cred, "layer", layer_id)
+    descriptor = get_layer_descriptor(layer_id)
+    cap = descriptor.online_temporal if descriptor else None
+    online: dict[str, Any]
+    if cap is None or not cap.enabled:
+        online = {
+            "available": False,
+            "coverage_start": None,
+            "coverage_end": None,
+            "native_step": None,
+        }
+    else:
+        online = {
+            "available": True,
+            "coverage_start": cap.coverage_start,
+            "coverage_end": cap.coverage_end,
+            "native_step": cap.native_step,
+        }
+
+    local_dates: list[str] = []
+    try:
+        from app.services.overlay_asset_workflow_service import (
+            overlay_asset_workflow_service,
+        )
+
+        state = overlay_asset_workflow_service.get_asset_state(layer_id)
+        local_dates = [str(t) for t in (state.get("time_list") or []) if t]
+    except Exception:
+        local_dates = []
+
+    return {
+        "layer_id": layer_id,
+        "channels": {
+            "online": online,
+            "local": {
+                "available": len(local_dates) > 0,
+                "dates": local_dates,
+            },
+        },
+    }
+
+
+def _submit_online_sync_workflow(payload: Any, cred: Any = None) -> Any:
+    """online_sync 的 workflow 提交封装（可 mock）。
+
+    模块级独立函数便于测试隔离路由编排逻辑与真实 workflow 提交。
+    """
+    from app.api.routers.workflow_router import submit_workflow
+
+    return submit_workflow(
+        payload,
+        cred=cred if hasattr(cred, "role") else None,
+    )
+
+
+@router.post(
+    "/layer-assets/{layer_id}/sync",
+    tags=["layer-platform"],
+    response_model=LayerOnlineSyncResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def sync_layer_asset_online(
+    layer_id: str,
+    body: LayerOnlineSyncRequest | None = None,
+    cred=Depends(get_request_user),
+) -> LayerOnlineSyncResponse:
+    """在线源同步统一入口（图层平台子系统 P1）。
+
+    前端不再自行拼 workflow 提交参数；服务端创建 ``workflow_kind=online_sync``
+    的 run 并复用 workflow-runs 状态/事件/取消契约。
+
+    语义：
+    - 图层未启用 online_temporal → ``skipped-unsupported``（200，不报错）
+    - 已有同图层同时间的活跃 online_sync run → ``in-flight``（复用）
+    - 其他情况 → 提交 workflow run，返回 ``submitted``
+
+    失败时保留旧资产显示（run 失败不影响已有烘焙资产）。
+    """
+    check_resource_access(cred, "layer", layer_id)
+    descriptor = get_layer_descriptor(layer_id)
+    cap = descriptor.online_temporal if descriptor else None
+    if cap is None or not cap.enabled:
+        return LayerOnlineSyncResponse(
+            status="skipped-unsupported",
+            message=f"图层 {layer_id} 未启用在线时间获取。",
+            layer_id=layer_id,
+            time_key=body.time_key if body else None,
+        )
+
+    from shared.contracts.api_contracts import ExecutionStatus
+
+    from app.services.workflow_repository import SQLiteWorkflowRepository
+
+    body = body or LayerOnlineSyncRequest()
+    repository = SQLiteWorkflowRepository()
+
+    # 复用同图层活跃 online_sync run（避免重复拉取）
+    for existing in repository.list_runs_by_layer(
+        layer_id, limit=10, workflow_kind="online_sync"
+    ):
+        if existing.status in {
+            ExecutionStatus.accepted,
+            ExecutionStatus.queued,
+            ExecutionStatus.running,
+            ExecutionStatus.retry_pending,
+        }:
+            return LayerOnlineSyncResponse(
+                run_id=existing.run_id,
+                status="in-flight",
+                message=f"图层 {layer_id} 的在线同步已在执行中。",
+                layer_id=layer_id,
+                time_key=body.time_key,
+                status_url=existing.status_url or f"/workflow-runs/{existing.run_id}",
+                events_url=existing.events_url
+                or f"/workflow-runs/{existing.run_id}/events",
+            )
+
+    # 构建 workflow 提交请求
+    from shared.contracts.api_contracts import (
+        TimeRange,
+        WorkflowCommandType,
+        WorkflowPriority,
+        WorkflowResourceProfile,
+        WorkflowSubmitRequest,
+    )
+
+    time_range = body.time_range
+    if time_range is None and body.time_key:
+        # time_key 简单解析：YYYY-MM → 当月范围；YYYY-MM-DD → 当天
+        key = body.time_key
+        try:
+            if len(key) == 7:  # YYYY-MM
+                from datetime import date
+
+                y, m = int(key[:4]), int(key[5:7])
+                start = date(y, m, 1)
+                if m == 12:
+                    end = date(y + 1, 1, 1)
+                else:
+                    end = date(y, m + 1, 1)
+                time_range = TimeRange(
+                    start_at=start.isoformat(), end_at=end.isoformat()
+                )
+            elif len(key) == 10:  # YYYY-MM-DD
+                from datetime import date as _date, timedelta as _td
+
+                d = _date.fromisoformat(key)
+                time_range = TimeRange(
+                    start_at=d.isoformat(), end_at=(d + _td(days=1)).isoformat()
+                )
+        except (ValueError, TypeError):
+            pass
+
+    priority = (
+        WorkflowPriority.low
+        if body.priority == "low" or body.is_prefetch
+        else WorkflowPriority.normal
+    )
+    payload = WorkflowSubmitRequest(
+        # command_type 必须为 analysis：submission_service 的
+        # normalize_workflow_submit_request 仅对 analysis 按 layer_id
+        # 填充 engine request（algorithm_request），否则 Celery 端
+        # no bridge 匹配 → 「未找到匹配的工作流引擎」（P1 遗留，2026-08-25 修复）
+        command_type=WorkflowCommandType.analysis,
+        command_label=f"在线同步 {layer_id}"
+        + (f" @ {body.time_key}" if body.time_key else ""),
+        layer_id=layer_id,
+        priority=priority,
+        resource_profile=(
+            WorkflowResourceProfile.batch
+            if body.is_prefetch or body.priority == "low"
+            else WorkflowResourceProfile.standard
+        ),
+        time_range=time_range,
+        parameters={
+            "workflow_kind": "online_sync",
+            "time_key": body.time_key,
+            "is_prefetch": body.is_prefetch,
+        },
+        # 注：不用 cap.queue_tag（"temporal-fetch"）——queue_tag 校验只接受
+        # 已注册队列名或 '<channel>-<slot>' 模式，自定义标签会 400；
+        # 优先级分流已由 resource_profile=batch 承担。
+    )
+
+    accepted = _submit_online_sync_workflow(payload, cred=cred)
+    return LayerOnlineSyncResponse(
+        run_id=accepted.run_id,
+        status="submitted",
+        message=accepted.message,
+        layer_id=layer_id,
+        time_key=body.time_key,
+        status_url=accepted.status_url,
+        events_url=accepted.events_url,
+    )
+
+
+# ── 图层平台子系统 P1：课题组工作流模板一键显示 ─────────────────────────────
+
+
+@router.get(
+    "/workflows/templates",
+    tags=["layer-platform"],
+    response_model=WorkflowTemplateListResponse,
+)
+def list_workflow_templates(
+    cred=Depends(get_request_user),
+) -> WorkflowTemplateListResponse:
+    """课题组工作流模板列表（图层平台子系统 P1）。
+
+    聚合 workflow_seeds/system + workflow_definitions/user 中
+    ``is_template=true`` 或 tags 含 "template"/"lab" 的定义；
+    前端课题组入口据此渲染「一键运行」面板。
+    鉴权开启时匿名 fail-closed；非 admin 按 workflow ACL 过滤。
+    """
+    from app.api.error_codes import AUTH_ERROR, ApiError
+    from app.core import config
+    from app.services.workflow_definition_service import list_definitions
+
+    _cred = cred if hasattr(cred, "role") else None
+    if _cred is None and config.settings.user_auth_enabled:
+        raise ApiError(
+            AUTH_ERROR,
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required.",
+        )
+
+    items: list[WorkflowTemplateSummary] = []
+    for item in list_definitions():
+        meta = item if isinstance(item, dict) else {}
+        tags = [str(t) for t in (meta.get("tags") or [])]
+        is_template = bool(meta.get("is_template", False)) or any(
+            t in {"template", "lab", "课题组"} for t in tags
+        )
+        if not is_template:
+            continue
+        items.append(
+            WorkflowTemplateSummary(
+                workflow_id=str(meta.get("workflow_id") or ""),
+                name=str(meta.get("name") or meta.get("workflow_id") or ""),
+                description=meta.get("description"),
+                engine=str(meta.get("engine") or "unknown"),
+                linked_layer_id=meta.get("linked_layer_id"),
+                auto_display=bool(meta.get("auto_display", True)),
+                resource_profile=str(meta.get("resource_profile") or "standard"),
+                is_template=bool(meta.get("is_template", True)),
+                readonly=bool(meta.get("readonly", False)),
+                kind=str(meta.get("kind") or "system"),
+                node_count=int(meta.get("node_count") or 0),
+                tags=tags,
+                updated_at=meta.get("updated_at"),
+            )
+        )
+
+    if _cred is not None and getattr(_cred, "role", None) != "admin":
+        user_id = getattr(_cred, "user_id", None)
+        source = getattr(_cred, "source", None)
+        if user_id is None:
+            if source not in {"service_key", "dev_bypass"}:
+                items = []
+        else:
+            from app.services.permission_repository import get_permission_repository
+
+            all_ids = [i.workflow_id for i in items if i.workflow_id]
+            accessible = set(
+                get_permission_repository().batch_filter_accessible(
+                    int(user_id), "workflow", all_ids
+                )
+            )
+            items = [i for i in items if i.workflow_id in accessible]
+
+    return WorkflowTemplateListResponse(items=items, count=len(items))
+
+
+@router.post(
+    "/workflows/templates/{workflow_id}/runs",
+    tags=["layer-platform"],
+    response_model=WorkflowTemplateRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def run_workflow_template(
+    workflow_id: str,
+    body: WorkflowTemplateRunRequest | None = None,
+    cred=Depends(get_request_user),
+) -> WorkflowTemplateRunResponse:
+    """课题组工作流模板一键运行（图层平台子系统 P1）。
+
+    按模板定义构建 WorkflowSubmitRequest 并提交；
+    完成后若 auto_display=true 且 linked_layer_id 非空，
+    由 workflow-runs 轮询链自动 materialize-map-layers 上图。
+    """
+    check_resource_access(cred, "workflow", workflow_id)
+    from app.services.workflow_definition_service import get_definition
+
+    definition = get_definition(workflow_id)
+    if definition is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workflow template not found: {workflow_id}",
+        )
+
+    meta = definition.get("_meta", {}) if isinstance(definition, dict) else {}
+    linked_layer_id = meta.get("linked_layer_id")
+    auto_display = bool(meta.get("auto_display", True))
+    resource_profile_str = str(meta.get("resource_profile") or "standard")
+
+    body = body or WorkflowTemplateRunRequest()
+    if body.resource_profile is not None:
+        resource_profile_str = body.resource_profile
+    if body.auto_display is not None:
+        auto_display = body.auto_display
+
+    # 构建提交请求
+    from shared.contracts.api_contracts import (
+        WorkflowCommandType,
+        WorkflowPriority,
+        WorkflowResourceProfile,
+        WorkflowSubmitRequest,
+    )
+
+    resource_profile = {
+        "light": WorkflowResourceProfile.light,
+        "realtime": WorkflowResourceProfile.light,  # realtime 别名映射到 light
+        "standard": WorkflowResourceProfile.standard,
+        "heavy": WorkflowResourceProfile.heavy,
+        "batch": WorkflowResourceProfile.batch,
+    }.get(resource_profile_str, WorkflowResourceProfile.standard)
+
+    payload = WorkflowSubmitRequest(
+        # analysis + algorithm_request.workflow_name（模板种子 id）：
+        # python_provider bridge 的 ALGORITHM_REQUEST_ENTRY_KEYS 含
+        # workflow_name，据此路由到对应模块执行；custom 类型会 no bridge。
+        command_type=WorkflowCommandType.analysis,
+        command_label=f"课题组模板 {meta.get('name', workflow_id)}",
+        layer_id=linked_layer_id,
+        priority=WorkflowPriority.normal,
+        resource_profile=resource_profile,
+        time_range=body.time_range,
+        algorithm_request={
+            "workflow_name": workflow_id,
+            "algorithm_params": dict(body.parameters),
+        },
+        parameters={
+            "workflow_kind": "lab_template",
+            "workflow_template_id": workflow_id,
+            "auto_display": auto_display,
+            **body.parameters,
+        },
+    )
+
+    accepted = _submit_online_sync_workflow(payload, cred=cred)
+    return WorkflowTemplateRunResponse(
+        run_id=accepted.run_id,
+        status="submitted",
+        message=accepted.message,
+        workflow_id=workflow_id,
+        linked_layer_id=linked_layer_id,
+        auto_display=auto_display,
+        status_url=accepted.status_url,
+        events_url=accepted.events_url,
+    )
+
+
+@router.get("/geo/transform", tags=["geo"])
+def transform_geo_point(
+    lng: float, lat: float, source: str, target: str = "EPSG:3857"
+) -> dict[str, float | str]:
+    try:
+        # 归一化旧码连字符写法（'GCJ-02' → 'GCJ02'，'BD-09' → 'BD09'），
+        # 保持与旧垫片 transform_point 相同的向后兼容行为
+        src = normalize_crs_code(source)
+        tgt = normalize_crs_code(target)
+        point = crs_transformer.transform_point(lng, lat, src, tgt)
+        return {"lng": point.lng, "lat": point.lat, "source": source, "target": target}
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+
+
+@router.get("/overlay-preview/{layer_id}", tags=["overlay"])
+def get_overlay_preview(
+    layer_id: str,
+    time: str | None = Query(default=None),
+    palette: str | None = Query(default=None),
+    min_value: float | None = Query(default=None),
+    max_value: float | None = Query(default=None),
+    nodata_mode: str | None = Query(default=None),
+    nodata_color: str | None = Query(default=None),
+    cred=Depends(get_request_user),
+) -> Response:
+    """返回图层的 PNG 预览图（地理配准），供前端 MapLibre image source 使用。
+
+    对于时间序列图层，可通过 `?time=YYYYMMDD` 指定时间标签；
+    未指定时使用 default_time。
+
+    有可读源且传入 palette/min/max/nodata 时动态重着色；否则返回烘焙 PNG。
+    """
+    check_resource_access(cred, "layer", layer_id)
+    from app.services.overlay_recolor import render_overlay_preview_styled
+
+    styled = bool(
+        (palette and palette.strip())
+        or min_value is not None
+        or max_value is not None
+        or (nodata_mode and nodata_mode.strip())
+        or (nodata_color and nodata_color.strip())
+    )
+    content = render_overlay_preview_styled(
+        layer_id,
+        time=time,
+        palette=palette,
+        min_value=min_value,
+        max_value=max_value,
+        nodata_mode=nodata_mode,
+        nodata_color=nodata_color,
+    )
+    # ACL-gated assets must not be shared via public caches.
+    cache = "no-cache, must-revalidate" if styled else "private, max-age=60"
+    return Response(
+        content=content,
+        media_type="image/png",
+        headers={"Cache-Control": cache, "Vary": "Accept-Encoding"},
+    )
+
+
+@router.get("/overlay-tiles/{layer_id}/{z}/{x}/{y}.png", tags=["overlay"])
+def get_overlay_tile(
+    layer_id: str,
+    z: int,
+    x: int,
+    y: int,
+    time: str | None = Query(default=None),
+    palette: str | None = Query(default=None),
+    min_value: float | None = Query(default=None),
+    max_value: float | None = Query(default=None),
+    nodata_mode: str | None = Query(default=None),
+    nodata_color: str | None = Query(default=None),
+    cred=Depends(get_request_user),
+) -> Response:
+    """Web Mercator XYZ PNG tile for imported / geotiff-backed overlays."""
+    check_resource_access(cred, "layer", layer_id)
+    from app.services.overlay_tile_service import render_overlay_tile
+
+    spec = get_overlay_spec(layer_id)
+    if spec is None:
+        raise HTTPException(status_code=404, detail=f"No overlay for layer: {layer_id}")
+    source = spec.resolve_source_path(time)
+    if source is None or source.suffix.lower() not in {
+        ".tif",
+        ".tiff",
+        ".geotiff",
+        ".cog",
+    }:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Overlay has no GeoTIFF source for XYZ tiles: {layer_id}",
+        )
+    try:
+        png = render_overlay_tile(
+            str(source),
+            z,
+            x,
+            y,
+            band=spec.source_band,
+            palette=palette or spec.palette or "viridis",
+            min_value=min_value if min_value is not None else spec.vmin,
+            max_value=max_value if max_value is not None else spec.vmax,
+            nodata_mode=nodata_mode,
+            nodata_color=nodata_color,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        _logger.warning(
+            "overlay tile render failed %s z=%s", layer_id, z, exc_info=True
+        )
+        # B-7：500 固定文案（不回显 exc，防内部信息泄露；真因走日志 exc_info）
+        raise HTTPException(status_code=500, detail="Tile render failed") from exc
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={"Cache-Control": "private, max-age=120", "Vary": "Accept-Encoding"},
+    )
+
+
+@router.get("/overlay-bounds/{layer_id}", tags=["overlay"])
+def get_overlay_bounds(
+    layer_id: str,
+    time: str | None = Query(default=None),
+    cred=Depends(get_request_user),
+) -> dict[str, Any]:
+    """返回图层的地理边界信息 + 元数据，供前端 MapLibre image source 定位与时间控制使用。
+
+    额外补一层"身份证"字段（来源 / 变量 / 单位的中文标签）：前端据此区分
+    「SMAP 土壤水分」与「风云 土壤水分」这类同名图层，并在日期提示里带上来源。
+    只补 meta 里缺失的键，绝不覆盖已有的 ``unit`` / ``label`` 语义（前者是
+    角色码 SM/VOD/OMEGA，图例依赖它）。
+    """
+    check_resource_access(cred, "layer", layer_id)
+    data = read_bounds(layer_id, time)
+    try:
+        from app.services.agent.layer_identity import identity_fields
+
+        ident = identity_fields(layer_id)
+    except Exception:  # 身份识别失败不影响边界返回
+        ident = {}
+    if ident:
+        meta = data.get("meta")
+        if isinstance(meta, dict):
+            for key in ("source", "source_label", "variable_label", "unit_label"):
+                if ident.get(key):
+                    meta.setdefault(key, ident[key])
+        data.setdefault("source", ident.get("source"))
+        data.setdefault("source_label", ident.get("source_label"))
+    return data
+
+
+@router.get("/overlays", tags=["overlay"])
+def list_overlays(cred=Depends(get_request_user)) -> dict[str, Any]:
+    """列出当前用户可访问的叠加图层 ID（供前端发现可用 overlay 图层）。"""
+    ids = _filter_accessible_layer_ids(list_overlay_ids(), cred)
+    return {"overlay_layer_ids": ids}
+
+
+@router.get("/overlays/intersect", tags=["overlay"])
+def get_overlays_in_viewport(
+    west: float = Query(..., ge=-180, le=360),  # 容许 >180（跨日界线 unwrap）
+    south: float = Query(..., ge=-90, le=90),
+    east: float = Query(..., ge=-180, le=360),
+    north: float = Query(..., ge=-90, le=90),
+    zoom: int | None = Query(default=None, ge=0, le=24),
+    cred=Depends(get_request_user),
+) -> dict[str, Any]:
+    """返回与视口相交且当前用户可访问的 overlay layer_ids。
+
+    优先用 spatial.sqlite + R*Tree（``ST_Intersects``）；扩展不可用或表空时
+    回退到逐层读 ``bounds.json`` 做 AABB 相交（与原前端 O(N) 过滤等价）。
+    空间库就绪时即使零命中也信任结果，不再误扫 bounds.json。
+
+    跨日界线约定：前端对跨日界线视口传 ``east > 180``（unwrap），与
+    ``overlay_safe_wgs84_bounds`` 一致。
+
+    回退路径无 zoom 元资料时不过滤（bounds.json / registry 目前无 min/maxzoom）。
+    """
+    from app.services.spatial_repository import get_spatial_repository
+
+    repo = get_spatial_repository()
+    if repo.is_spatial_ready():
+        hits = repo.query_intersects(west, south, east, north, zoom=zoom)
+        raw_ids = [h["layer_id"] for h in hits]
+        return {
+            "layer_ids": _filter_accessible_layer_ids(raw_ids, cred),
+            "source": "spatialite",
+        }
+
+    # 回退：扫所有 overlay 的 bounds.json 做 AABB 相交（未导入 / 扩展不可用）
+    from app.services.geo_math import overlay_safe_wgs84_bounds
+
+    matched: list[str] = []
+    # 视口也按同一日界线展开约定归一化，与空间路径（BuildMBR 用展开后视口）保持同一空间
+    vw, vs_, ve, vn = overlay_safe_wgs84_bounds(west, south, east, north)
+    for lid in list_overlay_ids():
+        try:
+            b = read_bounds(lid).get("bounds")
+            if not b or len(b) < 4:
+                continue
+            ow, os_, oe, on = b
+            ow, os_, oe, on = overlay_safe_wgs84_bounds(ow, os_, oe, on)
+            # AABB 相交（视口与 bounds 都已 unwrap 到同一空间）
+            if vw <= oe and ve >= ow and vs_ <= on and vn >= os_:
+                matched.append(lid)
+        except Exception:
+            _logger.debug(
+                "overlay %s bounds read failed in fallback", lid, exc_info=True
+            )
+            continue
+    return {
+        "layer_ids": _filter_accessible_layer_ids(matched, cred),
+        "source": "fallback_bounds_json",
+    }
+
+
+@router.get("/overlay-value/{layer_id}", tags=["overlay"])
+def get_overlay_value(
+    layer_id: str,
+    lng: float = Query(...),
+    lat: float = Query(...),
+    time: str | None = Query(default=None),
+    cred=Depends(get_request_user),
+) -> dict[str, Any]:
+    """查询 overlay 图层在指定点 (lng, lat) 的像素值。
+
+    对于时间序列图层，可通过 ?time=YYYYMMDD 指定时间标签。
+    返回 {"value": float | null, "unit": str, "layer_id": str, ...}。
+    """
+    check_resource_access(cred, "layer", layer_id)
+    spec = get_overlay_spec(layer_id)
+    if spec is None:
+        raise HTTPException(status_code=404, detail=f"No overlay for layer: {layer_id}")
+    return spec.resolve_value(lng, lat, time)

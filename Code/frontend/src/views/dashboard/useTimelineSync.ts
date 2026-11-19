@@ -1,0 +1,846 @@
+/**
+ * useTimelineSync — 时间轴同步核心逻辑。
+ *
+ * 从 DashboardView.vue 提取：tileForecastHour / selectedCatalogId /
+ * hasTimelineLayer / timelineLayerName / timelineAvailabilityLabel /
+ * timelineObservationLabel / snapTimelineToLatestValid / snapTimelineToLayerLatest /
+ * refreshImportedRasterEffectiveTimes / 新加图层 snap / 科学层渐进块跟随 /
+ * 工作流进度 seek / 运行启动对齐 / 切层记忆恢复 /
+ * activeLayerGranularity / isLayerLocked / timelineSegments。
+ */
+import { computed, ref, watch, type ComputedRef, type Ref } from 'vue'
+import type { useUiStore } from '../../stores/ui'
+import { useTimelineActionBannerStore } from '../../stores/timeline-action-banner'
+import { useLayerWorkspace, useWorkflowRun } from '../../stores/layers/selectors'
+import { useOnDemandFrameStore, toCompactDate } from '../../stores/layers/ondemand-frame'
+import type { useLogStore } from '../../stores/log'
+import type { useWeatherTileManager } from '../../stores/weather-tile-manager'
+import type { WeatherCoverage } from '../../services/runtime-api'
+import type { OverlayTimeState } from '../../components/map/overlay-image-module'
+import type { TimeGranularity, TimelineAvailabilitySegment } from '../../utils/layer-timeline'
+import {
+  buildClockDayTimelineSegments,
+  dateHourToTileHour,
+  findLatestValidCoverageInstant,
+} from '../../utils/weather-timeline'
+import {
+  BLOCK_DAY_READY_LABEL,
+  generateTimelineSegments,
+  isSingleCrossDayBlock,
+} from '../../utils/layer-timeline'
+
+/** 按需补帧图层的日格子说明（替代「无独立逐日帧」）。 */
+const ONDEMAND_DAY_READY_LABEL = '拖到这一天会取该日单日图'
+import {
+  referenceInstantFromTimeline,
+  resolveLayerEffectiveTime,
+  snapTargetFromLayer,
+  temporalSpecFromActiveLayer,
+} from '../../utils/layer-temporal'
+import {
+  dayAvailabilityFromTimeList,
+  formatSliceLabel,
+  monthAvailabilityFromTimeList,
+  parseInstant,
+  timeStepToLegacyGranularity,
+  yearAvailabilityFromTimeList,
+} from '../../utils/temporal-interval'
+import {
+  buildRunTimelineAvailability,
+  overlayOnlineTemporalFetchable,
+  type RunAvailabilityState,
+} from '../../utils/run-timeline-availability'
+import {
+  resolveJobLayerForActiveLayer,
+  resolveRunGroupForActiveLayer,
+  resolveTimelineNativeStep,
+  shouldUseExpectedTimelineAxis,
+} from '../../utils/job-layer-coverage'
+import {
+  matchSliceLabelInTimeList,
+  timelineTargetFromWorkflowTimeKey,
+  type WorkflowProgressTimeSeekHint,
+} from '../../utils/workflow-timekey-seek'
+import type MapCanvas from '../../components/MapCanvas.vue'
+import { DEFAULT_LAYERS } from '../../stores/layers/default-layers'
+import { toTimelineLayerDisplayName } from '../../utils/layer-display-name'
+
+interface ActiveLayerLike {
+  catalogId?: string
+  name?: string
+  accentColor?: string
+  availabilityLabel?: string
+  observationTimeLabel?: string
+  runReadiness?: unknown
+  instanceId?: string
+  isAdminBoundary?: boolean
+  isImported?: boolean
+  isImportedRaster?: boolean
+}
+
+interface SelectedLayerLike {
+  catalogId?: string
+  instanceId?: string
+}
+
+export function useTimelineSync(
+  uiStore: ReturnType<typeof useUiStore>,
+  logStore: ReturnType<typeof useLogStore>,
+  weatherTileManager: ReturnType<typeof useWeatherTileManager>,
+  weatherCoverage: Ref<WeatherCoverage | null>,
+  mapCanvasRef: Ref<InstanceType<typeof MapCanvas> | null>,
+  selectedLayerDisplay: Ref<SelectedLayerLike | null | undefined>,
+  activeLayer: ComputedRef<ActiveLayerLike>,
+  overlayTimeStates: Ref<OverlayTimeState[]>,
+  currentHour: Ref<number>,
+  currentDate: Ref<Date>,
+  unifiedTimeLock: Ref<boolean>,
+  isPlaying: Ref<boolean>,
+  weatherStatusVersion: Ref<number>,
+  weatherActivityVersion: Ref<number>,
+  workflowProgressTimeSeek: Ref<WorkflowProgressTimeSeekHint | null>,
+  analysisPanelRef: Ref<{ showPanel: () => void } | null>,
+) {
+  // ── Domain selectors ─────────────────────────────────────────────────
+  const workspace = useLayerWorkspace()
+  const workflowRun = useWorkflowRun()
+  /** 按需补帧：登记表 + 「当前显示哪一天」覆盖（见 stores/layers/ondemand-frame.ts） */
+  const ondemand = useOnDemandFrameStore()
+
+  /**
+   * 「补帧身份键」—— 同一个图层在系统里有两个 id，必须取后端认的那个。
+   *
+   * 后端 `ONDEMAND_TARGETS` 的 key 是**产物目录名** `imported-<sha1>`，
+   * 也就是 `importedRaster.overlayLayerId`；而 `ActiveLayer.catalogId` 在导入、
+   * 恢复快照等入口会被改写成 `method-<...>` 或 `imported-<instanceId>`。
+   *
+   * 2026-11-05 用户实测「风云平均勾选后只有月份、SMAP 平均正常」：
+   * 判定只用了 catalogId ⇒ 永远查不到登记表 ⇒ 时间轴退回 meta 的 `native_step`。
+   * 风云平均那三层恰好是 `1M`/单片 ⇒ 月历；SMAP 平均是 `1d`/73 片 ⇒ 看着正常，
+   * 掩盖了同一个缺陷。请求本身能通，是因为发请求用的是 overlayLayerId。
+   *
+   * 返回 `''` = 该层确实没接按天取数（两个键都查过）。
+   */
+  function ondemandKeyOf(
+    layer:
+      | { catalogId?: string | null; importedRaster?: { overlayLayerId?: string | null } | null }
+      | null
+      | undefined,
+  ): string {
+    if (!layer) return ''
+    const overlayId = layer.importedRaster?.overlayLayerId
+    if (overlayId && ondemand.isOnDemandLayer(overlayId)) return overlayId
+    const catalogId = layer.catalogId
+    if (catalogId && ondemand.isOnDemandLayer(catalogId)) return catalogId
+    return ''
+  }
+
+  /**
+   * 按需补帧图层：把登记表覆盖范围内、但 time_list 没有的日子标成「可在线获取」。
+   *
+   * 2026-11-11 老师复测：同一 SMAP 图层的 11-14 能取到单日数据（69 个有效栅格），
+   * 「当前观测」也显示 11-14，日历却标「无数据」。原因是日格子只按 time_list 判断
+   * ready，而该层其实登记了按需补帧——拖到那天就去 NAS 取单日帧。可补取的日期被
+   * 画成空档，用户以为没数据，反而不去拖。
+   *
+   * 只在图层确实登记了按需补帧、且能读到覆盖范围时才生效；超出覆盖范围的日期仍然
+   * 是空的（不会把 2030 年也标成可获取）。与 `overlayOnlineTemporalFetchable`
+   * 同一套状态语义，只是数据来源从 online_temporal 换成 NAS 登记表。
+   */
+  function overlayOndemandFetchable(
+    map: Record<number, RunAvailabilityState>,
+    gran: Parameters<typeof overlayOnlineTemporalFetchable>[2],
+  ): Record<number, RunAvailabilityState> {
+    if (!ondemandKeyOf(selectedActiveLayer.value)) return map
+    const cap = ondemand.coverage
+    if (!cap?.start || !cap?.end) return map
+    return overlayOnlineTemporalFetchable(map, currentDate.value, gran, cap.start, cap.end)
+  }
+
+  // ── 基础 computed ─────────────────────────────────────────────────────
+
+  /** 瓦片 API 用的预报偏移 */
+  const tileForecastHour = computed(() =>
+    dateHourToTileHour(weatherCoverage.value, currentDate.value, currentHour.value),
+  )
+
+  watch(
+    tileForecastHour,
+    (hour) => {
+      workspace.setCurrentHour(hour)
+    },
+    { immediate: true },
+  )
+
+  /** 当前选中图层 catalogId */
+  const selectedCatalogId = computed(() => selectedLayerDisplay.value?.catalogId ?? null)
+
+  /** 是否选中了真实图层 */
+  const hasTimelineLayer = computed(() => Boolean(selectedLayerDisplay.value?.catalogId))
+
+  const timelineLayerName = computed(() => {
+    if (!hasTimelineLayer.value) return '未选择图层'
+    const layer = workspace.activeLayers.value.find(
+      l => l.instanceId === selectedLayerDisplay.value?.instanceId,
+    ) ?? workspace.activeLayers.value.find(l => l.catalogId === selectedCatalogId.value)
+    const group = resolveRunGroupForActiveLayer(layer, workflowRun.runLayerGroups.value)
+    const overlayId = layer?.importedRaster?.overlayLayerId ?? layer?.catalogId
+    const known = DEFAULT_LAYERS.find(item => item.members.some(member => member.overlayId === overlayId))
+    return toTimelineLayerDisplayName(activeLayer.value.name, {
+      title: group?.title ?? known?.groupTitle,
+      workflowId: group?.workflowId ?? known?.workflowId,
+      sourceLayerId: group?.sourceLayerId ?? known?.catalogId,
+    })
+  })
+  const timelineAvailabilityLabel = computed(() =>
+    hasTimelineLayer.value ? (activeLayer.value.availabilityLabel ?? '—') : '空闲',
+  )
+  const timelineObservationLabel = computed(() =>
+    hasTimelineLayer.value ? (activeLayer.value.observationTimeLabel ?? '—') : '—',
+  )
+
+  // ── Snap / refresh 函数 ───────────────────────────────────────────────
+
+  /** 新加天气图层：跳过切层记忆恢复 */
+  const pendingSnapCatalogIds = new Set<string>()
+  const knownActiveInstanceIds = new Set<string>()
+  let layerTimeTrackingReady = false
+
+  function snapTimelineToLatestValid(reason: string) {
+    const selected = workspace.activeLayers.value.find(
+      (l) => l.catalogId === selectedCatalogId.value,
+    )
+    const scienceSnap = snapTargetFromLayer(selected)
+    if (scienceSnap) {
+      // 程序化 snap（加图层 / 切层）抑制顶栏「改轴确认卡」，见 useTimelineActionConfirm
+      useTimelineActionBannerStore().suppressConfirm(3_500)
+      uiStore.applyDateHour(scienceSnap.date, scienceSnap.hour)
+      uiStore.applyTimelineFromLayerGranularity(scienceSnap.granularity)
+      if (selectedCatalogId.value) {
+        uiStore.rememberLayerTime(selectedCatalogId.value)
+      }
+      logStore.logOperation('timeline-snap-latest', `${reason} · ${scienceSnap.label}`)
+      return
+    }
+    const latest = findLatestValidCoverageInstant(weatherCoverage.value, new Date())
+    if (!latest) return
+    uiStore.applyDateHour(latest.date, latest.hour)
+    if (selectedCatalogId.value) {
+      uiStore.rememberLayerTime(selectedCatalogId.value)
+    }
+    logStore.logOperation('timeline-snap-latest', reason)
+  }
+
+  function snapTimelineToLayerLatest(layerCatalogId: string, reason: string) {
+    if (unifiedTimeLock.value) return
+    if (uiStore.isLayerTimeLocked(layerCatalogId)) return
+    /**
+     * ★ 2026-11-07：这一层刚被**显式指定**过时刻（助手 set_timeline / 用户刚设的日子），
+     * 保护窗内不许自动跳最新帧。组合指令「切层 + 切日期 + 统计」以前就是这样出错的：
+     * 切层时 timeList 还没回来，`snapTargetFromLayer` 拿不到落点于是这一步空转；
+     * 等 timeList 晚到，下面 scienceTimeListSignature 里的 pending 分支再 snap 一次，
+     * 把刚设好的 12-16 顶成该层默认帧（20250701_20250731 → 界面显示 7 月 31 日）。
+     * 钉子见 stores/ui.ts 的 TimelinePin。
+     */
+    if (uiStore.isTimelinePinned(layerCatalogId)) return
+    const layer = workspace.activeLayers.value.find((l) => l.catalogId === layerCatalogId)
+    const scienceSnap = snapTargetFromLayer(layer)
+    if (!scienceSnap) return
+    // 程序化 snap 抑制顶栏确认，避免 add→snap→confirm→reuse 循环
+    useTimelineActionBannerStore().suppressConfirm(3_500)
+    uiStore.applyDateHour(scienceSnap.date, scienceSnap.hour)
+    uiStore.applyTimelineFromLayerGranularity(scienceSnap.granularity)
+    uiStore.rememberLayerTime(layerCatalogId)
+    logStore.logOperation('timeline-snap-latest', `${reason} · ${scienceSnap.label}`)
+  }
+
+  /** 按 T_ref 刷新各导入栅格层的生效时间标签 */
+  function refreshImportedRasterEffectiveTimes() {
+    for (const layer of workspace.activeLayers.value) {
+      if (!layer.importedRaster) continue
+      if (!layer.importedRaster.timeList?.length) {
+        const oid = layer.importedRaster.overlayLayerId
+        const st = oid
+          ? overlayTimeStates.value.find((s) => s.layerId === oid && s.category === 'time-series')
+          : null
+        if (st?.timeList?.length) {
+          layer.importedRaster.timeList = [...st.timeList]
+          if (!layer.importedRaster.nativeStep) {
+            layer.importedRaster.nativeStep = st.timeList.some((t) => /^\d{8}_\d{8}$/.test(t))
+              ? '8d'
+              : '1d'
+          }
+        }
+      }
+      /**
+       * 按需补帧（2026-10-27）：用户拖到某天后，那张单日帧**不在** time_list 里
+       * （在 time_list 里会让默认落点变成单日帧，勾选/添加图层就不再是长序列）。
+       * 所以这里优先认前端那层「当前显示哪一天」的覆盖，
+       * 取不到才回落 time_list 的常规解析。
+       */
+      // Independent layer mode must render each layer's remembered instant.
+      // Changing the selected layer must not redraw every visible raster at its date.
+      const independentOther = !unifiedTimeLock.value && layer.catalogId !== selectedCatalogId.value
+      let memory = independentOther ? uiStore.layerTimeMemory[layer.catalogId] : null
+      if (independentOther && !memory) {
+        const pin = uiStore.isTimelinePinned(layer.catalogId) ? uiStore.timelinePin : null
+        const ownFrame = layer.importedRaster.effectiveTimeLabel || layer.importedRaster.defaultTime || ''
+        const range = /^(\d{8})_(\d{8})$/.exec(ownFrame)
+        const date = parseInstant(pin?.dateKey || range?.[2] || ownFrame)
+        if (!date) continue // No own time is known; never borrow another layer's clock.
+        uiStore.setLayerTimeMemoryAt(layer.catalogId, date, pin?.hour ?? date.getHours())
+        memory = uiStore.layerTimeMemory[layer.catalogId]
+      }
+      const layerDate = memory ? parseInstant(memory.dateKey) : currentDate.value
+      if (!layerDate) continue
+      const layerHour = memory?.hour ?? currentHour.value
+      const tRef = referenceInstantFromTimeline(layerDate, layerHour)
+      const ondemandTag = ondemandKeyOf(layer)
+        ? ondemand.displayedDayTag(ondemandKeyOf(layer), toCompactDate(layerDate))
+        : null
+      const resolved = resolveLayerEffectiveTime(layer, tRef)
+      const sliceLabel = ondemandTag ?? (resolved?.slice ? formatSliceLabel(resolved.slice) : null)
+      if (!sliceLabel) continue
+      layer.importedRaster.effectiveTimeLabel = sliceLabel
+      const overlayId = layer.importedRaster.overlayLayerId
+      if (overlayId) {
+        void mapCanvasRef.value?.setOverlayTime?.(overlayId, sliceLabel)
+      }
+    }
+  }
+
+  // ── Watchers ──────────────────────────────────────────────────────────
+
+  watch(() => [ondemand.dayTag, ondemand.loaded], refreshImportedRasterEffectiveTimes, { deep: true })
+  watch(() => uiStore.layerTimeMemory, refreshImportedRasterEffectiveTimes, { deep: true })
+
+  // 拖动/改日期：单通道刷新
+  watch(
+    () => [currentHour.value, currentDate.value, unifiedTimeLock.value] as const,
+    () => {
+      if (!unifiedTimeLock.value) {
+        uiStore.rememberLayerTime(selectedCatalogId.value)
+      }
+      refreshImportedRasterEffectiveTimes()
+    },
+  )
+
+  // 新加图层 snap
+  watch(
+    () => workspace.activeLayers.value.map((l) => l.instanceId),
+    (ids) => {
+      if (!layerTimeTrackingReady) {
+        for (const id of ids) knownActiveInstanceIds.add(id)
+        layerTimeTrackingReady = true
+        return
+      }
+      const added = ids.filter((id) => !knownActiveInstanceIds.has(id))
+      for (const id of ids) knownActiveInstanceIds.add(id)
+      for (const id of Array.from(knownActiveInstanceIds)) {
+        if (!ids.includes(id)) knownActiveInstanceIds.delete(id)
+      }
+      if (added.length === 0) return
+      // Background metadata/seed attachment is not a request to change the clock.
+      // Manual add still selects its new layer before Vue flushes this watcher.
+      const selectedInstanceId = selectedLayerDisplay.value?.instanceId
+      const selectedAdded = added.filter((instanceId) => {
+        const layer = workspace.activeLayers.value.find((item) => item.instanceId === instanceId)
+        return layer?.visible && (selectedInstanceId
+          ? instanceId === selectedInstanceId
+          : layer.catalogId === selectedCatalogId.value)
+      })
+      if (!selectedAdded.length) return
+      /**
+       * 添加图层是一次「程序化改轴」的起点：snap / 记忆恢复 / 产物对齐会在随后几秒里
+       * 反复挪时间轴。确认卡（「重跑 / 取消」）只在**用户自己拖时间轴**时才该出现，
+       * 否则每次添加都弹一次，既打断操作又暴露内部 id 文案。
+       *
+       * 这里给一个比 debounce(2s) + 挂载探测都长的抑制窗，把整条添加流程盖住；
+       * 用户真要按新时间重跑，可拖一下时间轴（那时抑制早已过期）或走「重算」按钮。
+       */
+      useTimelineActionBannerStore().suppressConfirm(8_000)
+      // 产品约定：添加图层强制独立记忆，再 snap 到最新有数据时刻
+      if (unifiedTimeLock.value) {
+        uiStore.setUnifiedTimeLock(false)
+      }
+      for (const instanceId of selectedAdded) {
+        const layer = workspace.activeLayers.value.find((l) => l.instanceId === instanceId)
+        if (!layer) continue
+        /**
+         * 未勾选的图层不参与落点（2026-10-21）。
+         *
+         * 默认图层名单新增「SMAP卫星反演产品」后，它是**挂着但默认不勾选**的：
+         * 若它也算「新加图层」，就会把时间轴从风云的整月合成帧
+         * （20251201_20251231）拽到 SMAP 的日帧（20260102）——表现为风云那一层
+         * 匹配不到切片、看着像"消失"，日期也跟着乱。
+         * 语义上也应如此：看不见的图层不该带走时间轴。
+         * 正常添加流程新增的图层都是可见的，因此不改变原有行为。
+         */
+        if (!layer.visible) continue
+        // Hydrated layers already own a date. They are not newly requested data.
+        if (uiStore.layerTimeMemory[layer.catalogId]) continue
+        if (layer.importedRaster) {
+          // 稳定编号直探挂载时，timeList 常由 overlay meta 稍后补到。
+          // 先登记「待落点」，等列表到位再补一次 snap（见下方 scienceTimeListSignature）。
+          // 工作流渐进物化带 runGroupId：未点播放不抢轴（色段仍会更新），故不登记。
+          const progressive = !isPlaying.value && Boolean(layer.runGroupId)
+          if (!progressive) pendingSnapCatalogIds.add(layer.catalogId)
+          if (!layer.importedRaster.timeList?.length) continue
+          if (progressive) continue
+          snapTimelineToLayerLatest(layer.catalogId, `新加科学图层 ${layer.catalogId} → 最新整月`)
+          uiStore.rememberLayerTime(layer.catalogId, { force: true })
+          break
+        }
+        if (!workspace.isWeatherEngineLayer(layer.catalogId)) continue
+        pendingSnapCatalogIds.add(layer.catalogId)
+        snapTimelineToLatestValid(`新加图层 ${layer.catalogId} → 最新有效时次`)
+        uiStore.rememberLayerTime(layer.catalogId, { force: true })
+        break
+      }
+    },
+    { immediate: true },
+  )
+
+  // 渐进块：仅在时间轴播放中跟随最新块；未点播放时不抢用户选定时刻
+  const scienceTimeListSignature = computed(() =>
+    workspace.activeLayers.value
+      .filter((l) => l.importedRaster?.timeList?.length)
+      .map(
+        (l) =>
+          `${l.catalogId}:${l.importedRaster!.timeList!.length}:${l.importedRaster!.timeList!.at(-1)}`,
+      )
+      .join('|'),
+  )
+  const knownScienceTimeSig = ref('')
+  watch(scienceTimeListSignature, (sig) => {
+    if (!layerTimeTrackingReady) {
+      knownScienceTimeSig.value = sig
+      return
+    }
+    if (!sig || sig === knownScienceTimeSig.value) return
+    const prev = knownScienceTimeSig.value
+    knownScienceTimeSig.value = sig
+
+    refreshImportedRasterEffectiveTimes()
+
+    // 新加层的时间列表可能是挂载之后才补到的：此时补一次落点，避免时间轴
+    // 停在添加前的旧时刻（表现为：加完 SMAP 却显示上个月某一天）。
+    // 这是添加流程的一部分，不受「未播放不抢轴」限制。
+    if (!unifiedTimeLock.value && !isPlaying.value) {
+      const pending = workspace.activeLayers.value.find(
+        (l) =>
+          l.catalogId === selectedCatalogId.value &&
+          pendingSnapCatalogIds.has(l.catalogId) &&
+          Boolean(l.importedRaster?.timeList?.length),
+      )
+      if (pending) {
+        pendingSnapCatalogIds.delete(pending.catalogId)
+        // ★ 2026-11-07：显式指定过时刻的层，晚到的 timeList 只补时间标签，不倒拨时间轴。
+        // 时间轴此刻已经停在指定那天（set_timeline 先落过点），这里再 snap 就是覆盖它。
+        if (uiStore.isTimelinePinned(pending.catalogId)) {
+          refreshImportedRasterEffectiveTimes()
+          return
+        }
+        snapTimelineToLayerLatest(
+          pending.catalogId,
+          `新加科学图层 ${pending.catalogId} → 最新整月（时间列表到位）`,
+        )
+        return
+      }
+    }
+
+    if (!prev) return
+    if (unifiedTimeLock.value) return
+    if (!isPlaying.value) return
+
+    const selected = workspace.activeLayers.value.find(
+      (l) => l.catalogId === selectedCatalogId.value,
+    )
+    if (!selected?.importedRaster?.timeList?.length) return
+    if (uiStore.isLayerTimeLocked(selected.catalogId)) return
+
+    const times = selected.importedRaster.timeList
+    const oldTip = times.length >= 2 ? times[times.length - 2]! : null
+    if (!oldTip) return
+    const tRef = referenceInstantFromTimeline(currentDate.value, currentHour.value)
+    const resolved = resolveLayerEffectiveTime(selected, tRef)
+    const curLabel = resolved?.slice ? formatSliceLabel(resolved.slice) : null
+    if (curLabel !== oldTip) return
+
+    snapTimelineToLayerLatest(selected.catalogId, `新块产出 ${selected.catalogId} → 跟随最新切片`)
+    refreshImportedRasterEffectiveTimes()
+  })
+
+  // 工作流进度 seek
+  function seekTimelineToWorkflowProgressTimeKey(
+    catalogId: string,
+    timeKey: string,
+    sliceLabel: string,
+    reason: string,
+  ) {
+    if (unifiedTimeLock.value) return
+    // 未点播放时不随工作流块 seek；inFlight 键仍由 emitWorkflowProgressTimeSeek 更新色段
+    if (!isPlaying.value) return
+    if (uiStore.isLayerTimeLocked(catalogId)) return
+
+    const target = timelineTargetFromWorkflowTimeKey(timeKey)
+    if (!target) return
+
+    uiStore.applyDateHour(target.date, target.hour)
+    uiStore.applyTimelineFromLayerGranularity(target.granularity)
+    uiStore.rememberLayerTime(catalogId)
+
+    const layer = workspace.activeLayers.value.find((l) => l.catalogId === catalogId)
+    const runGroupId = layer?.runGroupId
+    const members = runGroupId
+      ? workspace.activeLayers.value.filter(
+          (l) => l.runGroupId === runGroupId && l.importedRaster?.overlayLayerId,
+        )
+      : layer?.importedRaster?.overlayLayerId
+        ? [layer]
+        : []
+
+    for (const member of members) {
+      const overlayId = member.importedRaster?.overlayLayerId
+      if (!overlayId) continue
+      const label =
+        matchSliceLabelInTimeList(member.importedRaster?.timeList, sliceLabel) ?? sliceLabel
+      void mapCanvasRef.value?.setOverlayTime?.(overlayId, label)
+    }
+
+    refreshImportedRasterEffectiveTimes()
+    logStore.logOperation('timeline-seek-workflow', `${reason} · ${sliceLabel}`)
+  }
+
+  watch(
+    workflowProgressTimeSeek,
+    (hint) => {
+      if (!hint) return
+      const selected = selectedCatalogId.value
+        ? workspace.activeLayers.value.find((l) => l.catalogId === selectedCatalogId.value)
+        : null
+      const hintLayer = workspace.activeLayers.value.find((l) => l.catalogId === hint.catalogId)
+      const sameRunGroup =
+        Boolean(selected?.runGroupId) &&
+        Boolean(hintLayer?.runGroupId) &&
+        selected!.runGroupId === hintLayer!.runGroupId
+      if (selected && hint.catalogId !== selected.catalogId && !sameRunGroup) return
+      seekTimelineToWorkflowProgressTimeKey(
+        hint.catalogId,
+        hint.timeKey,
+        hint.sliceLabel,
+        `工作流块 ${hint.runId.slice(0, 8)}`,
+      )
+    },
+    { deep: true },
+  )
+
+  // 运行启动：仅在时间轴播放中首次对齐 start_at（未点播放不抢用户选定时刻）
+  const alignedRunStartJobs = new Set<string>()
+  watch(
+    (): { jobId: string; startAt: string; status: string } | null => {
+      const layer = workspace.activeLayers.value.find(
+        (l) => l.catalogId === selectedCatalogId.value,
+      )
+      const job = resolveJobLayerForActiveLayer(
+        layer,
+        workflowRun.jobLayers.value,
+        workflowRun.runLayerGroups.value,
+      )
+      const startAt = job?.expectedTimeRange?.start_at
+      if (!job || !startAt) return null
+      return { jobId: job.jobId, startAt, status: job.status }
+    },
+    (hint, prev) => {
+      if (!hint) return
+      if (hint.status !== 'running') return
+      if (alignedRunStartJobs.has(hint.jobId)) return
+      const isFreshRun =
+        !prev ||
+        prev.jobId !== hint.jobId ||
+        prev.status === 'queued' ||
+        prev.status === 'retry_pending'
+      if (!isFreshRun) return
+      if (unifiedTimeLock.value) return
+      // 未点播放：仅记录已对齐，避免下次播放又跳回 start_at；不改 currentDate
+      if (!isPlaying.value) {
+        alignedRunStartJobs.add(hint.jobId)
+        return
+      }
+      const catalogId = selectedCatalogId.value
+      if (!catalogId || uiStore.isLayerTimeLocked(catalogId)) return
+      const d = parseInstant(hint.startAt)
+      if (!d) return
+      useTimelineActionBannerStore().suppressConfirm(3_500)
+      uiStore.applyDateHour(d, 0)
+      alignedRunStartJobs.add(hint.jobId)
+    },
+  )
+
+  // 切层：记忆恢复
+  watch(selectedCatalogId, (catalogId, previous) => {
+    if (!catalogId || catalogId === previous) return
+    const layer = workspace.activeLayers.value.find((l) => l.catalogId === catalogId)
+    const spec = temporalSpecFromActiveLayer(layer)
+    if (spec) {
+      uiStore.applyTimelineFromLayerGranularity(timeStepToLegacyGranularity(spec.nativeStep))
+    } else if (layer?.importedRaster) {
+      uiStore.applyTimelineFromLayerGranularity('static')
+    } else {
+      uiStore.applyTimelineFromLayerGranularity('hour')
+    }
+    if (unifiedTimeLock.value) {
+      refreshImportedRasterEffectiveTimes()
+      return
+    }
+    if (previous) {
+      uiStore.rememberLayerTime(previous)
+    }
+    if (pendingSnapCatalogIds.has(catalogId)) {
+      pendingSnapCatalogIds.delete(catalogId)
+      refreshImportedRasterEffectiveTimes()
+      return
+    }
+    // 切层恢复记忆时刻同样是程序化改轴：抑制确认卡（否则切一下图层就问「要不要重跑」）
+    useTimelineActionBannerStore().suppressConfirm(3_500)
+    const restored = uiStore.restoreLayerTime(catalogId)
+    if (restored) {
+      const times = layer?.importedRaster?.timeList ?? []
+      const day = currentDate.value.getDate()
+      const covered = times.length
+        ? dayAvailabilityFromTimeList(currentDate.value, times)[day] === 'ready'
+        : true
+      if (!covered && spec) {
+        snapTimelineToLayerLatest(catalogId, `切层 ${catalogId} · 记忆日无覆盖 → 最新切片`)
+      } else {
+        logStore.logOperation('timeline-restore-layer', `恢复图层 ${catalogId} 记忆时刻`)
+      }
+    } else if (spec) {
+      snapTimelineToLayerLatest(catalogId, `切层 ${catalogId} → 最新切片`)
+    }
+    refreshImportedRasterEffectiveTimes()
+  })
+
+  // analysisFocusRequest → showPanel
+  watch(
+    () => uiStore.analysisFocusRequest,
+    (request) => {
+      if (!request) return
+      analysisPanelRef.value?.showPanel()
+    },
+  )
+
+  // ── 粒度 & 时间轴色段 ─────────────────────────────────────────────────
+
+  const selectedActiveLayer = computed(
+    () => workspace.activeLayers.value.find((l) => l.catalogId === selectedCatalogId.value) ?? null,
+  )
+
+  const activeLayerGranularity = computed<TimeGranularity>(() => {
+    const layer = selectedActiveLayer.value
+    /**
+     * 按需补帧图层（2026-10-27）：时间轴刻度必须按「天」，
+     * 否则日历控件被设成月份选择器，物理上选不到 17 号 —— 用户反馈的
+     * 「只能选月份不能选单日」就是这个原因。
+     *
+     * 只改**时间轴刻度**：不改该层 meta.json 的 native_step，
+     * 也不改 snapTargetFromLayer 的落点算法 ⇒ 打开页面仍是原来的长序列。
+     */
+    if (layer?.importedRaster?.timeList?.length && ondemandKeyOf(layer)) {
+      return 'day'
+    }
+    const scienceSpec = temporalSpecFromActiveLayer(layer)
+    if (scienceSpec) {
+      return timeStepToLegacyGranularity(scienceSpec.nativeStep)
+    }
+    if (layer?.importedRaster) {
+      return 'static'
+    }
+    const catalogId = layer?.catalogId ?? activeLayer.value?.catalogId
+    if (!catalogId) return 'hour'
+    if (workspace.isWeatherEngineLayer(catalogId)) return 'hour'
+    const descriptor = workspace.resolveEffectiveDescriptor(catalogId)
+    if (!descriptor) return 'hour'
+    const gran =
+      (descriptor as { time_granularity?: string }).time_granularity ||
+      (descriptor as { timeGranularity?: string }).timeGranularity
+    if (gran === 'static' || descriptor.supports_time === false) return 'static'
+    if (gran === 'month' || gran === 'year' || gran === 'day' || gran === 'hour') return gran
+    return 'hour'
+  })
+
+  const isLayerLocked = computed(() => {
+    const catalogId = activeLayer.value?.catalogId
+    return catalogId ? uiStore.isLayerTimeLocked(catalogId) : false
+  })
+
+  const timelineSegments = computed((): TimelineAvailabilitySegment[] => {
+    // Touch reactive sources not accessed in every branch to ensure re-evaluation
+    void weatherStatusVersion.value
+    void weatherActivityVersion.value
+    void weatherCoverage.value
+    void overlayTimeStates.value
+    void selectedActiveLayer.value?.importedRaster?.timeList
+    void workflowRun.jobLayers.value
+    void workflowRun.runLayerGroups.value
+
+    if (!hasTimelineLayer.value) {
+      return buildClockDayTimelineSegments({
+        selectedDate: currentDate.value,
+        currentHour: currentHour.value,
+        coverage: null,
+        currentStatus: null,
+        isWeatherLayer: false,
+      })
+    }
+
+    const gran = activeLayerGranularity.value
+    if (gran === 'static') {
+      // 事件时间轴（2026-08-25 用户反馈）：静态图层若带事件时间（overlay
+      // meta time_list，如 ERA5 2020 灾害事件），按事件年份生成年刻度轴，
+      // 事件年标记就绪；无事件时间才回落笼统的「静态」单段。
+      const oid = selectedActiveLayer.value?.importedRaster?.overlayLayerId
+      const eventTimes = oid
+        ? (overlayTimeStates.value.find((s) => s.layerId === oid)?.timeList ?? [])
+        : []
+      const eventYears = [
+        ...new Set(
+          eventTimes
+            .map((t) => /^\d{4}/.exec(String(t))?.[0])
+            .filter((y): y is string => Boolean(y))
+            .map(Number),
+        ),
+      ].sort((a, b) => a - b)
+      if (eventYears.length > 0) {
+        const start = Math.max(1, eventYears[0] - 1)
+        const end = eventYears[eventYears.length - 1] + 1
+        return Array.from({ length: end - start + 1 }, (_, idx): TimelineAvailabilitySegment => {
+          const year = start + idx
+          const isEvent = eventYears.includes(year)
+          return {
+            index: year,
+            label: String(year),
+            state: isEvent ? 'ready' : 'empty',
+            availabilityLabel: isEvent ? `事件时间 ${year} · 资产就绪` : '无事件',
+          }
+        })
+      }
+      return generateTimelineSegments(currentDate.value, 'static')
+    }
+
+    const scienceLayer = selectedActiveLayer.value
+    const fromStore = scienceLayer?.importedRaster?.timeList?.filter(Boolean) ?? []
+    const oid = scienceLayer?.importedRaster?.overlayLayerId
+    const fromOverlay = oid
+      ? (overlayTimeStates.value.find((s) => s.layerId === oid)?.timeList ?? [])
+      : []
+    const scienceTimes = fromStore.length ? fromStore : fromOverlay.filter(Boolean)
+
+    const jobForTimeline = resolveJobLayerForActiveLayer(
+      scienceLayer,
+      workflowRun.jobLayers.value,
+      workflowRun.runLayerGroups.value,
+    )
+    const runGroup = resolveRunGroupForActiveLayer(scienceLayer, workflowRun.runLayerGroups.value)
+    const expected = jobForTimeline?.expectedTimeRange
+    const useExpectedAxis = shouldUseExpectedTimelineAxis({
+      expected,
+      job: jobForTimeline,
+      runGroup,
+      readyTimeCount: scienceTimes.length,
+    })
+
+    if (gran === 'day' || gran === 'month' || gran === 'year') {
+      // 检查当前图层是否支持在线时间获取
+      const onlineCap = selectedCatalogId.value
+        ? workspace.getOnlineTemporalConfig(selectedCatalogId.value)
+        : null
+
+      if (useExpectedAxis && expected) {
+        let map = buildRunTimelineAvailability({
+          windowDate: currentDate.value,
+          granularity: gran,
+          expectedTimeRange: expected,
+          nativeStep: resolveTimelineNativeStep({
+            job: jobForTimeline,
+            layer: scienceLayer,
+            fallback: '1d',
+          }),
+          readyTimeList: scienceTimes,
+          inFlightTimeKeys: jobForTimeline?.inFlightTimeKeys,
+          failedTimeKeys: jobForTimeline?.failedTimeKeys,
+          runFailed: jobForTimeline?.status === 'failed' || runGroup?.status === 'failed',
+        })
+        if (onlineCap) {
+          map = overlayOnlineTemporalFetchable(
+            map,
+            currentDate.value,
+            gran,
+            onlineCap.coverage_start,
+            onlineCap.coverage_end,
+          )
+        }
+        map = overlayOndemandFetchable(map, gran)
+        return generateTimelineSegments(currentDate.value, gran, map)
+      }
+      let map: Record<number, RunAvailabilityState> =
+        gran === 'day'
+          ? dayAvailabilityFromTimeList(currentDate.value, scienceTimes)
+          : gran === 'month'
+            ? monthAvailabilityFromTimeList(currentDate.value, scienceTimes)
+            : yearAvailabilityFromTimeList(currentDate.value, scienceTimes)
+      if (onlineCap) {
+        map = overlayOnlineTemporalFetchable(
+          map,
+          currentDate.value,
+          gran,
+          onlineCap.coverage_start,
+          onlineCap.coverage_end,
+        )
+      }
+      map = overlayOndemandFetchable(map, gran)
+      // 单块跨多天（如 20251201_20260201）时，日格子不能写「每日数据已就绪」——
+      // 该块内每一天都不是独立观测（报告第二轮 P2）。
+      // 按需补帧图层例外：它的日格子确实能换来单日图（拖到那天就去 NAS 取），
+      // 所以文案换成「拖到该日可取单日图」，不再说「无独立逐日帧」。
+      const readyLabel =
+        gran === 'day' && isSingleCrossDayBlock(scienceTimes)
+          ? ondemandKeyOf(selectedActiveLayer.value)
+            ? ONDEMAND_DAY_READY_LABEL
+            : BLOCK_DAY_READY_LABEL
+          : undefined
+      return generateTimelineSegments(currentDate.value, gran, map, readyLabel)
+    }
+
+    const layer = activeLayer.value
+    const catalogId = layer.catalogId
+    const isWeatherLayer = catalogId ? workspace.isWeatherEngineLayer(catalogId) : false
+    if (!isWeatherLayer) {
+      return generateTimelineSegments(currentDate.value, 'static')
+    }
+    const currentStatus =
+      isWeatherLayer && catalogId ? weatherTileManager.getLayerStatus(catalogId) : null
+
+    return buildClockDayTimelineSegments({
+      selectedDate: currentDate.value,
+      currentHour: currentHour.value,
+      coverage: weatherCoverage.value,
+      currentStatus,
+      isWeatherLayer,
+      runReadiness: layer.runReadiness as string | undefined,
+    })
+  })
+
+  return {
+    tileForecastHour,
+    selectedCatalogId,
+    hasTimelineLayer,
+    timelineLayerName,
+    timelineAvailabilityLabel,
+    timelineObservationLabel,
+    activeLayerGranularity,
+    isLayerLocked,
+    timelineSegments,
+    refreshImportedRasterEffectiveTimes,
+  }
+}

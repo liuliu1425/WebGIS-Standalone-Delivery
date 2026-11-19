@@ -1,0 +1,515 @@
+<script setup lang="ts">
+/**
+ * 全局加载动效：
+ * - hero：全屏地球 + 卫星轨道（启动 / 大面板）
+ * - compact：顶栏细进度条（普通 API 等）
+ */
+import { toRef } from 'vue'
+import { useUiLoadingStore } from '../stores/ui-loading'
+
+const uiLoading = useUiLoadingStore()
+const isVisible = toRef(uiLoading, 'isVisible')
+const message = toRef(uiLoading, 'message')
+const mode = toRef(uiLoading, 'mode')
+</script>
+
+<template>
+  <Teleport to="body">
+    <!-- 全屏地球 + 卫星 -->
+    <Transition name="cgda-fade">
+      <div
+        v-if="isVisible && mode === 'hero'"
+        class="loading-overlay hero"
+        role="alert"
+        aria-live="polite"
+        aria-busy="true"
+      >
+        <div class="hero-card">
+          <div class="orbit-stage" aria-hidden="true">
+            <div class="stars"></div>
+            <div class="orbit-ring"></div>
+            <div class="orbit-ring ring-2"></div>
+            <div class="earth">
+              <div class="earth-glow"></div>
+              <div class="earth-sphere">
+                <div class="lat lat-a"></div>
+                <div class="lat lat-b"></div>
+                <div class="lat lat-c"></div>
+                <div class="meridian"></div>
+                <div class="land land-a"></div>
+                <div class="land land-b"></div>
+              </div>
+            </div>
+            <div class="sat-orbit">
+              <div class="satellite">
+                <span class="sat-body"></span>
+                <span class="sat-wing left"></span>
+                <span class="sat-wing right"></span>
+                <span class="sat-beam"></span>
+              </div>
+            </div>
+          </div>
+          <div class="loading-message">{{ message || '加载中' }}</div>
+          <div class="loading-progress-bar" aria-hidden="true">
+            <div class="loading-progress-glow"></div>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- 轻量顶栏 -->
+    <Transition name="cgda-fade">
+      <div
+        v-if="isVisible && mode === 'compact'"
+        class="loading-compact"
+        role="status"
+        aria-live="polite"
+        aria-busy="true"
+      >
+        <div class="compact-track" aria-hidden="true">
+          <div class="compact-glow"></div>
+        </div>
+        <span class="compact-msg">{{ message || '加载中' }}</span>
+      </div>
+    </Transition>
+  </Teleport>
+</template>
+
+<style scoped>
+.loading-overlay.hero {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-loading);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-1);
+  backdrop-filter: blur(5px);
+  -webkit-backdrop-filter: blur(5px);
+}
+
+.hero-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1.1rem;
+  padding: 2rem 2.4rem 1.6rem;
+  border-radius: var(--radius-xl);
+  background: linear-gradient(165deg, var(--surface-2), var(--surface-1));
+  border: 1px solid var(--accent-border);
+  box-shadow:
+    0 24px 80px var(--shadow-ambient-strong),
+    0 0 60px var(--accent-surface),
+    inset 0 1px 0 var(--accent-surface);
+  backdrop-filter: blur(24px) saturate(1.1);
+  -webkit-backdrop-filter: blur(24px) saturate(1.1);
+  animation: hero-card-in var(--motion-slow) var(--ease-emphasized) both;
+}
+
+.orbit-stage {
+  position: relative;
+  width: 168px;
+  height: 168px;
+  display: grid;
+  place-items: center;
+}
+
+.stars {
+  position: absolute;
+  inset: 12%;
+  border-radius: 50%;
+  background:
+    radial-gradient(1px 1px at 20% 30%, var(--text-primary), transparent),
+    radial-gradient(1px 1px at 70% 22%, var(--text-secondary), transparent),
+    radial-gradient(1.5px 1.5px at 40% 70%, rgba(180, 230, 255, 0.65), transparent),
+    radial-gradient(1px 1px at 82% 62%, var(--text-secondary), transparent);
+  opacity: 0.7;
+  animation: twinkle 2.8s ease-in-out infinite;
+}
+
+.orbit-ring {
+  position: absolute;
+  width: 132px;
+  height: 132px;
+  border: 1px dashed var(--border-accent);
+  border-radius: 50%;
+  transform: rotateX(58deg) scale(1.05);
+}
+
+.orbit-ring.ring-2 {
+  width: 150px;
+  height: 150px;
+  border-color: var(--warning-border);
+  transform: rotateX(58deg) rotateZ(25deg) scale(1.02);
+}
+
+.earth {
+  position: relative;
+  width: 78px;
+  height: 78px;
+  z-index: 2;
+}
+
+.earth-glow {
+  position: absolute;
+  inset: -10px;
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--border-accent) 0%, transparent 68%);
+  animation: pulse-glow 2.4s ease-in-out infinite;
+}
+
+.earth-sphere {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  overflow: hidden;
+  background: radial-gradient(
+    circle at 32% 28%,
+    var(--accent) 0%,
+    var(--accent-strong) 38%,
+    var(--surface-1) 78%,
+    var(--surface-base) 100%
+  );
+  box-shadow:
+    inset -10px -6px 18px var(--surface-sunken),
+    0 0 18px var(--border-accent);
+  animation: earth-spin 12s linear infinite;
+}
+
+.lat {
+  position: absolute;
+  left: 8%;
+  right: 8%;
+  height: 1px;
+  background: rgba(200, 236, 255, 0.28);
+  border-radius: 1px;
+}
+
+.lat-a {
+  top: 28%;
+}
+.lat-b {
+  top: 50%;
+  background: rgba(200, 236, 255, 0.38);
+}
+.lat-c {
+  top: 72%;
+}
+
+.meridian {
+  position: absolute;
+  top: 6%;
+  bottom: 6%;
+  left: 50%;
+  width: 1px;
+  background: rgba(200, 236, 255, 0.3);
+  transform: translateX(-50%);
+}
+
+.land {
+  position: absolute;
+  background: rgba(120, 210, 150, 0.45);
+  border-radius: 40% 60% 55% 45%;
+  filter: blur(0.2px);
+}
+
+.land-a {
+  width: 28px;
+  height: 18px;
+  top: 30%;
+  left: 22%;
+  transform: rotate(-18deg);
+}
+
+.land-b {
+  width: 18px;
+  height: 22px;
+  top: 48%;
+  left: 52%;
+  transform: rotate(24deg);
+  background: rgba(150, 220, 130, 0.4);
+}
+
+.sat-orbit {
+  position: absolute;
+  inset: 0;
+  animation: sat-orbit 3.6s linear infinite;
+  transform-style: preserve-3d;
+}
+
+.satellite {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  width: 18px;
+  height: 10px;
+  margin-left: -9px;
+  transform: rotateX(58deg);
+}
+
+.sat-body {
+  position: absolute;
+  left: 6px;
+  top: 2px;
+  width: 6px;
+  height: 6px;
+  border-radius: 1px;
+  background: linear-gradient(135deg, var(--warning), var(--accent-warm));
+  box-shadow: 0 0 8px rgba(255, 184, 77, 0.7);
+}
+
+.sat-wing {
+  position: absolute;
+  top: 3px;
+  width: 6px;
+  height: 4px;
+  background: var(--border-strong);
+  box-shadow: 0 0 6px var(--border-strong);
+}
+
+.sat-wing.left {
+  left: 0;
+}
+.sat-wing.right {
+  right: 0;
+}
+
+.sat-beam {
+  position: absolute;
+  left: 8px;
+  top: 8px;
+  width: 2px;
+  height: 14px;
+  background: linear-gradient(180deg, var(--warning-border), transparent);
+  transform-origin: top center;
+  animation: beam-pulse 1.2s ease-in-out infinite;
+}
+
+.loading-message {
+  color: var(--text-primary);
+  font-size: var(--font-size-body);
+  font-weight: var(--font-weight-medium);
+  letter-spacing: 0.04em;
+  text-align: center;
+  min-height: 1.2em;
+}
+
+.loading-message::after {
+  content: '';
+  display: inline-block;
+  width: 1.5em;
+  text-align: left;
+  animation: loading-dots 1.4s steps(4, end) infinite;
+}
+
+.loading-progress-bar {
+  position: relative;
+  width: 148px;
+  height: 2px;
+  background: var(--accent-surface);
+  border-radius: 1px;
+  overflow: hidden;
+}
+
+.loading-progress-glow {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 40%;
+  background: linear-gradient(
+    90deg,
+    var(--accent-surface) 0%,
+    var(--border-strong) 50%,
+    var(--warning-surface) 100%
+  );
+  animation: progress-slide 1.6s ease-in-out infinite;
+}
+
+/* compact：条带贴视口顶端；文案单独下移，避免盖住顶栏 */
+.loading-compact {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: calc(var(--z-loading) - 1);
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.compact-track {
+  height: 3px;
+  background: var(--accent-surface);
+  overflow: hidden;
+}
+
+.compact-glow {
+  height: 100%;
+  width: 32%;
+  background: linear-gradient(90deg, transparent, var(--accent), var(--warning), transparent);
+  animation: progress-slide 1.1s ease-in-out infinite;
+}
+
+.compact-msg {
+  align-self: center;
+  margin-top: calc(96px + var(--space-2));
+  padding: var(--space-1) var(--space-4);
+  border-radius: var(--radius-pill);
+  background: var(--surface-1);
+  border: 1px solid var(--border-accent);
+  color: var(--text-secondary);
+  font-size: var(--font-size-caption);
+  letter-spacing: 0.03em;
+  box-shadow: var(--elevation-2);
+}
+
+.compact-msg::after {
+  content: '';
+  display: inline-block;
+  width: 1.2em;
+  animation: loading-dots 1.4s steps(4, end) infinite;
+}
+
+@keyframes earth-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes sat-orbit {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes pulse-glow {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.06);
+  }
+}
+
+@keyframes beam-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 0.95;
+  }
+}
+
+@keyframes twinkle {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 0.85;
+  }
+}
+
+@keyframes progress-slide {
+  0% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(380%);
+  }
+}
+
+@keyframes loading-dots {
+  0% {
+    content: '';
+  }
+  25% {
+    content: '.';
+  }
+  50% {
+    content: '..';
+  }
+  75% {
+    content: '...';
+  }
+  100% {
+    content: '';
+  }
+}
+
+.cgda-fade-enter-active,
+.cgda-fade-leave-active {
+  transition: opacity var(--motion-modal, var(--motion-base)) var(--ease-standard);
+}
+
+.cgda-fade-enter-from,
+.cgda-fade-leave-to {
+  opacity: 0;
+}
+
+@keyframes hero-card-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* 系统 / 设置「减少动效」：放慢加载反馈，但不要完全静止（否则像卡死） */
+@media (prefers-reduced-motion: reduce) {
+  .stars {
+    animation-duration: 6s;
+  }
+  .earth-sphere {
+    animation-duration: 24s;
+  }
+  .sat-orbit {
+    animation-duration: 8s;
+  }
+  .earth-glow,
+  .sat-beam {
+    animation-duration: 3s;
+  }
+  .loading-progress-glow,
+  .compact-glow {
+    animation-duration: 2.4s;
+  }
+  .hero-card {
+    animation: none;
+  }
+}
+
+html.reduce-motion .stars {
+  animation-duration: 6s;
+}
+html.reduce-motion .earth-sphere {
+  animation-duration: 24s;
+}
+html.reduce-motion .sat-orbit {
+  animation-duration: 8s;
+}
+html.reduce-motion .earth-glow,
+html.reduce-motion .sat-beam {
+  animation-duration: 3s;
+}
+html.reduce-motion .loading-progress-glow,
+html.reduce-motion .compact-glow {
+  animation-duration: 2.4s;
+}
+html.reduce-motion .hero-card {
+  animation: none;
+}
+</style>

@@ -1,0 +1,460 @@
+"""nas_ondemand 配置与红线常量。
+
+本模块**不含任何副作用**（不连网、不建目录），只声明常量，方便被 CLI、
+路由、测试同时引用。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Any
+
+# ── 仓库根定位 ────────────────────────────────────────────────────────────────
+# 本文件: <repo>/Code/backend/app/services/nas_ondemand/config.py
+# parents: 0=nas_ondemand 1=services 2=app 3=backend 4=Code 5=<repo>
+_REPO_ROOT = Path(__file__).resolve().parents[5]
+_CRED_PATH = _REPO_ROOT / "Tools" / "_nas_credentials.json"
+
+# ── NAS 接入（凭据从项目内文件读，不在代码里硬编码）──────────────────────────
+_NAS_KEY = "filebrowser.nasfile"
+
+
+class NasConfigurationError(RuntimeError):
+    """The read-only NAS connection is unavailable or incomplete."""
+
+
+def _load_nas_config() -> tuple[str, str, str]:
+    """返回 (base_url, username, password)。
+
+    优先级：环境变量 > Tools/_nas_credentials.json。
+    环境变量便于容器化部署时不挂凭据文件。
+    """
+    base = os.environ.get("NAS_FILEBROWSER_BASE_URL", "").strip()
+    user = os.environ.get("NAS_FILEBROWSER_USERNAME", "").strip()
+    pwd = os.environ.get("NAS_FILEBROWSER_PASSWORD", "").strip()
+    if base and user and pwd:
+        return base.rstrip("/"), user, pwd
+    # An explicit runtime path keeps container credentials out of source/images.
+    credential_path = Path(os.environ.get("NAS_FILEBROWSER_CREDENTIALS_PATH") or _CRED_PATH)
+    try:
+        cfg = json.loads(credential_path.read_text(encoding="utf-8"))["filebrowser"]["nasfile"]
+        values = tuple(str(cfg[key]).strip() for key in ("base_url", "username", "password"))
+        if not all(values):
+            raise ValueError("incomplete NAS configuration")
+        return values[0].rstrip("/"), values[1], values[2]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise NasConfigurationError("NAS 取数连接尚未配置完整，请联系管理员检查数据源连接。") from exc
+
+
+# ── 本地共享盘直读（2026-11-10）───────────────────────────────────────────────
+# 背景：FileBrowser 走的是 Cloudflare 隧道（nasfile.personaltunnel.dpdns.org）。
+# 隧道一断，按需补帧就整片失败（表现为「取数服务暂时不可用」），但数据本体在
+# 局域网共享盘上一直好好的。
+#
+# 因此增加「本地直读」通道：直接读 UNC 路径，与 HTTP 通道**共用同一套白名单
+# 校验**（assert_nas_path_readable / assert_mat_filename 一行不少，先校验后读盘），
+# 只是把「发 HTTPS 请求」换成「开本地文件」。
+#
+#   访问模式（CGDA_FY_NAS_ACCESS_MODE）：
+#     auto  —— 默认。本地根可达就走本地，不可达回落到 FileBrowser 隧道。
+#     local —— 只走本地；根不可达直接报错，不悄悄回落（排障用）。
+#     http  —— 只走 FileBrowser（保持旧行为）。
+#
+#   CGDA_FY_NAS_LOCAL_ROOT：与 FileBrowser 的 base_url 等价的本地根目录，
+#   即远程路径 ``/Liuzheng/omega_final/fy_avg_smvod/`` 对应
+#   ``<ROOT>\Liuzheng\omega_final\fy_avg_smvod\``。
+LOCAL_ROOT_ENV = "CGDA_FY_NAS_LOCAL_ROOT"
+ACCESS_MODE_ENV = "CGDA_FY_NAS_ACCESS_MODE"
+
+NAS_ACCESS_AUTO = "auto"
+NAS_ACCESS_LOCAL = "local"
+NAS_ACCESS_HTTP = "http"
+_NAS_ACCESS_MODES = (NAS_ACCESS_AUTO, NAS_ACCESS_LOCAL, NAS_ACCESS_HTTP)
+
+
+def local_nas_root() -> str:
+    """本地共享盘根目录（未配置返回空串）。去掉尾部斜杠，便于安全拼接。"""
+    return os.environ.get(LOCAL_ROOT_ENV, "").strip().rstrip("\\/")
+
+
+def nas_access_mode() -> str:
+    """当前访问模式；非法值按 auto 处理（配置写错不至于把功能打死）。"""
+    raw = (os.environ.get(ACCESS_MODE_ENV, "") or "").strip().lower()
+    return raw if raw in _NAS_ACCESS_MODES else NAS_ACCESS_AUTO
+
+
+# 本地根可达性缓存秒数：共享盘偶发掉线不该让每一帧都卡在网络判定上，
+# 也不该把「刚恢复」的状态缓存太久。
+LOCAL_ROOT_PROBE_TTL = 30.0
+
+
+# ── 红线 1：NAS 上唯一允许触碰的 8 个目录 ────────────────────────────────────
+# 校验方式是 str.startswith()，所以每一项都必须以 "/" 结尾，避免
+# "fy_avg_smvod_xxx" 这类同前缀目录被误判为命中。
+_NAS_DATA_ROOT = "/Liuzheng/omega_final"
+
+#
+# ⚠ OMEGA 组的目录名存在两种写法：勘察记录里 fy_avg_ω / smap_avg_ω / fy_raw_ω
+#   用的是希腊小写 ω（U+03C9），而 smap_raw_omega 用的是拉丁字母。为避免靠记忆
+#   硬编码导致 404，ω 与 omega 两种拼法都列入白名单，运行期按顺序试第一个
+#   能列出内容的（见 fetcher.resolve_nas_dir）。两者都在同一个父目录下，
+#   不扩大读取范围。
+ALLOWED_NAS_PREFIXES: tuple[str, ...] = (
+    f"{_NAS_DATA_ROOT}/fy_avg_smvod/",
+    f"{_NAS_DATA_ROOT}/fy_raw_smvod/",
+    f"{_NAS_DATA_ROOT}/smap_avg_smvod/",
+    f"{_NAS_DATA_ROOT}/smap_raw_smvod/",
+    f"{_NAS_DATA_ROOT}/fy_avg_omega/",
+    f"{_NAS_DATA_ROOT}/fy_raw_omega/",
+    f"{_NAS_DATA_ROOT}/smap_avg_omega/",
+    f"{_NAS_DATA_ROOT}/smap_raw_omega/",
+    f"{_NAS_DATA_ROOT}/fy_avg_\u03c9/",
+    f"{_NAS_DATA_ROOT}/fy_raw_\u03c9/",
+    f"{_NAS_DATA_ROOT}/smap_avg_\u03c9/",
+    f"{_NAS_DATA_ROOT}/smap_raw_\u03c9/",
+)
+
+# ── 红线 2：只认这两种文件名形态 ──────────────────────────────────────────────
+# 文件名必须是 8 位数字 + .mat；后缀白名单写死，其它后缀一律不下载。
+MAT_SUFFIX = ".mat"
+MAT_NAME_LEN = len("YYYYMMDD") + len(MAT_SUFFIX)
+
+# ── 产品表：4 个 NAS 目录 = 卫星 × 约束口径 ───────────────────────────────────
+# constraint 用来在图层名/图例里区分「平均散射约束」与「动态散射约束」。
+PRODUCTS: dict[str, dict[str, str]] = {
+    "fy_avg": {
+        "nas_dir": f"{_NAS_DATA_ROOT}/fy_avg_smvod/",
+        "source": "FY",
+        "source_label": "风云卫星",
+        "constraint": "平均散射约束",
+    },
+    "fy_raw": {
+        "nas_dir": f"{_NAS_DATA_ROOT}/fy_raw_smvod/",
+        "source": "FY",
+        "source_label": "风云卫星",
+        "constraint": "动态散射约束",
+    },
+    "smap_avg": {
+        "nas_dir": f"{_NAS_DATA_ROOT}/smap_avg_smvod/",
+        "source": "SMAP",
+        "source_label": "SMAP",
+        "constraint": "平均散射约束",
+    },
+    "smap_raw": {
+        "nas_dir": f"{_NAS_DATA_ROOT}/smap_raw_smvod/",
+        "source": "SMAP",
+        "source_label": "SMAP",
+        "constraint": "动态散射约束",
+    },
+}
+
+# ω 单独一组目录（smvod 目录里的 OMEGA 与 omega 目录可能是同一批，这里按目录分派）。
+# 变量 → 用哪个目录：smvod 目录取 SM/VOD，omega 目录取 OMEGA。
+# 值为 str 表示唯一候选；值为 tuple 表示多个候选（运行期按序探测）。
+PRODUCT_NAS_DIR_BY_VAR: dict[str, dict[str, str | tuple[str, ...]]] = {
+    "SM": {
+        "fy_avg": f"{_NAS_DATA_ROOT}/fy_avg_smvod/",
+        "fy_raw": f"{_NAS_DATA_ROOT}/fy_raw_smvod/",
+        "smap_avg": f"{_NAS_DATA_ROOT}/smap_avg_smvod/",
+        "smap_raw": f"{_NAS_DATA_ROOT}/smap_raw_smvod/",
+    },
+    "VOD": {
+        "fy_avg": f"{_NAS_DATA_ROOT}/fy_avg_smvod/",
+        "fy_raw": f"{_NAS_DATA_ROOT}/fy_raw_smvod/",
+        "smap_avg": f"{_NAS_DATA_ROOT}/smap_avg_smvod/",
+        "smap_raw": f"{_NAS_DATA_ROOT}/smap_raw_smvod/",
+    },
+    "OMEGA": {
+        # 按顺序试：拉丁写法优先（smap_raw_omega 已确认为拉丁），希腊 ω 作兜底。
+        # 具体用哪个由 fetcher.resolve_nas_dir 在运行期确定并缓存。
+        "fy_avg": (
+            f"{_NAS_DATA_ROOT}/fy_avg_omega/",
+            f"{_NAS_DATA_ROOT}/fy_avg_\u03c9/",
+        ),
+        "fy_raw": (
+            f"{_NAS_DATA_ROOT}/fy_raw_omega/",
+            f"{_NAS_DATA_ROOT}/fy_raw_\u03c9/",
+        ),
+        "smap_avg": (
+            f"{_NAS_DATA_ROOT}/smap_avg_omega/",
+            f"{_NAS_DATA_ROOT}/smap_avg_\u03c9/",
+        ),
+        "smap_raw": (
+            f"{_NAS_DATA_ROOT}/smap_raw_omega/",
+            f"{_NAS_DATA_ROOT}/smap_raw_\u03c9/",
+        ),
+    },
+}
+
+# ── 变量表：配色与量程口径 ────────────────────────────────────────────────────
+# ⚠ 口径来源：app/services/python_provider_result_builder.py 的 VARIABLE 预设，
+#   与现有导入产物 meta.json 完全一致（SM sm-paper 0–0.6 / VOD vod-yellow-green
+#   0–1.5 / OMEGA reds 0–0.5）。**不是本模块新定的，不许擅自改**：
+#   VOD 的 vmax=1.5 是用户 2026-10-20 明确否决过 0.75 之后确定的现状。
+#   2026-11-04（用户）：SM 全校统一为 sm-paper / 0–0.6，本表同步，
+#   否则新建 NAS 层会退回 ylgnbu/0–0.5，与其它 8 个 SM 产物不一致。
+VARIABLES: dict[str, dict[str, object]] = {
+    "SM": {
+        "variable_id": "SM",
+        "label": "SM",
+        "title": "土壤水分",
+        "palette": "sm-paper",
+        "vmin": 0.0,
+        "vmax": 0.6,
+        "unit": "m³/m³",
+    },
+    "VOD": {
+        "variable_id": "VOD",
+        "label": "VOD",
+        "title": "植被光学厚度",
+        "palette": "vod-yellow-green",
+        "vmin": 0.0,
+        "vmax": 1.5,
+        "unit": "1",
+    },
+    "OMEGA": {
+        "variable_id": "OMEGA",
+        "label": "OMEGA",
+        "title": "散射反照率",
+        "palette": "reds",
+        "vmin": 0.0,
+        "vmax": 0.5,
+        "unit": "1",
+    },
+}
+
+# 同一逻辑变量在 NAS .mat 里的多种写法（按顺序取第一个存在的）。
+# 实测：smvod→SM/VOD/OMEGA；*_avg_ω→OMEGA_AVG；*_raw_ω→OMEGA_grid
+VARIABLE_ALIASES: dict[str, tuple[str, ...]] = {
+    "SM": ("SM",),
+    "VOD": ("VOD",),
+    "OMEGA": ("OMEGA", "OMEGA_AVG", "OMEGA_grid", "OMEGA_daily"),
+}
+
+# ── 缓存策略（用户 2026-10-27 定稿）────────────────────────────────────────────
+# 2000 帧上限；每图层保底 30 帧；超限删到 1800 停（留 10% 缓冲，避免每存
+# 一帧就删一帧的抖动）。
+CACHE_MAX_FRAMES = 2000
+CACHE_TARGET_FRAMES = 1800
+PER_LAYER_FLOOR = 30
+# 最近 N 天打开过的帧不参与淘汰
+PROTECT_RECENT_DAYS = 7
+
+# 本地落盘根：imports 下只认这个前缀
+LOCAL_LAYER_PREFIX = "imported-nas-"
+
+# 单帧目标分辨率（度，赤道处）。与 Tools/export_overlay_assets.py 里
+# _export_smap_soil_vod_sm_ts 的调用一致（0.1°），保证与已有产物同规格。
+TARGET_RESOLUTION_DEG = 0.1
+
+# 与已有产物一致的裁剪窗口（中国区域）
+CLIP_BOUNDS = (73.0, 15.0, 137.0, 59.0)
+
+# 补帧进「既有图层」时的画幅口径（2026-10-27 实测修正）
+# ────────────────────────────────────────────────────────────────────────────
+# 工作流产出的风云平均图层，画幅是**全球**的 2048×2047 墨卡托方图
+# （bounds ≈ [-180, -85.04, 180, 85.04]）。补进去的单日帧必须同画幅，
+# 否则拖动时间轴会从「全球」突变成「中国区特写」，看着像换了图层。
+# 分辨率取 360/2048 度 ≈ 0.1758°，与 2048 宽一一对应；
+# 若按 0.1° 渲染全球，会得到 3600×3600、单帧 PNG 5~10 MB，没必要。
+GLOBAL_FRAME_RESOLUTION_DEG = 360.0 / 2048.0
+
+# 单次下载超时（秒）。NAS 隧道较慢，2.04 MB/s 实测，4.3 MB 文件留足余量。
+DOWNLOAD_TIMEOUT = 180
+LIST_TIMEOUT = 60
+
+# 下载遇到网络抖动（连接被重置 / IncompleteRead）时的总尝试次数。
+DOWNLOAD_RETRIES = 3
+
+
+def layer_id_for(product: str, variable: str) -> str:
+    """产品 × 变量 → 本地图层 ID（如 ``imported-nas-fy-avg-sm``）。"""
+    return f"{LOCAL_LAYER_PREFIX}{product.replace('_', '-')}-{variable.lower()}"
+
+
+def ondemand_target(layer_id: str) -> dict[str, str] | None:
+    """图层 ID → 该层的 NAS 取数口径（未登记返回 None）。"""
+    return ONDEMAND_TARGETS.get(str(layer_id or "").strip())
+
+
+# ── 按需补帧目标图层（2026-10-27）────────────────────────────────────────────
+# 用户要求「勾选/添加图层保持长序列，只有手动拖时间轴才看单日」，所以单日帧
+# **不新建图层**，而是补进工作流已经产出的那个图层目录里。
+#
+# 目录名 = ``imported-<sha1(catalogId|role|role)[:12]>``，同一工作流重跑会覆盖
+# 同一个目录（编号稳定，不随重跑变化），因此这里可以把映射写死。
+#
+# 前端只报 layer_id，产品/变量由后端查表 —— 避免前端硬编码 NAS 目录语义。
+#
+# ⚠ 只登记「NAS 上确实有逐日文件」的图层：
+#   · 风云·平均散射约束 SM / VOD → fy_avg_smvod/YYYYMMDD.mat（真·逐日）
+#   · SMAP·平均散射约束 SM / VOD → smap_avg_smvod/YYYYMMDD.mat（真·逐日，
+#     实测 3844 个文件覆盖 20150401~20251231，与风云同规格）
+#   · 风云·平均散射约束 OMEGA    → fy_avg_ω/doy_DDD.mat（年内日序气候态，
+#     与「2025-12-17 这一天」语义不等价，待用户确认口径后再接）
+#
+# layer_id 的来源（两处都对得上，改前已核）：
+#   目录名 = imported-<sha1(...)>,  取该层 meta.json 的 time_list 与侧栏显示日期比对：
+#   风云组三层 = 20251201_20251231（SM/VOD/OMEGA 各一）；
+#   SMAP组三层 = 20251201_20260201（SM/VOD/OMEGA 各一），全库唯一，排他确定。
+ONDEMAND_TARGETS: dict[str, dict[str, str]] = {
+    # 风云卫星 · 平均散射约束
+    "imported-55359b8ecd3d": {"product": "fy_avg", "variable": "SM"},
+    "imported-a94205dad5f9": {"product": "fy_avg", "variable": "VOD"},
+    # SMAP · 平均散射约束（2026-10-27 追加）
+    # ⚠ 2026-10-28 更正：下面两条是**遗留 id**——反算 sha1 不属于任何 catalog 层，
+    #   侧栏根本加载不到（目录里只有一个 63 天季均块）。保留仅为了兼容浏览器里
+    #   已经存了这两个 id 的旧会话，**不要把它们当成正确映射**。
+    #   正确映射见紧随其后的两条。
+    "imported-38993117b963": {"product": "smap_avg", "variable": "SM"},
+    "imported-bce85323670f": {"product": "smap_avg", "variable": "VOD"},
+    # SMAP · 平均散射约束 —— 正确目录（= sha1("method-smap-omega-doy-avg|VAR|VAR")）
+    # 侧栏「SMAP 平均散射约束产品」加载的就是这两个，原来不在名单里 ⇒ 点它拖时间轴
+    # 会 400「未登记为按需补帧目标」。
+    "imported-136c60293bbf": {"product": "smap_avg", "variable": "SM"},
+    "imported-169f6402583c": {"product": "smap_avg", "variable": "VOD"},
+    # 动态散射约束（2026-10-27 追加）
+    # NAS 实测：fy_raw_smvod / smap_raw_smvod 各 4018 个严格逐日 .mat
+    # （20150101~20251231），与平均组同规格，故 SM / VOD 可直接按天取。
+    # 目录映射来源：meta.run_id → workflow_runs.layer_id
+    #   风云动态 = method-fy-omega-doy-dynamic，SMAP 动态 = method-smap-omega-doy-dynamic。
+    # ⚠ 动态组的 OMEGA 源是 8 天块（*_raw_ω 里 YYYYMMDD_YYYYMMDD_exp0_…mat），
+    #   块内所有天共用同一个 ω，与「取某一天」语义不完全等价，暂未登记。
+    "imported-fa303afda71e": {"product": "fy_raw", "variable": "SM"},
+    "imported-731b37b59c97": {"product": "fy_raw", "variable": "VOD"},
+    "imported-a8940443fd6d": {"product": "smap_raw", "variable": "SM"},
+    "imported-5427e1020d63": {"product": "smap_raw", "variable": "VOD"},
+    # ── OMEGA（散射反照率）四层，2026-11-05 追加 ────────────────────────────
+    # 之前只登记了 SM / VOD，于是同一层组的 ω「拖日期完全没反应」——
+    # 其它变量都能取单日，唯独 ω 不行，用户看不出这是没登记还是没数据。
+    #
+    # ⚠ ω 与 SM/VOD **不是同一时间口径**，NAS 上的文件命名就不同：
+    #   · 平均组：``doy_DDD.mat``  ⇒ 该「年内日序」的多年气候态（366 个文件）
+    #   · 动态组：``YYYYMMDD_YYYYMMDD_exp0_….mat`` ⇒ 8 天块，块内各天共用一值
+    # 所以「按天取」在 ω 上是**取到与该日对应的一格**，而不是当天独立观测。
+    # 这一点由 ``temporal_basis_note()`` 如实回给前端，回执必须照说，不能
+    # 让人以为拿到了 2025-11-13 当天的反照率。
+    "imported-72aa577da95e": {"product": "fy_avg", "variable": "OMEGA"},
+    "imported-9a7cf36832cd": {"product": "smap_avg", "variable": "OMEGA"},
+    "imported-c6c55b8a9f4e": {"product": "fy_raw", "variable": "OMEGA"},
+    "imported-94501b455dcd": {"product": "smap_raw", "variable": "OMEGA"},
+}
+
+# NAS 成果的实际覆盖范围（前端据此提前拦掉明显不可能的日期，省一次往返）
+DATA_COVERAGE_START = "20150401"
+DATA_COVERAGE_END = "20251231"
+
+
+# ── NAS 文件名规则（2026-10-27 实地核对 /Liuzheng/omega_final）───────────────
+# 三套完全不同的命名，不能统一按 YYYYMMDD.mat 取：
+#   · smvod 目录（SM / VOD）    ：YYYYMMDD.mat                     —— 逐日
+#   · *_avg_ω 目录（OMEGA）     ：doy_DDD.mat                      —— 年内日序的气候态
+#   · *_raw_ω 目录（OMEGA）     ：YYYYMMDD_YYYYMMDD_exp0_...mat    —— 8 天块
+# 例：fy_raw_ω 里首尾是 20150330_20150406 / 20251227_20251231，
+#     即按「年内第 DOY 天」每 8 天切一段，块起点 = 1/1 + 8*((doy-1)//8)，
+#     与算法 algorithms/omega.py::make_date_blocks 完全一致，年末尾块截断。
+RAW_BLOCK_DAYS = 8
+RAW_OMEGA_FILENAME_SUFFIX = "_exp0_global_ismn_all_shard01of01_roundrobin.mat"
+
+
+def _parse_tag(date_tag: str) -> Any:
+    import datetime as _dt
+
+    tag = str(date_tag).strip()
+    return _dt.date(int(tag[0:4]), int(tag[4:6]), int(tag[6:8]))
+
+
+def raw_block_span(date_tag: str) -> tuple[Any, Any]:
+    """请求日期 → 它所属的 8 天块 (起, 止)，两者都含端点。"""
+    import calendar
+    import datetime as _dt
+
+    d = _parse_tag(date_tag)
+    year_start = _dt.date(d.year, 1, 1)
+    doy = (d - year_start).days + 1
+    start_doy = 1 + RAW_BLOCK_DAYS * ((doy - 1) // RAW_BLOCK_DAYS)
+    year_days = 366 if calendar.isleap(d.year) else 365
+    end_doy = min(start_doy + RAW_BLOCK_DAYS - 1, year_days)
+    return (
+        year_start + _dt.timedelta(days=start_doy - 1),
+        year_start + _dt.timedelta(days=end_doy - 1),
+    )
+
+
+def nas_filename_for(product: str, variable: str, date_tag: str) -> str:
+    """产品 × 变量 × 日期 → NAS 上真实存在的那个文件名。"""
+    var = variable.upper()
+    if var == "OMEGA":
+        if product.endswith("_avg"):
+            doy = _parse_tag(date_tag).timetuple().tm_yday
+            return f"doy_{doy:03d}{MAT_SUFFIX}"
+        start, end = raw_block_span(date_tag)
+        return (
+            f"{start.strftime('%Y%m%d')}_{end.strftime('%Y%m%d')}"
+            f"{RAW_OMEGA_FILENAME_SUFFIX}"
+        )
+    return f"{date_tag}{MAT_SUFFIX}"
+
+
+def nas_dir_candidates(product: str, variable: str) -> tuple[str, ...]:
+    """产品 × 变量 → NAS 目录候选列表（带尾斜杠，按优先级排序）。
+
+    OMEGA 组返回 2 个候选（拉丁 omega / 希腊 ω），SM 与 VOD 返回 1 个。
+    真正的目录由 ``fetcher.resolve_nas_dir`` 探测确定并缓存。
+    """
+    try:
+        raw = PRODUCT_NAS_DIR_BY_VAR[variable.upper()][product]
+    except KeyError as exc:
+        raise ValueError(f"未知的产品/变量组合：{product}/{variable}") from exc
+    if isinstance(raw, tuple):
+        return raw
+    return (raw,)
+
+
+# ── 时间口径（2026-11-05）────────────────────────────────────────────────────
+# 「按天取一帧」在不同变量上代表的东西不一样，回执必须说清，否则就是口径欺骗：
+
+TEMPORAL_BASIS_DAILY = "daily"
+TEMPORAL_BASIS_DOY_CLIM = "doy_climatology"
+TEMPORAL_BASIS_BLOCK = "block_8day"
+
+TEMPORAL_BASIS_LABEL: dict[str, str] = {
+    TEMPORAL_BASIS_DAILY: "逐日观测",
+    TEMPORAL_BASIS_DOY_CLIM: "年内日序气候态",
+    TEMPORAL_BASIS_BLOCK: "8 天块共用值",
+}
+
+
+def temporal_basis(product: str, variable: str) -> str:
+    """这一格数据真实的时间口径：逐日 / 日序气候态 / 8 天块。"""
+    if variable.upper() != "OMEGA":
+        return TEMPORAL_BASIS_DAILY
+    return (
+        TEMPORAL_BASIS_DOY_CLIM
+        if str(product).endswith("_avg")
+        else TEMPORAL_BASIS_BLOCK
+    )
+
+
+def temporal_basis_note(product: str, variable: str, date_tag: str) -> str | None:
+    """给前端的一句话解释；逐日观测返回 ``None``（不需要额外说明）。"""
+    basis = temporal_basis(product, variable)
+    if basis == TEMPORAL_BASIS_DAILY:
+        return None
+    if basis == TEMPORAL_BASIS_DOY_CLIM:
+        try:
+            doy = _parse_tag(date_tag).timetuple().tm_yday
+        except Exception:
+            return "该变量是年内日序（doy）的多年气候态，不是当天观测"
+        return (
+            f"该变量的这一帧是「年内第 {doy} 天」的多年气候态，"
+            f"不是 {date_tag} 当天的观测值"
+        )
+    try:
+        start, end = raw_block_span(date_tag)
+        span = f"{start:%Y-%m-%d} 至 {end:%Y-%m-%d}"
+    except Exception:
+        span = "所属的 8 天块"
+    return f"该变量的这一帧是 {span} 这个 8 天块内共用的一个值，不是当天独立观测"

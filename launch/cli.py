@@ -1,0 +1,394 @@
+"""argparse 配置与 ``main`` 入口 for the CGDA launcher.
+
+Extracted from the original ``launch.py``. Builds the sub-command parser
+tree (start / stop / status / restart / logs / flush / reset-db / sync),
+dispatches to the ``cmd_*`` functions in :mod:`launch.commands`, and
+owns the top-level ``KeyboardInterrupt`` / ``finally`` cleanup.
+
+Keeping the parser here (rather than in ``commands.py``) separates
+"what the CLI surface looks like" from "what each command does", so
+adding a new flag does not require touching command implementations
+and vice versa.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+
+from launch.commands import (
+    cmd_clean_cache,
+    cmd_deploy,
+    cmd_flush,
+    cmd_logs,
+    cmd_reload,
+    cmd_reset_db,
+    cmd_restart,
+    cmd_start,
+    cmd_status,
+    cmd_stop,
+    cmd_sync,
+)
+from launch.constants import (
+    DEFAULT_FRONTEND_PORT,
+    DEFAULT_MAX_SNAPSHOTS,
+    DEFAULT_MODE,
+    VALID_MODES,
+)
+from launch.logging_setup import log
+
+# ─── 子命令帮助文本（集中声明，便于审阅 CLI 表面） ──────────────────────────
+_COMPONENT_HELP = (
+    "组件: all/docker/fastapi/beat/worker/worker:<name>/frontend/gateway/backend"
+    "（默认 all；backend=仅 FastAPI+Worker+Beat）"
+)
+_LOGS_COMPONENT_HELP = (
+    "组件: fastapi/beat/frontend/worker/worker:<name>（默认合并全部）"
+)
+_STOP_COMPONENT_HELP = "可选: gateway（仅停 Nginx 网关；默认停止全部）"
+_MODE_HELP = (
+    f"启动形态: bare（裸机，默认）/ dev（= --vite，网关 HMR + 本机 Vite）/ "
+    f"prod（交付态，全量容器化）。可选: {'/'.join(VALID_MODES)}"
+)
+_DEPLOY_ACTIONS = ("up", "down", "restart", "build", "ps", "logs", "config")
+
+
+def _add_start_restart_args(p: argparse.ArgumentParser) -> None:
+    """为 start / restart 子命令添加共享参数。"""
+    p.add_argument("component", nargs="?", default="all", help=_COMPONENT_HELP)
+    p.add_argument(
+        "--mode",
+        choices=list(VALID_MODES),
+        default=DEFAULT_MODE,
+        help=_MODE_HELP,
+    )
+    p.add_argument(
+        "--tag",
+        default=None,
+        help="交付态镜像 tag（--mode prod / deploy；默认取 .env 的 CGDA_TAG）",
+    )
+    p.add_argument(
+        "--data-root",
+        default=None,
+        help="交付态宿主数据根（--mode prod / deploy；默认取 .env 的 CGDA_DATA_ROOT）",
+    )
+    p.add_argument(
+        "--no-build",
+        action="store_true",
+        help="交付态跳过镜像构建，直接用已有 tag 镜像（离线/预构建场景）",
+    )
+    p.add_argument(
+        "--no-frontend",
+        action="store_true",
+        help="不启动前端入口（Nginx Gateway / Vite 都不启）",
+    )
+    p.add_argument(
+        "--vite",
+        action="store_true",
+        help="Gateway 同域入口 + 背后 Vite HMR（对外仍 :5175；Vite 本机 :5174）",
+    )
+    p.add_argument("--no-docker", action="store_true", help="不启动 Docker 容器")
+    p.add_argument(
+        "--no-open-meteo",
+        action="store_true",
+        help=(
+            "不启动 cgda-open-meteo API（仍启动 Redis/MinIO；"
+            "同步见 Code/infra/data-sync）"
+        ),
+    )
+    p.add_argument(
+        "--frontend-only",
+        action="store_true",
+        help="仅启动前端（等同 start frontend；Vite 开发服务器）",
+    )
+    p.add_argument(
+        "--debug",
+        action="store_true",
+        help="调试模式：不隐藏窗口，Celery 日志级别 DEBUG",
+    )
+    p.add_argument(
+        "--frontend-port",
+        type=int,
+        default=DEFAULT_FRONTEND_PORT,
+        help=f"前端端口（默认 {DEFAULT_FRONTEND_PORT}）",
+    )
+    p.add_argument(
+        "--rebuild-frontend",
+        action="store_true",
+        help="启动 Gateway 前强制 npm run build 刷新 dist（默认有 dist 则复用）",
+    )
+    p.add_argument(
+        "--clean-cache",
+        action="store_true",
+        help="强制启动/重启前清理全部本地编译缓存（pycache+Vite；非 flush）",
+    )
+    p.add_argument(
+        "--no-clean-cache",
+        action="store_true",
+        help="跳过默认的本地编译缓存清理（start/restart 按组件矩阵自动 clean）",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """构造 CGDA 启动器的 argparse 解析器。"""
+    parser = argparse.ArgumentParser(
+        prog="launch.py",
+        description="CGDA 跨平台一键启动器（Windows / Linux）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "示例:\n"
+            "  python launch.py start                      # 启动全部（含 Nginx Gateway :5175）\n"
+            "  python launch.py start --vite               # Gateway 同域 + Vite HMR（入口仍 :5175）\n"
+            "  python launch.py start docker               # 仅 Redis + MinIO + Open-Meteo API\n"
+            "  python launch.py sync                       # 跑 data-sync open-meteo-sync\n"
+            "  python launch.py start gateway              # 仅 Nginx 同域入口 :5175（静态 dist）\n"
+            "  python launch.py start gateway --vite       # Gateway HMR 剖面 + 本机 Vite :5174\n"
+            "  python launch.py start gateway --rebuild-frontend\n"
+            "  python launch.py reload gateway             # Nginx 配置热重载（nginx -s reload）\n"
+            "  python launch.py stop gateway               # 仅停 Nginx Gateway\n"
+            "  python launch.py start worker:weather       # 仅启动 weather Worker\n"
+            "  python launch.py start fastapi --debug      # 调试模式启动 FastAPI\n"
+            "  python launch.py start frontend             # 仅 Vite 直连（默认 :5175，停 Gateway）\n"
+            "  python launch.py start --frontend-port 3000 # 仅 start frontend 时生效\n"
+            "  python launch.py restart                    # 全量重启（默认按矩阵 clean-cache）\n"
+            "  python launch.py restart backend            # 重启 backend（默认清 pycache）\n"
+            "  python launch.py start --no-clean-cache     # 跳过默认本地编译缓存清理\n"
+            "  python launch.py start --clean-cache        # 强制 pycache+Vite 全清后再启\n"
+            "  python launch.py logs fastapi -n 100        # 查看 FastAPI 最后 100 行日志\n"
+            "  python launch.py logs worker:all            # 查看所有 Worker 日志\n"
+            "  python launch.py flush                      # 清空 Redis + 文件缓存（需确认；永不自动）\n"
+            "  python launch.py flush --dry-run            # 预览将要清空的对象，不执行\n"
+            "  python launch.py flush --yes                # 跳过确认直接执行\n"
+            "  python launch.py clean-cache                # 手动清 __pycache__ + Vite .vite（不碰 Redis）\n"
+            "  python launch.py reset-db                   # 清空 workflow_state，自动快照 + 重 seed\n"
+            "  python launch.py reset-db --yes             # 跳过确认直接执行\n"
+            "  python launch.py reset-db --clear-user      # 同时清空用户自定义工作流\n"
+            "  python launch.py stop                       # 停止全部服务\n"
+            "  python launch.py status                     # 查看服务状态\n"
+            "  python launch.py start --mode dev           # 开发态（= start --vite）\n"
+            "  python launch.py start --mode prod          # 交付态（构建镜像 + 起容器栈）\n"
+            "  python launch.py deploy config              # 交付态 compose 配置干跑校验\n"
+            "  python launch.py deploy build               # 仅构建 cgda-backend / cgda-web 镜像\n"
+            "  python launch.py deploy up --no-build       # 用已有 tag 镜像起栈（离线交付）\n"
+            "  python launch.py deploy ps                  # 交付态容器状态\n"
+            "  python launch.py deploy logs backend        # 交付态日志跟随\n"
+            "  python launch.py deploy down                # 停交付态容器（保留卷）\n"
+            "\n"
+            "Windows: start.bat / stop.bat    Linux/macOS: ./start.sh / ./stop.sh"
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # start
+    p_start = sub.add_parser("start", help="启动服务")
+    _add_start_restart_args(p_start)
+
+    # stop
+    p_stop = sub.add_parser("stop", help="停止全部服务（或指定 gateway）")
+    p_stop.add_argument(
+        "component",
+        nargs="?",
+        default=None,
+        help=_STOP_COMPONENT_HELP,
+    )
+
+    # status
+    sub.add_parser("status", help="查看服务状态")
+
+    # reload（配置热重载；当前仅 gateway）
+    p_reload = sub.add_parser(
+        "reload",
+        help="热重载组件配置（gateway → nginx -s reload，不重建容器）",
+    )
+    p_reload.add_argument(
+        "component",
+        nargs="?",
+        default="gateway",
+        help="组件: gateway（默认）",
+    )
+
+    # restart
+    p_restart = sub.add_parser("restart", help="重启服务")
+    _add_start_restart_args(p_restart)
+
+    # logs
+    p_logs = sub.add_parser("logs", help="查看日志")
+    p_logs.add_argument("component", nargs="?", default=None, help=_LOGS_COMPONENT_HELP)
+    p_logs.add_argument("-n", type=int, default=50, help="显示行数（默认 50）")
+
+    # flush
+    p_flush = sub.add_parser("flush", help="清空 Redis DB + 应用天气文件缓存")
+    p_flush.add_argument(
+        "--yes", "-y", action="store_true", help="跳过确认提示直接执行"
+    )
+    p_flush.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="仅预览将要清空的对象，不执行任何删除",
+    )
+
+    # clean-cache（本地编译缓存；与 flush 隔离）
+    p_clean = sub.add_parser(
+        "clean-cache",
+        help="清理 __pycache__ / *.pyc 与 Vite node_modules/.vite（不碰 Redis）",
+    )
+    p_clean.add_argument(
+        "--all",
+        action="store_true",
+        help="清理 pycache + Vite（默认行为）",
+    )
+    p_clean.add_argument(
+        "--pycache",
+        action="store_true",
+        help="仅清理 Code/backend、Code/algorithms、Test 下的 __pycache__ / *.pyc",
+    )
+    p_clean.add_argument(
+        "--vite",
+        action="store_true",
+        help="仅清理 Code/frontend/node_modules/.vite（及 frontend/.vite）",
+    )
+    p_clean.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="仅预览将要删除的路径，不执行",
+    )
+
+    # reset-db
+    p_reset = sub.add_parser(
+        "reset-db",
+        help="清空 workflow_state 运行时数据库并重新 seed 工作流定义",
+    )
+    p_reset.add_argument(
+        "--yes", "-y", action="store_true", help="跳过确认提示直接执行"
+    )
+    p_reset.add_argument(
+        "--no-snapshot",
+        action="store_true",
+        help="跳过快照备份（不推荐，无法回滚）",
+    )
+    p_reset.add_argument(
+        "--keep-snapshots",
+        type=int,
+        default=DEFAULT_MAX_SNAPSHOTS,
+        help=f"保留快照数量（默认 {DEFAULT_MAX_SNAPSHOTS}）",
+    )
+    p_reset.add_argument(
+        "--clear-user",
+        action="store_true",
+        help="同时清空用户自定义工作流定义（默认保留）",
+    )
+    p_reset.add_argument(
+        "--force",
+        action="store_true",
+        help="即使后端服务正在运行也强制执行（可能导致文件锁失败）",
+    )
+
+    # sync
+    p_sync = sub.add_parser("sync", help="数据面一次性同步（Code/infra/data-sync）")
+    p_sync.add_argument(
+        "job",
+        nargs="?",
+        default="open-meteo-sync",
+        help="compose service 名（默认 open-meteo-sync）",
+    )
+
+    # deploy —— 交付态（形态 B）运维入口
+    p_deploy = sub.add_parser(
+        "deploy",
+        help="交付态（全量容器化）容器栈运维: up/down/restart/build/ps/logs/config",
+    )
+    p_deploy.add_argument(
+        "deploy_action",
+        nargs="?",
+        default="up",
+        choices=list(_DEPLOY_ACTIONS),
+        help="动作（默认 up）",
+    )
+    p_deploy.add_argument(
+        "services",
+        nargs="*",
+        help="可选：up 仅启动指定服务；logs 取第一个作为目标服务",
+    )
+    p_deploy.add_argument(
+        "--tag",
+        default=None,
+        help="镜像 tag（默认 .env 的 CGDA_TAG）",
+    )
+    p_deploy.add_argument(
+        "--data-root",
+        default=None,
+        help="宿主地理数据根（默认 .env 的 CGDA_DATA_ROOT）",
+    )
+    p_deploy.add_argument(
+        "--no-build",
+        action="store_true",
+        help="跳过镜像构建，直接使用已有 tag 镜像",
+    )
+    p_deploy.add_argument(
+        "--volumes",
+        action="store_true",
+        help="down 时连命名卷一起删除（危险：MinIO 产物/Redis 队列/beat 调度库全丢）",
+    )
+    p_deploy.add_argument(
+        "-n",
+        "--lines",
+        type=int,
+        default=80,
+        help="logs 显示行数（默认 80）",
+    )
+
+    return parser
+
+
+# ─── 命令分发表 ──────────────────────────────────────────────────────────────
+# 集中声明 command → handler 映射，避免长 if/elif 链。
+# stop / status 无参数；其余命令接收 argparse.Namespace。
+def _dispatch(args: argparse.Namespace) -> int:
+    command = args.command
+    if command == "start":
+        return cmd_start(args)
+    if command == "stop":
+        return cmd_stop(args)
+    if command == "status":
+        return cmd_status()
+    if command == "reload":
+        return cmd_reload(args)
+    if command == "restart":
+        return cmd_restart(args)
+    if command == "logs":
+        return cmd_logs(args)
+    if command == "flush":
+        return cmd_flush(args)
+    if command == "clean-cache":
+        return cmd_clean_cache(args)
+    if command == "reset-db":
+        return cmd_reset_db(args)
+    if command == "sync":
+        return cmd_sync(args.job)
+    if command == "deploy":
+        return cmd_deploy(args)
+    # argparse 的 required=True 已保证不会走到这里
+    log.error("Launcher", f"未知命令: {command}")
+    return 2
+
+
+def main() -> int:
+    """CGDA 启动器入口：解析参数并分派到对应命令。"""
+    # 无子命令时默认 start（兼容直接 python launch.py / start.bat）
+    if len(sys.argv) == 1:
+        sys.argv.append("start")
+
+    parser = build_parser()
+    args = parser.parse_args()
+
+    try:
+        return _dispatch(args)
+    except KeyboardInterrupt:
+        log.warn("Launcher", "用户中断")
+        return 130
+    finally:
+        log.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,118 @@
+# ============================================================
+# CGDA 后端运行栈（长期运行）
+#   - Redis / MinIO
+#   - Open-Meteo API (cgda-open-meteo) — 读 named volume，不跑 sync
+#
+# 数据同步（一次性 run）在独立 compose：
+#   Code/infra/data-sync/  →  docker compose -p data-sync --profile sync run --rm open-meteo-sync
+#
+# 日常:
+#   docker compose -p backend up -d
+#
+# Windows: Docker Desktop 与终端建议以管理员身份运行，
+# 否则可能镜像无法访问 / volume 或配置读取失败。
+# ============================================================
+
+services:
+  # ----------------------------------------------------------
+  # Redis — Celery broker / result backend / 缓存
+  # ----------------------------------------------------------
+  redis:
+    # B4 供应链 pin：锁定 7.4.10（2026-07 拉取 digest sha256:e7723ff73d96…）
+    image: redis:7.4.10-alpine
+    container_name: cgda-redis
+    restart: unless-stopped
+    ports:
+      # 宿主机 16379：避开 Windows Hyper-V 动态保留段（本机常见 6326–6425 含 6379，
+      # 绑定会报 “forbidden by its access permissions”，与是否管理员无关）。
+      # 容器内仍为 6379；应用侧默认 BACKEND_REDIS_URL=redis://127.0.0.1:16379/0
+      - "127.0.0.1:16379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ----------------------------------------------------------
+  # MinIO — 对象存储
+  #   Console: http://localhost:9101  (minioadmin / minioadmin)
+  #   API:     http://localhost:9100
+  #   注: 宿主机端口改为 9100/9101 以避开 Hyper-V 保留端口 8963-9062
+  # ----------------------------------------------------------
+  minio:
+    # B4 供应链 pin：latest → 精确版本（digest sha256:14cea493d9a3…）
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: cgda-minio
+    restart: unless-stopped
+    ports:
+      # 发布就绪修复（P0-3）：绑定回环
+      - "127.0.0.1:9100:9000"    # API (宿主机 9100 -> 容器 9000)
+      - "127.0.0.1:9101:9001"    # Console (宿主机 9101 -> 容器 9001)
+    environment:
+      # 凭据经环境变量注入。生产/他机构部署必须覆盖 minioadmin 默认值
+      #（MINIO_ROOT_USER/PASSWORD，且后端 BACKEND_MINIO_* 与此一致）。
+      # 默认值仅本地联调保留，切勿原样上生产。
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_DEFAULT_BUCKETS: workflow-artifacts,gee-exports,workflow-artifacts-public
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------
+  # MinIO 初始化 — 创建桶（非阻塞，等待 MinIO 就绪后执行一次）
+  # ----------------------------------------------------------
+  minio-init:
+    # B4 供应链 pin：latest → 精确版本（digest sha256:a7fe349ef4bd…）
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    container_name: cgda-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set myminio http://minio:9000 \"$${MINIO_ROOT_USER:-minioadmin}\" \"$${MINIO_ROOT_PASSWORD:-minioadmin}\";
+      mc mb -p myminio/workflow-artifacts;
+      mc mb -p myminio/gee-exports;
+      mc mb -p myminio/workflow-artifacts-public;
+      mc anonymous set download myminio/workflow-artifacts-public;
+      exit 0
+      "
+    restart: "no"
+
+  # ----------------------------------------------------------
+  # Open-Meteo API — 运行态（与 Redis/MinIO 同栈）
+  #   http://127.0.0.1:8080/v1/forecast
+  #   数据在 Docker named volume（I:\Docker\DockerDesktop / Linux /var/lib/docker）。
+  #   勿 bind Windows/项目路径（errno 95）。同步见 Code/infra/data-sync。
+  # ----------------------------------------------------------
+  open-meteo:
+    # B4 供应链 pin：ECR 私有镜像仅 latest tag → digest pin（2026-07-11 拉取）；
+    # 升级时改 OPEN_METEO_IMAGE 或更新此 digest。
+    image: ${OPEN_METEO_IMAGE:-public.ecr.aws/w5w8t1y7/openmeteo@sha256:65268afd77a3a126762cd60595cec2bbb7cfff1b932b96ce4ab7ffe595536665}
+    container_name: cgda-open-meteo
+    restart: unless-stopped
+    ports:
+      # 发布就绪修复（P0-3）：绑定回环
+      - "127.0.0.1:${OPEN_METEO_HOST_PORT:-8080}:8080"
+    volumes:
+      - open-meteo-data:/app/data
+
+volumes:
+  redis-data:
+  minio-data:
+  # Shared with Code/infra/data-sync (sync jobs write; API reads).
+  # Lives inside Docker Desktop (this PC: I:\Docker\DockerDesktop), not the repo.
+  open-meteo-data:
+    name: ${OPEN_METEO_DATA_VOLUME:-backend_open-meteo-data}

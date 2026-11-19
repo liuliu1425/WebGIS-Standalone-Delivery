@@ -1,0 +1,10 @@
+# Explicit opt-in for external providers configured by the deploying institution.
+services:
+  backend:
+    networks: [application, providers]
+  worker:
+    networks: [application, providers]
+  worker-timeseries:
+    networks: [application, providers]
+networks:
+  providers:

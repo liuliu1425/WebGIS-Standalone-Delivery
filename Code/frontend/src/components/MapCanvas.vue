@@ -1,0 +1,1647 @@
+<script setup lang="ts">
+import { MapChromeNavigationControl } from './map/map-chrome-controls'
+import { createAnalysisDrawing } from './timeseries/analysis-drawing'
+import type { Map as MapInstance } from 'maplibre-gl'
+import mapWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url'
+
+import { computed, onBeforeUnmount, onMounted, ref, shallowRef, toRef, watch } from 'vue'
+
+import { AlertTriangle } from './ui/icons'
+import DrawToolbar from './map/draw-toolbar.vue'
+import GlobeStarfield from './map/GlobeStarfield.vue'
+import GlobeSolarSystemBackdrop from './map/GlobeSolarSystemBackdrop.vue'
+import type { SolarSystemCamera } from './map/globe-solar-system'
+import ZonalStatsCard from './info-panel/ZonalStatsCard.vue'
+import VectorAttributeTable from './info-panel/VectorAttributeTable.vue'
+import { useLayersStore } from '../stores/layers'
+import { useLayerWorkspace, useLayerViewport } from '../stores/layers/selectors'
+import { useUiStore } from '../stores/ui'
+import { useDrawStore } from '../stores/draw-store'
+import { useLogStore } from '../stores/log'
+import { useDrawSave } from '../composables/useDrawSave'
+import { useDrawSessionTransition } from '../composables/useDrawSessionTransition'
+import { useWeatherTileManager } from '../stores/weather-tile-manager'
+import type { LayerHotspot } from '../stores/layers/types'
+import { createMapCanvasActionBridge } from './map/map-canvas-action-bridge'
+import { createMapCanvasExposeBridge } from './map/map-canvas-expose-bridge'
+import { createMapCanvasLifecycleBinder } from './map/map-canvas-lifecycle-binder'
+import {
+  createBoundedMapPanConstraint,
+  createMapCanvasMapOptions,
+} from './map/map-canvas-map-options'
+import { createMapCanvasModuleBundle } from './map/map-canvas-module-bundle'
+import type { MapCanvasNonWeatherLayerSyncModule } from './map/map-canvas-non-weather-layer-sync-module'
+import { createMapStagePresentationModule } from './map/map-stage-presentation-module'
+import { createMapCanvasState } from './map/map-canvas-state'
+import { createMapCanvasTeardownBinder } from './map/map-canvas-teardown-binder'
+import { ensureWorldLandBase, setWorldLandBaseVisible } from './map/land-base-module'
+import {
+  LAND_SEA_OCEAN_COLOR,
+  ensureLandSeaBase,
+  setLandSeaBaseVisible,
+} from './map/land-sea-module'
+import { installSafeMapStyleAccess, isMapStyleAlive } from './map/map-style-guards'
+import type { OverlayTimeState } from './map/overlay-image-module'
+import { validateOverlayBounds } from './map/overlay-image-module'
+import {
+  consumeGlobeViewSnapshot,
+  heightMetersToZoom,
+  setGlobeViewSnapshot,
+  zoomToHeightMeters,
+} from './map/globe-engine/view-bridge'
+import {
+  buildMapStageAppearanceModel,
+  buildMapStageDisplayModel,
+  buildFallbackActiveLayerDisplay,
+  buildMapStageStatusModel,
+  buildMapStageTimeVisualState,
+} from './map/map-stage-view-model'
+import { aggregateWeatherTileBanner } from './map/weather-tile-banner'
+import {
+  TILE_SOURCE_MAP,
+  getDefaultTileSource,
+  getFailoverCandidates,
+  isTileSourceUsable,
+  type TileSourceId,
+} from '../services/api-config'
+import { isReducedMotionActive } from '../services/motion-preference'
+import { isGlobalMapViewport } from '../utils/map-viewport'
+import { DEFAULT_LAYER_OPACITY } from '../utils/layer-opacity'
+import {
+  isMapDistributionChromeEnabled,
+  subscribeMapDistributionChrome,
+  getGlobeBackgroundMode,
+  getGlobeDaylightMode,
+  subscribeGlobeScene,
+  type GlobeBackgroundMode,
+  type GlobeDaylightMode,
+} from '../services/settings-local'
+import { classifyBasemapBrightness, resolveGlobeSky } from './map/globe-scene-utils'
+import { quantizeNightMaskHour } from './map/globe-night-mask'
+import {
+  ensureGlobeNightMaskLayerOnMap,
+  GlobeNightMaskLayer,
+  removeLegacyNightMaskRaster,
+} from './map/globe-night-mask-layer'
+import { TILE_LAYER_ID } from './map/basemap-module'
+import { useThemeStore } from '../stores/theme'
+import { resolveGlobeBackgroundColor } from './map/map-canvas-map-options'
+import {
+  dataWorkspaceHighlight,
+  dataWorkspaceZoomRequest,
+  showToast,
+} from '../data-manager/core/workspace-store'
+import { debugLog as probeDebugLog } from '../utils/perf-probe'
+import { useSettingsStore } from '../stores/settings'
+
+const layersStore = useLayersStore() // createMapCanvasModuleBundle 需完整 store 实例
+const workspace = useLayerWorkspace()
+const viewport = useLayerViewport()
+const uiStore = useUiStore()
+const settingsStore = useSettingsStore()
+const drawStore = useDrawStore()
+const { requestInteractionMode } = useDrawSessionTransition()
+const logStore = useLogStore()
+const weatherTileManager = useWeatherTileManager()
+const weatherStatusVersion = toRef(weatherTileManager, 'statusVersion')
+const weatherActivityVersion = toRef(weatherTileManager, 'activityVersion')
+
+const props = defineProps<{
+  tileSourceId: TileSourceId
+  currentHour: number
+  /** 时间轴日期（"自然"晨昏样式计算太阳赤纬所需；缺省取当前日期） */
+  currentDate?: Date
+  /** 地图点查选中坐标（持久标记，非定位标记） */
+  inspectPoint?: { lng: number; lat: number } | null
+  /** 实验性 3D：true 时地图切 globe 投影（外观设置勾选「启用3D视图」后生效） */
+  globeProjection?: boolean
+  /** 「海陆底图（无国界）」叠加层：勾上就把底下的地名与国界整片盖掉 */
+  landSeaBasemap?: boolean
+}>()
+
+const emit = defineEmits<{
+  visibleHotspotsChange: [hotspots: LayerHotspot[]]
+  hotspotSelect: [hotspot: LayerHotspot | null]
+  mapPointSelect: [point: { lng: number; lat: number }]
+  overlayTimeUpdate: [states: OverlayTimeState[]]
+}>()
+
+const state = createMapCanvasState()
+const {
+  mapContainer,
+  mapStageRef,
+  hotspotPins,
+  selectedHotspotId,
+  mapReady,
+  mapVisible,
+  skeletonVisible,
+  isMapInteracting,
+  isSourceTransitioning,
+  loadingLabel,
+  tileLoadFailed,
+  tileFailedProvider,
+} = state
+
+/** 卸载 / 样式重建期间为 true；须在 mapReady 之前声明供 getMapReady 闭包使用 */
+let _isUnmounted = false
+let boundedMapPanConstraint: ReturnType<typeof createBoundedMapPanConstraint> | null = null
+const isMapInteractive = () =>
+  mapReady.value && !_isUnmounted && isMapStyleAlive(state.resources.map)
+
+// ─── 地图初始化失败 / 超时提示 ──────────────────────────────────────────────
+/**
+ * 初始化失败或超时后必须给用户可见提示。
+ * 原实现只在 catch 里 console.error + 隐藏骨架屏，页面继续显示"正在加载地图"，
+ * 用户会无限等下去（外部测试报告 P0-1）。这里补一个错误态。
+ * 只影响提示层，不改变地图创建流程本身。
+ */
+const mapInitError = ref<string | null>(null)
+/**
+ * 失败的技术细节（原始异常信息，通常是英文）。
+ * 外部测试报告 优先4 后半：普通界面只留简洁中文原因，堆栈/外部网址收进「技术详情」折叠区，
+ * 不给用户糊一脸英文。
+ */
+const mapInitTechDetail = ref<string | null>(null)
+/** 初始化总超时：到点仍未 ready 即按失败处理（沿用通用经验值 30s，可按需调整） */
+const MAP_INIT_TIMEOUT_MS = 30_000
+let mapInitTimer: ReturnType<typeof globalThis.setTimeout> | null = null
+
+function clearMapInitTimer(): void {
+  if (mapInitTimer !== null) {
+    globalThis.clearTimeout(mapInitTimer)
+    mapInitTimer = null
+  }
+}
+
+function markMapInitFailed(reason: string, techDetail?: string | null): void {
+  clearMapInitTimer()
+  // 已经就绪的不要再被超时回调误判为失败
+  if (mapReady.value || _isUnmounted) return
+  mapInitError.value = reason
+  mapInitTechDetail.value = techDetail ? String(techDetail) : null
+  skeletonVisible.value = false
+}
+
+function handleReloadForMapInit(): void {
+  if (typeof globalThis.window !== 'undefined') globalThis.window.location.reload()
+}
+
+const teardownBinder = createMapCanvasTeardownBinder({
+  getResources: () => state.resources,
+  clearResources: state.clearResources,
+})
+const actionBridge = createMapCanvasActionBridge({
+  getMapReady: () => isMapInteractive(),
+  getHasAdminBoundary: () => hasAdminBoundary.value,
+  getAdminBoundaryOpacity: () => adminBoundaryOpacity.value,
+  getAdminBoundaryModule: () => state.resources.adminBoundaryModule,
+  getBasemapModule: () => state.resources.basemapModule,
+  getHotspotPinsModule: () => state.resources.hotspotPinsModule,
+})
+const exposeBridge = createMapCanvasExposeBridge({
+  getMapStageElement: () => mapStageRef.value,
+  getMap: () => state.resources.map,
+  // Agent 状态问答：直接读既有真源，不另造状态
+  isMapReady: () => isMapInteractive(),
+  getMapError: () => mapInitError.value,
+  selectHotspot: (pinId: string) => actionBridge.handleHotspotPinClick(pinId),
+  setWindAnimationPaused: (paused: boolean) => {
+    state.resources.weatherOverlayModule?.setAnimationPaused(paused)
+  },
+  fitToLayerExtent: (instanceId: string) => fitToLayerExtent(instanceId),
+  setOverlayTime: (layerId: string, time: string) => {
+    /**
+     * 这里原本是 `void setOverlayTime(...)`，异常被彻底吞掉：地图侧一旦报错
+     * （源删不干净 / bounds 不合法 / WebGL 状态异常），界面上什么都不会说，
+     * 用户只看到「拖了日期，图没变」。至少留一条可见记录 + 控制台原文。
+     */
+    const pending = overlayImageModule?.setOverlayTime(layerId, time)
+    void Promise.resolve(pending).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err)
+      console.warn(`[Overlay] 切换时间失败 ${layerId}@${time}`, err)
+      useLogStore().logOperation('overlay-time', `切换时间失败 ${layerId}@${time}：${msg}`)
+    })
+  },
+  flyTo: (options: {
+    center: [number, number]
+    zoom?: number
+    duration?: number
+    curve?: number
+  }): boolean => {
+    // 地图未就绪时如实返回 false：调用方（Agent 定位命令）据此提示"地图未就绪"，
+    // 不再出现"嘴上说已定位、画面没动"（外部测试报告 P0-2）。
+    if (!isMapInteractive()) return false
+    const duration =
+      options.duration !== undefined ? (isReducedMotionActive() ? 0 : options.duration) : undefined
+    state.resources.map?.flyTo({ ...options, duration, curve: options.curve ?? 1.42 })
+    return true
+  },
+  fitBounds: (
+    bounds: [number, number, number, number],
+    options?: { padding?: number; maxZoom?: number; duration?: number },
+  ): boolean => {
+    // 同 flyTo：未就绪如实返回 false，供上位命令反馈真实结果
+    if (!isMapInteractive()) return false
+    const [w, s, e, n] = bounds
+    const baseOptions = options ?? { padding: 48, duration: 1000 }
+    const duration =
+      baseOptions.duration !== undefined
+        ? isReducedMotionActive()
+          ? 0
+          : baseOptions.duration
+        : undefined
+    state.resources.map?.fitBounds(
+      [
+        [w, s],
+        [e, n],
+      ],
+      { ...baseOptions, duration },
+    )
+    return true
+  },
+})
+
+let analysisDrawing: ReturnType<typeof createAnalysisDrawing> | null = null
+let analysisDrawingActive = false
+let analysisPointSet = false
+let pendingAnalysisRegion: { geometry: GeoJSON.Geometry; name: string } | null = null
+function syncAnalysisCamera() {
+  overlayImageModule?.setAutoFitEnabled(!analysisDrawingActive && !analysisPointSet && !pendingAnalysisRegion)
+}
+function ensureAnalysisDrawing() {
+  if (!isMapInteractive() || !state.resources.map) return null
+  analysisDrawing ??= createAnalysisDrawing(state.resources.map, active => {
+    analysisDrawingActive = active
+    syncAnalysisCamera()
+  })
+  return analysisDrawing
+}
+function beginAnalysisRegion(mode: 'rectangle' | 'polygon', done: (geometry: GeoJSON.Polygon) => void) {
+  if (uiStore.interactionMode === 'draw' || uiStore.interactionMode === 'measure') return false
+  const drawing = ensureAnalysisDrawing()
+  if (!drawing) return false
+  drawing.begin(mode, done)
+  return true
+}
+function cancelAnalysisRegion() { analysisDrawing?.cancel() }
+function previewAnalysisRegion(geometry: GeoJSON.Geometry | null, name = '') {
+  pendingAnalysisRegion = geometry ? { geometry, name } : null
+  syncAnalysisCamera()
+  ensureAnalysisDrawing()?.preview(geometry, name)
+}
+watch(mapReady, ready => {
+  if (ready && pendingAnalysisRegion) ensureAnalysisDrawing()?.preview(pendingAnalysisRegion.geometry, pendingAnalysisRegion.name)
+})
+function locateAnalysisPoint(point: [number, number] | null, fly = true) {
+  const analysis = ensureAnalysisDrawing()
+  if (!analysis) return false
+  analysisPointSet = !!point
+  syncAnalysisCamera()
+  analysis.showPoint(point, fly)
+  return true
+}
+function pickAnalysisPoint(done: (point: [number, number]) => void, ended: () => void) {
+  if (uiStore.interactionMode === 'draw' || uiStore.interactionMode === 'measure') return false
+  const analysis = ensureAnalysisDrawing()
+  if (!analysis) return false
+  analysis.pick(point => {
+    analysisPointSet = true
+    syncAnalysisCamera()
+    done(point)
+  }, ended)
+  return true
+}
+onBeforeUnmount(() => { analysisDrawing?.dispose(); analysisDrawing = null })
+defineExpose({ ...exposeBridge, beginAnalysisRegion, cancelAnalysisRegion, previewAnalysisRegion, locateAnalysisPoint, pickAnalysisPoint })
+
+function fitToLayerExtent(instanceId: string): boolean {
+  const map = state.resources.map
+  if (!map) return false
+
+  const layer = workspace.activeLayers.value.find((l) => l.instanceId === instanceId)
+  const display = workspace.activeLayersDisplay.value.find((l) => l.instanceId === instanceId)
+  if (!layer && !display) {
+    showToast('未找到图层，无法缩放', true)
+    return false
+  }
+
+  let bounds: [number, number, number, number] | null | undefined =
+    layer?.importedVector?.bounds ??
+    layer?.importedRaster?.bounds ??
+    display?.importedBounds ??
+    display?.importedRasterBounds
+
+  if (!bounds) {
+    const overlayId = layer?.importedRaster?.overlayLayerId ?? display?.catalogId
+    if (overlayId && overlayImageModule) {
+      const st = overlayImageModule.overlayTimeStates.value.find((s) => s.layerId === overlayId)
+      bounds = st?.bounds ?? null
+    }
+  }
+
+  if (!bounds && layer?.importedVector) {
+    const mod = state.resources.nonWeatherLayerSyncModule?.importedLayerModule
+    if (mod) {
+      // 相机操作失败不得炸断用户操作链（坏 bounds 数据防御）
+      try {
+        mod.fitLayers([instanceId])
+        return true
+      } catch (error) {
+        console.warn('[MapCanvas] fitLayers failed', error)
+        showToast('该图层坐标超出地理范围，无法定位', true, 3500)
+        return false
+      }
+    }
+  }
+
+  if (!bounds) {
+    showToast('该图层暂无可用显示范围', true, 3500)
+    return false
+  }
+
+  const check = validateOverlayBounds(bounds)
+  if (!check.ok) {
+    showToast(`无法缩放到图层：${check.reason}`, true, 5000)
+    return false
+  }
+  const [w, s, e, n] = check.bounds
+  const pad = 0.0001
+  let west = w
+  let south = s
+  let east = e
+  let north = n
+  if (east - west < pad) {
+    west -= pad
+    east += pad
+  }
+  if (north - south < pad) {
+    south -= pad
+    north += pad
+  }
+  map.fitBounds(
+    [
+      [west, south],
+      [east, north],
+    ],
+    { padding: 48, maxZoom: 14, duration: 600 },
+  )
+  return true
+}
+
+// ─── Overlay image module (via non-weather sync module) ──────────────────────
+let overlayImageModule: MapCanvasNonWeatherLayerSyncModule['overlayImageModule'] | null = null
+// 响应式句柄：overlayImageModule 是异步挂载后才赋值的普通变量，直接放进 computed
+// 会因 `?.` 短路而丢失依赖追踪（永远为空数组）。用 shallowRef 保证赋值后 watcher 触发。
+const overlayImageModuleRef = shallowRef<
+  MapCanvasNonWeatherLayerSyncModule['overlayImageModule'] | null
+>(null)
+const overlayTimeStates = computed(() => overlayImageModuleRef.value?.overlayTimeStates.value ?? [])
+
+// 透传 overlay 时间状态到父组件
+watch(
+  overlayTimeStates,
+  (states) => {
+    emit('overlayTimeUpdate', states)
+  },
+  { deep: true },
+)
+
+function debugLog(module: string, ...args: unknown[]) {
+  probeDebugLog(`[${performance.now().toFixed(1)}ms] [${module}]`, ...args)
+}
+
+const currentTileConfig = computed(
+  () => TILE_SOURCE_MAP.get(props.tileSourceId) ?? TILE_SOURCE_MAP.get(getDefaultTileSource())!,
+)
+
+// ── Derived from layersStore ──────────────────────────────────────────────────
+
+const selectedLayer = computed(() => workspace.selectedLayerDisplay.value)
+const hasAdminBoundary = computed(() =>
+  workspace.activeLayersDisplay.value.some((d) => d.isAdminBoundary),
+)
+const adminBoundaryOpacity = computed(() => {
+  const layer = workspace.activeLayersDisplay.value.find((d) => d.isAdminBoundary)
+  return layer ? layer.opacity : DEFAULT_LAYER_OPACITY
+})
+
+// Safe fallback for template (no selected layer = dark atmospheric state)
+const activeLayer = computed(() => selectedLayer.value ?? buildFallbackActiveLayerDisplay())
+const stageDisplayModel = computed(() =>
+  buildMapStageDisplayModel({ activeLayer: activeLayer.value }),
+)
+const stageStatusModel = computed(() =>
+  buildMapStageStatusModel({
+    mapReady: mapReady.value,
+    loadingLabel: loadingLabel.value,
+    tileLoadFailed: tileLoadFailed.value,
+    tileFailedProvider: tileFailedProvider.value,
+  }),
+)
+
+// 天气瓦片加载/错误/半覆盖状态：按层隔离聚合（单层无数据不盖住健康层）
+const weatherTileStatusModel = computed(() => {
+  // statusVersion：错误/补洞；activityVersion：瓦片入队/完成（缩放中途加载进度）
+  void weatherStatusVersion.value
+  void weatherActivityVersion.value
+  const weatherLayers = workspace.activeLayersDisplay.value.filter(
+    (l) => l.visible && workspace.isWeatherEngineLayer(l.catalogId),
+  )
+  return aggregateWeatherTileBanner(
+    weatherLayers.map((layer) => {
+      const status = weatherTileManager.getLayerStatus(layer.catalogId)
+      return {
+        label: layer.name || layer.metricLabel || layer.catalogId,
+        active: status.active,
+        cachedInViewport: status.cachedInViewport,
+        missingInViewport: status.missingInViewport,
+        pending: status.pending,
+        gapSweepActive: status.gapSweepActive,
+        errorType: status.errorType,
+        errorMessage: status.errorMessage,
+      }
+    }),
+  )
+})
+const mapDistributionChromeEnabled = ref(isMapDistributionChromeEnabled())
+const unsubscribeMapChrome = subscribeMapDistributionChrome(() => {
+  mapDistributionChromeEnabled.value = isMapDistributionChromeEnabled()
+})
+
+// ─── 主题切换时更新 MapLibre 背景色 ──────────────────────────────────────────
+const themeStore = useThemeStore()
+
+// A single rendered world leaves a bounded gutter while panning. Match the opaque
+// land/sea image there; keep the globe canvas transparent so its starfield remains visible.
+const flatLandSeaBackgroundColor = computed(() =>
+  props.globeProjection !== true && props.landSeaBasemap === true
+    ? LAND_SEA_OCEAN_COLOR
+    : undefined,
+)
+
+/** 同步画布内背景；2D 海陆底图与 CSS 留白共用海洋色，其他模式保持原规则。 */
+function applyBackgroundColor(): void {
+  const map = state.resources.map
+  if (!map || !isMapInteractive()) return
+  try {
+    map.setPaintProperty(
+      'background',
+      'background-color',
+      flatLandSeaBackgroundColor.value ??
+        resolveGlobeBackgroundColor(props.globeProjection === true, themeStore.mode === 'light'),
+    )
+  } catch {
+    /* style mid-teardown */
+  }
+}
+
+watch(
+  [() => themeStore.mode, flatLandSeaBackgroundColor],
+  () => {
+    applyBackgroundColor()
+    // 昼夜遮罩层在主题切换时无需改色（fill-color 固定深色半透明）
+  },
+)
+
+const stageAppearanceModel = computed(() =>
+  buildMapStageAppearanceModel({
+    basemapStyle: currentTileConfig.value.style,
+    activeLayer: activeLayer.value,
+    timeVisualState: timeVisualState.value,
+    isMapInteracting: isMapInteracting.value,
+    isSourceTransitioning: isSourceTransitioning.value,
+    mapVisible: mapVisible.value,
+    skeletonVisible: skeletonVisible.value,
+    isGlobalViewport: isGlobalMapViewport(viewport.currentMapBBox.value),
+    hasVisibleDataLayers: workspace.activeLayers.value.some(
+      (layer) => layer.visible && !layer.isAdminBoundary,
+    ),
+    distributionChromeEnabled: mapDistributionChromeEnabled.value,
+  }),
+)
+
+const mapStageStyleVars = computed(() => ({
+  ...stageAppearanceModel.value.stageStyleVars,
+  ...(flatLandSeaBackgroundColor.value
+    ? { '--map-world-background': flatLandSeaBackgroundColor.value }
+    : {}),
+}))
+
+// ─── 低缩放纯色底图抑制 ──────────────────────────────────────────────────────
+// 设计变更：关闭「分布淡底 / 氛围遮罩」时，底图应始终可见，不再在低 zoom 抑制。
+// 原逻辑在 zoom≤3.5 + 无数据图层 + 设置关闭时隐藏底图瓦片，导致大洲/世界视口下底图消失。
+// 现改为始终保留底图，氛围效果由 CSS chrome-off 类统一控制（opacity:0）。
+const shouldSuppressBasemap = computed(() => false)
+
+function applyBasemapSuppression() {
+  if (!isMapInteractive()) return
+  const map = state.resources.map
+  if (!map) return
+  // 空白底图（tileSourceId=none）必须保持隐藏；否则切源后的延时抑制会把旧瓦片重新显示出来
+  const blankBasemap = props.tileSourceId === 'none'
+  const suppress = shouldSuppressBasemap.value || blankBasemap
+  const tileLayer = map.getLayer('tile-base-raster')
+  if (tileLayer) {
+    const target = suppress ? 'none' : 'visible'
+    if (map.getLayoutProperty('tile-base-raster', 'visibility') !== target) {
+      map.setLayoutProperty('tile-base-raster', 'visibility', target)
+    }
+  }
+  const overlayLayer = map.getLayer('tile-base-overlay-raster')
+  if (overlayLayer && suppress) {
+    if (map.getLayoutProperty('tile-base-overlay-raster', 'visibility') !== 'none') {
+      map.setLayoutProperty('tile-base-overlay-raster', 'visibility', 'none')
+    }
+  }
+}
+
+watch(shouldSuppressBasemap, () => applyBasemapSuppression())
+
+// 瓦片源切换（scheduleTileSourceSwitch 有 80ms 防抖）后重新应用抑制
+watch(
+  () => props.tileSourceId,
+  () => {
+    setTimeout(applyBasemapSuppression, 120)
+  },
+)
+
+/**
+ * 全球陆地灰底衬是否该显示。
+ * 默认就开（用户要求"勾了图层就该有"，不该依赖任何别的开关）。
+ * 只在两种底图上关掉：卫星/影像（灰会把影像糊掉）、深色底图（灰会发脏）。
+ * 空白底图没有海洋蓝可比，也一并不开。
+ */
+const shouldShowWorldLandBaseNow = computed(() => {
+  const style = TILE_SOURCE_MAP.get(props.tileSourceId)?.style
+  return style !== 'satellite' && style !== 'dark' && style !== 'none'
+})
+
+watch(shouldShowWorldLandBaseNow, (show) => {
+  setWorldLandBaseVisible(state.resources.map, show)
+})
+
+/**
+ * 海陆底图叠加（顶栏「底图 → 底图叠加」里的勾选项）。
+ * 勾上就建层并显示（ensureLandSeaBase 幂等），取消只隐藏、不销毁——
+ * 反复勾选不该反复下图片。它与「底图选哪家」无关，切换来源不必处理。
+ */
+watch(
+  () => props.landSeaBasemap,
+  (on) => {
+    const map = state.resources.map
+    if (!map || !isMapStyleAlive(map)) return
+    if (on) void ensureLandSeaBase(map, true)
+    else setLandSeaBaseVisible(map, false)
+  },
+)
+
+// ─── 实验性 3D：globe 投影切换 ──────────────────────────────────────────────
+// 外观设置勾选「启用3D视图（实验测试）」且顶栏处于 3D 模式时切 globe；
+// 关闭或切回 2D 时恢复 mercator。地图实例保持不变，全部图层与叠加层保留。
+watch(
+  [() => props.globeProjection, mapReady],
+  ([on, ready]) => {
+    if (!ready || _isUnmounted) return
+    const map = state.resources.map
+    if (!map || !isMapStyleAlive(map)) return
+    const target = on ? 'globe' : 'mercator'
+    try {
+      // Globe keeps MapLibre's own latitude/zoom rules; the gutter is only for flat 2D.
+      if (on) map.setTransformConstrain(null)
+      const current = map.getProjection?.()
+      if (current?.type !== target) {
+        map.setProjection({ type: target })
+        debugLog('MapCanvas', 'setProjection', target)
+      }
+      if (!on && boundedMapPanConstraint) {
+        map.setTransformConstrain(boundedMapPanConstraint)
+      }
+    } catch (err) {
+      console.warn('[MapCanvas] setProjection failed:', err)
+    }
+    applyBackgroundColor()
+    // 从 Cesium 切回 MapLibre globe 时恢复视口
+    if (on) {
+      const snap = consumeGlobeViewSnapshot()
+      if (snap) {
+        try {
+          const zoom = snap.zoom ?? heightMetersToZoom(snap.heightMeters, snap.lat)
+          map.jumpTo({
+            center: [snap.lng, snap.lat],
+            zoom,
+            bearing: snap.bearing ?? map.getBearing(),
+            pitch: snap.pitch ?? map.getPitch(),
+          })
+        } catch (err) {
+          console.warn('[MapCanvas] restore globe view failed:', err)
+        }
+      }
+    }
+  },
+  { immediate: true },
+)
+
+// ─── 3D globe 场景偏好（背景星图 / 昼夜光影档位）────────────────────────────
+
+const globeProjectionOn = computed(() => props.globeProjection === true)
+const globeBackgroundMode = ref<GlobeBackgroundMode>(getGlobeBackgroundMode())
+const globeDaylightMode = ref<GlobeDaylightMode>(getGlobeDaylightMode())
+const solarSystemActive = computed(
+  () => globeProjectionOn.value && globeBackgroundMode.value === 'solar_system',
+)
+const solarCamera = ref<SolarSystemCamera>({
+  lng: 0,
+  lat: 0,
+  bearing: 0,
+  pitch: 0,
+  zoom: 1.5,
+})
+
+function syncSolarCameraFromMap() {
+  const map = state.resources.map
+  if (!map) return
+  try {
+    const c = map.getCenter()
+    solarCamera.value = {
+      lng: c.lng,
+      lat: c.lat,
+      bearing: map.getBearing?.() ?? 0,
+      pitch: map.getPitch?.() ?? 0,
+      zoom: map.getZoom?.() ?? 1.5,
+    }
+  } catch {
+    /* map disposed */
+  }
+}
+
+let _unsubscribeGlobeScene: (() => void) | null = null
+_unsubscribeGlobeScene = subscribeGlobeScene(() => {
+  globeBackgroundMode.value = getGlobeBackgroundMode()
+  globeDaylightMode.value = getGlobeDaylightMode()
+})
+onBeforeUnmount(() => {
+  _unsubscribeGlobeScene?.()
+  _unsubscribeGlobeScene = null
+  const map = state.resources.map
+  if (map) {
+    map.off('move', syncSolarCameraFromMap)
+    map.off('zoom', syncSolarCameraFromMap)
+  }
+})
+
+// 太阳系背景：跟随地图相机
+watch(
+  [solarSystemActive, mapReady],
+  ([active, ready]) => {
+    const map = state.resources.map
+    if (!map || !ready) return
+    if (active) {
+      syncSolarCameraFromMap()
+      map.on('move', syncSolarCameraFromMap)
+      map.on('zoom', syncSolarCameraFromMap)
+    } else {
+      map.off('move', syncSolarCameraFromMap)
+      map.off('zoom', syncSolarCameraFromMap)
+    }
+  },
+  { immediate: true },
+)
+
+// map 实例在 onMounted 异步创建；watch 先登记，创建后立即 apply，
+// 时间轴 / 底图源 / 光影档位变化时仅更新光照与天空。
+watch(
+  [
+    () => props.globeProjection,
+    () => props.currentHour,
+    () => props.currentDate,
+    () => props.tileSourceId,
+    globeDaylightMode,
+    mapReady,
+  ],
+  ([enabled, hour, , , , ready]) => {
+    const map = state.resources.map
+    if (map && ready) applyGlobeScene(map, enabled === true, hour)
+  },
+  { immediate: true },
+)
+
+// ─── Time-of-day visual vars ─────────────────────────────────────────────────
+
+/** 3D「自然」档冻结屏幕空间时间 CSS 变量，避免 --horizon-position / --stage-glow-spread 随时间轴变化形成"圈在动" */
+const timeVisualState = computed(() => {
+  if (globeProjectionOn.value && globeDaylightMode.value === 'natural') {
+    return buildMapStageTimeVisualState(12)
+  }
+  return buildMapStageTimeVisualState(props.currentHour)
+})
+
+/**
+ * Globe 专属视觉层：原生天空大气 + raster 昼夜遮罩。
+ * 只在 3D 模式打开，2D 模式恢复默认，避免常规地图承担额外样式更新。
+ *
+ * ⚠️ globe 模式下**不再 setLight**：light 的 azimuth 公式是"视口相对方位"，
+ * 对 globe 语义错误（且 raster 瓦片本身不吃 light，只会对 vector 数据层
+ * 产生方向错误的阴影）——昼夜统一由夜半球遮罩（applyNightHemisphere）
+ * 与 raster-brightness 压制（applyBasemapBrightness）负责。
+ *
+ * 亮色底图（街道/矢量/地形）在太阳直射下会过曝发白：
+ * 直接压底图 raster 图层的 brightness-max（对瓦片像素的硬约束）：
+ * 亮色底图白天段 ≈ 0.80，soft 档再降至 0.72；影像/暗色底图保留 1.0。
+ */
+function applyGlobeScene(map: MapInstance, enabled: boolean, hour: number): void {
+  try {
+    applyBasemapBrightness(map, enabled)
+    applyNightHemisphere(map, enabled, hour, props.currentDate)
+    if (!enabled || globeDaylightMode.value === 'off') {
+      // 非 globe 或「无」档：恢复默认大气（整体亮度统一，不加任何亮暗效果）
+      map.setSky?.({})
+      return
+    }
+    if (globeDaylightMode.value === 'natural') {
+      // 自然档：关闭球缘大气（atmosphere-blend>0 会在背景形成固定亮圈；
+      // setSky({}) 在 MapLibre 5.x 会回落到默认大气，须显式 blend=0）
+      map.setSky?.({
+        'atmosphere-blend': 0,
+        'sky-horizon-blend': 0,
+        'horizon-fog-blend': 0,
+        'fog-ground-blend': 0,
+      })
+      return
+    }
+    const basemapStyle = TILE_SOURCE_MAP.get(props.tileSourceId)?.style
+    const brightness = classifyBasemapBrightness(basemapStyle)
+    const sky = resolveGlobeSky(12, brightness)
+    map.setSky?.({
+      'sky-color': sky.skyColor,
+      'horizon-color': sky.horizonColor,
+      'fog-color': sky.fogColor,
+      'fog-ground-blend': sky.fogGroundBlend,
+      'horizon-fog-blend': sky.horizonFogBlend,
+      'sky-horizon-blend': sky.skyHorizonBlend,
+      'atmosphere-blend': sky.atmosphereBlend,
+    })
+  } catch (error) {
+    // 旧样式/旧 MapLibre 版本不支持天空参数时，不影响地图主体渲染。
+    debugLog('[MapCanvas] globe scene style unavailable', error)
+  }
+}
+
+/**
+ * 底图 raster 亮度压制（globe 模式专属）。
+ * 亮色底图阳面"过曝发白"的主修：直接限制瓦片像素最大亮度。
+ * - 亮色底图 + 标准：raster-brightness-max = 0.80
+ * - 亮色底图 + 柔和：0.72（进一步压）
+ * - 影像/暗色底图：1.0（保留原始对比）
+ * - 2D / globe 关闭：恢复 1.0
+ */
+/**
+ * 底图 raster 亮度压制（globe 模式专属）。
+ * 亮色底图阳面"过曝发白"的主修：直接限制瓦片像素最大亮度。
+ * - 亮色底图 + 标准：raster-brightness-max = 0.80（左上立体压亮）
+ * - 自然 / 无：1.0（自然档昼夜仅由遮罩负责，不加瓦片光影）
+ * - 影像/暗色底图：1.0（保留原始对比）
+ * - 2D / globe 关闭：恢复 1.0
+ */
+function applyBasemapBrightness(map: MapInstance, globeEnabled: boolean): void {
+  try {
+    if (!map.getLayer?.(TILE_LAYER_ID)) return
+    let brightnessMax = 1.0
+    if (globeEnabled && globeDaylightMode.value === 'standard') {
+      const basemapStyle = TILE_SOURCE_MAP.get(props.tileSourceId)?.style
+      const brightness = classifyBasemapBrightness(basemapStyle)
+      if (brightness === 'light') {
+        brightnessMax = 0.8
+      }
+    }
+    const current = map.getPaintProperty?.(TILE_LAYER_ID, 'raster-brightness-max')
+    if (current !== brightnessMax) {
+      map.setPaintProperty(TILE_LAYER_ID, 'raster-brightness-max', brightnessMax)
+    }
+  } catch (error) {
+    debugLog('[MapCanvas] applyBasemapBrightness unavailable', error)
+  }
+}
+
+// ─── Globe「自然」档：WebGL 球面夜半球（硬边暗/亮，无 image source 扭曲） ───
+
+function nightMaskCacheKey(hour: number, date?: Date): string {
+  const day = date ? date.toISOString().slice(0, 10) : 'today'
+  return `${quantizeNightMaskHour(hour).toFixed(2)}|${day}`
+}
+
+let lastNightMaskKey = ''
+
+function applyNightHemisphereNow(
+  map: MapInstance,
+  globeEnabled: boolean,
+  hour: number,
+  date?: Date,
+): void {
+  removeLegacyNightMaskRaster(map)
+
+  const applyLayerState = (layer: GlobeNightMaskLayer) => {
+    if (!globeEnabled || globeDaylightMode.value !== 'natural') {
+      layer.setVisible(false)
+      lastNightMaskKey = ''
+      return
+    }
+    const cacheKey = nightMaskCacheKey(hour, date)
+    if (cacheKey !== lastNightMaskKey) {
+      lastNightMaskKey = cacheKey
+      layer.setSunState(quantizeNightMaskHour(hour), date)
+    }
+    layer.setVisible(true)
+    try {
+      map.triggerRepaint()
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const layer = ensureGlobeNightMaskLayerOnMap(map, applyLayerState)
+  applyLayerState(layer)
+}
+
+/** 每帧合并一次更新，避免拖动时间轴时连续 setSunState */
+let nightMaskRaf = 0
+let pendingNightMask: {
+  map: MapInstance
+  globeEnabled: boolean
+  hour: number
+  date?: Date
+} | null = null
+
+function cancelPendingNightMask(): void {
+  if (nightMaskRaf) {
+    cancelAnimationFrame(nightMaskRaf)
+    nightMaskRaf = 0
+  }
+  pendingNightMask = null
+}
+
+function applyNightHemisphere(
+  map: MapInstance,
+  globeEnabled: boolean,
+  hour: number,
+  date?: Date,
+): void {
+  try {
+    if (!globeEnabled || globeDaylightMode.value !== 'natural') {
+      cancelPendingNightMask()
+      applyNightHemisphereNow(map, globeEnabled, hour, date)
+      return
+    }
+    pendingNightMask = { map, globeEnabled, hour, date }
+    if (nightMaskRaf) return
+    nightMaskRaf = requestAnimationFrame(() => {
+      nightMaskRaf = 0
+      const pending = pendingNightMask
+      pendingNightMask = null
+      if (!pending) return
+      try {
+        applyNightHemisphereNow(pending.map, pending.globeEnabled, pending.hour, pending.date)
+      } catch (error) {
+        debugLog('[MapCanvas] applyNightHemisphere unavailable', error)
+      }
+    })
+  } catch (error) {
+    debugLog('[MapCanvas] applyNightHemisphere unavailable', error)
+  }
+}
+
+// ─── Map init ────────────────────────────────────────────────────────────────
+
+onMounted(async () => {
+  if (!mapContainer.value) {
+    markMapInitFailed('地图容器未就绪，请刷新页面重试')
+    return
+  }
+
+  // 底图菜单要靠它判断「哪些底图能点」。不能等设置面板打开才拉，
+  // 否则首次进站时 apiKeys 为空，天地图等底图会被误判成「需配置密钥」。
+  void settingsStore.ensureBasemapAvailability()
+
+  // 超时兜底：初始化卡住时也要给出可见提示，而不是一直"正在加载地图"
+  mapInitError.value = null
+  mapInitTechDetail.value = null
+  clearMapInitTimer()
+  mapInitTimer = globalThis.setTimeout(() => {
+    markMapInitFailed('地图加载超时（30 秒未完成），请检查网络或浏览器是否支持 WebGL2')
+  }, MAP_INIT_TIMEOUT_MS)
+
+  try {
+    const presentationModule = createMapStagePresentationModule({
+      getMapContainer: () => mapContainer.value,
+      getUsesLightNavigationTheme: () => stageAppearanceModel.value.usesLightNavigationTheme,
+      setLoadingLabel: (label) => {
+        loadingLabel.value = label
+      },
+      setMapVisible: (visible) => {
+        mapVisible.value = visible
+      },
+      setSkeletonVisible: (visible) => {
+        skeletonVisible.value = visible
+      },
+    })
+    state.resources.mapStagePresentationModule = presentationModule
+    await presentationModule.prepareMount()
+    if (_isUnmounted) return
+
+    const maplibregl = await import('maplibre-gl')
+    // Bundle the module worker and its imports. The library's relative default
+    // URL otherwise points to an absent file after Vite combines the main chunk.
+    maplibregl.setWorkerUrl(mapWorkerUrl)
+    if (_isUnmounted) return
+
+    boundedMapPanConstraint = createBoundedMapPanConstraint({
+      container: mapContainer.value,
+      getMap: () => state.resources.map,
+      createLngLat: (longitude, latitude) => new maplibregl.LngLat(longitude, latitude),
+    })
+    const mapInstance = new maplibregl.Map({
+      ...createMapCanvasMapOptions({
+        container: mapContainer.value,
+      }),
+      transformConstrain: props.globeProjection ? null : boundedMapPanConstraint,
+    })
+    installSafeMapStyleAccess(mapInstance)
+    state.resources.map = mapInstance
+    // 调试诊断口：浏览器控制台排查 globe/光照/图层状态用（perf-probe 惯例，只读引用）
+    if (typeof window !== 'undefined') {
+      ;(window as unknown as Record<string, unknown>).__cgdaMap = mapInstance
+    }
+    const moduleBundle = createMapCanvasModuleBundle({
+      map: mapInstance,
+      layersStore,
+      weatherTileManager,
+      getCurrentHour: () => props.currentHour,
+      getMapReady: () => isMapInteractive(),
+      getTileConfig: (sourceId) => TILE_SOURCE_MAP.get(sourceId),
+      getCurrentTileSourceId: () => props.tileSourceId,
+      setTileLoadFailed: (failed) => {
+        tileLoadFailed.value = failed
+      },
+      setTileFailedProvider: (provider) => {
+        tileFailedProvider.value = provider
+      },
+      setSourceTransitioning: (transitioning) => {
+        isSourceTransitioning.value = transitioning
+      },
+      onAfterSourceSwitch: () => {
+        presentationModule.scheduleNavigationThemeSync()
+      },
+      onProviderFailover: (nextSourceId, failedProvider) => {
+        // 同步单一真源：更新 store 选中态，让底图选择器 UI 与实际渲染一致
+        uiStore.setTileSource(nextSourceId)
+        const nextLabel = TILE_SOURCE_MAP.get(nextSourceId)?.label ?? nextSourceId
+        logStore.logOperation(
+          'basemap-failover',
+          `底图源「${failedProvider}」暂时不可用，已自动切换至「${nextLabel}」`,
+        )
+        showToast(`底图源「${failedProvider}」暂时不可用，已自动切换至「${nextLabel}」`, false)
+      },
+      getFailoverCandidates: (sourceId, excludeProviders) =>
+        getFailoverCandidates(sourceId, excludeProviders).filter((id) => {
+          const cfg = TILE_SOURCE_MAP.get(id)
+          return (
+            !!cfg && isTileSourceUsable(cfg, (key) => settingsStore.isBasemapApiKeyAvailable(key))
+          )
+        }),
+      setLoadingLabel: (label) => {
+        presentationModule.setLoadingLabel(label)
+      },
+      getSelectedLayer: () => selectedLayer.value,
+      getSelectedHotspotId: () => selectedHotspotId.value,
+      setSelectedHotspotId: (hotspotId) => {
+        selectedHotspotId.value = hotspotId
+      },
+      emitVisibleHotspotsChange: (hotspots) => emit('visibleHotspotsChange', hotspots),
+      emitHotspotSelect: (hotspot) => emit('hotspotSelect', hotspot),
+      setHotspotPins: (pins) => {
+        hotspotPins.value = pins
+      },
+      getInteractionMode: () => analysisDrawingActive ? 'draw' : uiStore.interactionMode,
+      setIsMapInteracting: (interacting) => {
+        isMapInteracting.value = interacting
+      },
+      scheduleHotspotSync: actionBridge.scheduleHotspotSync,
+      emitMapPointSelect: (point) => emit('mapPointSelect', point),
+      getHasAdminBoundary: () => hasAdminBoundary.value,
+      getAdminBoundaryOpacity: () => adminBoundaryOpacity.value,
+      syncAdminOverlay: actionBridge.syncAdminOverlay,
+      debugLog,
+      weatherDebounceMs: 350,
+      getMeasureState: () => uiStore.measureState,
+      addMeasurePoint: (p) => uiStore.addMeasurePoint(p),
+      undoLastMeasurePoint: () => uiStore.undoLastMeasurePoint(),
+      completeMeasure: () => uiStore.completeMeasure(),
+      setHoverPoint: (p) => uiStore.setHoverPoint(p),
+      clearMeasure: () => uiStore.clearMeasure(),
+      getDrawState: () => ({
+        drawMode: drawStore.drawMode,
+        features: drawStore.features,
+        activeVertices: drawStore.activeVertices,
+        isDrawing: drawStore.isDrawing,
+        hoverPoint: drawStore.hoverPoint,
+        selectedFeatureIndex: drawStore.selectedFeatureIndex,
+      }),
+      addDrawVertex: (v) => drawStore.addVertex(v),
+      undoDrawVertex: () => drawStore.undoLastVertex(),
+      setDrawHoverPoint: (p) => drawStore.setHoverPoint(p),
+      addDrawFeature: (f) => drawStore.addFeature(f),
+      clearDrawVertices: () => drawStore.clearActiveVertices(),
+      setDrawDrawingFlag: (v) => {
+        drawStore.isDrawing = v
+      },
+      scheduleDrawPersist: () => drawStore.scheduleDraftPersist(),
+      shouldSuppressImportedMapRender: (instanceId) =>
+        // 仅在「正在落点」时隐藏草稿层二次渲染；闭合后恢复可见，避免整面消失
+        uiStore.interactionMode === 'draw' &&
+        drawStore.isDrawing &&
+        (instanceId === drawStore.draftLayerId || instanceId === drawStore.editingLayerId),
+      getImportedMapSuppressKey: () =>
+        `${uiStore.interactionMode}:${drawStore.isDrawing ? 1 : 0}:${drawStore.draftLayerId ?? ''}:${drawStore.editingLayerId ?? ''}`,
+      // 闭合后 imported 已展示完成面：draw fill/line 省略，避免双路径叠色。
+      // 不限定 interactionMode：退出绘制态（草稿层仍在）时同样省略，防双渲染。
+      omitCompletedDrawFeatures: () =>
+        !drawStore.isDrawing && Boolean(drawStore.draftLayerId || drawStore.editingLayerId),
+    })
+    state.resources.basemapModule = moduleBundle.basemapModule
+    state.resources.adminBoundaryModule = moduleBundle.adminBoundaryModule
+    state.resources.weatherOverlayModule = moduleBundle.weatherOverlayModule
+    state.resources.nonWeatherLayerSyncModule = moduleBundle.nonWeatherLayerSyncModule
+    state.resources.hotspotPinsModule = moduleBundle.hotspotPinsModule
+    state.resources.mapInteractionModule = moduleBundle.mapInteractionModule
+    state.resources.mapCanvasRuntimeModule = moduleBundle.mapCanvasRuntimeModule
+    state.resources.selectedLayerFocusModule = moduleBundle.selectedLayerFocusModule
+    state.resources.measureModule = moduleBundle.measureModule
+    overlayImageModule = moduleBundle.nonWeatherLayerSyncModule.overlayImageModule
+    syncAnalysisCamera()
+    state.resources.drawModule = moduleBundle.drawModule
+    overlayImageModuleRef.value = moduleBundle.nonWeatherLayerSyncModule.overlayImageModule
+    moduleBundle.weatherOverlayModule.setupWatchers()
+    moduleBundle.nonWeatherLayerSyncModule.setupWatchers()
+    void moduleBundle.nonWeatherLayerSyncModule.init()
+    moduleBundle.mapInteractionModule.bindEvents()
+    moduleBundle.mapCanvasRuntimeModule.setupWatchers()
+    moduleBundle.selectedLayerFocusModule.setupWatchers()
+    moduleBundle.measureModule.bindEvents()
+    moduleBundle.drawModule.bindEvents()
+    watch(
+      dataWorkspaceHighlight,
+      (hl) => {
+        const mod = moduleBundle.nonWeatherLayerSyncModule.importedLayerModule
+        if (!hl) {
+          for (const id of mod.getLoadedIds()) mod.setFeatureHighlight(id, null)
+          return
+        }
+        for (const id of mod.getLoadedIds()) {
+          if (id !== hl.instanceId) mod.setFeatureHighlight(id, null)
+        }
+        mod.setFeatureHighlight(hl.instanceId, hl.feature)
+      },
+      { deep: false },
+    )
+
+    watch(
+      dataWorkspaceZoomRequest,
+      (req) => {
+        if (!req || !mapInstance) return
+        const [west, south, east, north] = req.bbox
+        mapInstance.fitBounds(
+          [
+            [west, south],
+            [east, north],
+          ],
+          { padding: 80, maxZoom: 14, duration: 600 },
+        )
+      },
+      { deep: false },
+    )
+
+    createMapCanvasLifecycleBinder({
+      map: mapInstance,
+      controls: {
+        NavigationControl: MapChromeNavigationControl,
+      },
+      onLocate: handleLocateMe,
+      onMapError: (event) => {
+        moduleBundle.basemapModule.handleMapErrorEvent(event)
+      },
+      onMapLoad: async () => {
+        moduleBundle.basemapModule.switchTileSource(props.tileSourceId)
+        await moduleBundle.adminBoundaryModule.ensureLayers()
+        // 全球陆地灰底衬（数据是全球栅格，缩到全球视野时底图为空白米色，需自铺一层灰）
+        await ensureWorldLandBase(mapInstance, shouldShowWorldLandBaseNow.value)
+        // 兜住时序：onMapLoad 时 tileSourceId / 视图可能还没定稿，若那一刻判定为"该隐藏"
+        // 就会把图层建成 visibility:none 且之后没人再纠正；若第一次因时序失败，这里重试一次
+        // （ensureWorldLandBase 幂等：已存在则只切显隐）。
+        setTimeout(() => {
+          if (_isUnmounted || !isMapStyleAlive(mapInstance)) return
+          void ensureWorldLandBase(mapInstance, shouldShowWorldLandBaseNow.value)
+        }, 600)
+        // 海陆底图叠加（默认关）：只在用户勾选时建/显，不勾就什么都不做
+        if (props.landSeaBasemap) {
+          await ensureLandSeaBase(mapInstance, true)
+        }
+        // 就绪即撤销初始化超时兜底（避免地图已好还被判超时）
+        clearMapInitTimer()
+        mapInitError.value = null
+        mapInitTechDetail.value = null
+        mapReady.value = true
+        actionBridge.syncAdminOverlay()
+        moduleBundle.selectedLayerFocusModule.handleMapLoad()
+        // 初始化 store 的地图视口，使首次工作流提交时能拿到正确中心点和 bbox
+        moduleBundle.mapInteractionModule.syncViewportToStore()
+        // 地图就绪后同步天气叠加层（之前 syncWeatherOverlay 在 mapReady=true 之前调用会被跳过）
+        moduleBundle.weatherOverlayModule.runSyncNow()
+        // 同样补同步导入层：mapReady 前 addVectorLayer 会 no-op
+        moduleBundle.nonWeatherLayerSyncModule.syncImportedLayers({ fitNew: true })
+        void moduleBundle.nonWeatherLayerSyncModule.syncOverlayLayers()
+        moduleBundle.mapInteractionModule.applyInteractionMode()
+        // 测量模式初始状态同步（mapInteractionModule 已处理 dragPan，measureModule 处理 doubleClickZoom/boxZoom + Canvas show）
+        moduleBundle.measureModule.applyMeasureMode()
+        // 绘制模式初始状态同步
+        moduleBundle.drawModule.applyDrawMode()
+        presentationModule.revealMap()
+      },
+      scheduleNavigationThemeSync: () => {
+        presentationModule.scheduleNavigationThemeSync()
+      },
+    }).bind()
+  } catch (err) {
+    console.error('[MapCanvas] initialization failed:', err)
+    logStore.logOperation('map-init-error', `地图初始化失败: ${err}`)
+    const detail = err instanceof Error ? err.message : String(err)
+    // 面板只给简洁中文；英文原始信息放「技术详情」折叠区（报告 优先4 后半）
+    markMapInitFailed('地图初始化失败：浏览器未能创建 WebGL2 画布或底图资源加载失败', detail)
+  }
+})
+
+onBeforeUnmount(() => {
+  // 切到 Cesium 前写入视口桥（仅 globe 3D）；须在 map.remove 之前、style 仍可用时
+  if (props.globeProjection) {
+    const map = state.resources.map
+    if (map && isMapStyleAlive(map)) {
+      try {
+        const c = map.getCenter()
+        const zoom = map.getZoom()
+        setGlobeViewSnapshot({
+          lng: c.lng,
+          lat: c.lat,
+          zoom,
+          heightMeters: zoomToHeightMeters(zoom, c.lat),
+          bearing: map.getBearing(),
+          pitch: map.getPitch(),
+        })
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  // 先掐断就绪态，避免 dispose / 异步 watcher 在 style 清空时继续 getLayer
+  _isUnmounted = true
+  clearMapInitTimer()
+  mapReady.value = false
+  cancelPendingNightMask()
+  unsubscribeMapChrome()
+  teardownBinder.dispose()
+  overlayImageModule = null
+  _clearLocationMarker()
+  _clearInspectMarker()
+  if (locateErrorTimer) {
+    clearTimeout(locateErrorTimer)
+    locateErrorTimer = null
+  }
+  window.removeEventListener('draw:save', handleDrawSave)
+  window.removeEventListener('draw:toggle-attr-table', handleToggleAttrTable)
+})
+
+// ── 绘制保存事件处理 ────────────────────────────────────────────────────
+
+const attrTableVisible = ref(false)
+const drawSave = useDrawSave()
+
+function handleToggleAttrTable() {
+  attrTableVisible.value = !attrTableVisible.value
+}
+
+async function handleDrawSave() {
+  const res = await drawSave.saveDrawLayer()
+  if (res.ok) {
+    logStore.logOperation(
+      'draw-save',
+      res.dropped ? '空图层已丢弃' : `绘制图层已保存 (${res.featureCount} 个要素)`,
+    )
+    return
+  }
+  if (res.validationErrors.length > 0) {
+    logStore.logOperation('draw-save-error', `校验未通过: ${res.validationErrors[0].message}`)
+    // 打开属性表展示校验错误，便于用户定位问题要素
+    if (!attrTableVisible.value) {
+      window.dispatchEvent(new CustomEvent('draw:toggle-attr-table'))
+    }
+    return
+  }
+  logStore.logOperation('draw-save-error', `保存失败: ${res.error ?? '未知错误'}`)
+  console.error('[draw] save failed:', res.error)
+}
+
+// 进入绘制模式时自动创建草稿图层；编辑已有图层或已有草稿则跳过
+watch(
+  () => uiStore.interactionMode,
+  (mode) => {
+    if (mode !== 'draw') return
+    if (drawStore.editingLayerId) return
+    const hasActiveDraft = drawStore.draftLayerId || drawStore.features.length > 0
+    if (hasActiveDraft) return
+    const name = drawStore.draftLayerName || `绘制图层-${new Date().toLocaleString('zh-CN')}`
+    const layer = layersStore.addDrawDraftLayer(name)
+    drawStore.beginDrawSession(name)
+    drawStore.setDraftLayerId(layer.instanceId)
+  },
+)
+
+// 孤儿草稿安全网：草稿/编辑图层在工作区被移除时，清空绘制 store，避免悬空状态
+watch(
+  () => layersStore.activeLayers.map((l) => l.instanceId),
+  (ids) => {
+    const draftId = drawStore.draftLayerId
+    const editingId = drawStore.editingLayerId
+    if ((draftId && !ids.includes(draftId)) || (editingId && !ids.includes(editingId))) {
+      drawStore.clearDraft()
+      if (uiStore.interactionMode === 'draw') {
+        void requestInteractionMode('move')
+      }
+    }
+  },
+)
+
+// L3：刷新后恢复未保存草稿 —— 重建草稿图层并回填要素
+{
+  const restored = drawStore.restoreDraft()
+  if (restored && drawStore.features.length > 0) {
+    const name = drawStore.draftLayerName || '恢复的绘制图层'
+    const layer = layersStore.addDrawDraftLayer(name)
+    drawStore.setDraftLayerId(layer.instanceId)
+    logStore.logOperation('draw-restore', `已恢复未保存草稿 (${drawStore.features.length} 个要素)`)
+  } else if (restored === false && drawStore.editingLayerId) {
+    // 编辑已有图层的草稿恢复暂不自动进入，等用户切到 draw 模式
+  }
+}
+
+window.addEventListener('draw:save', handleDrawSave)
+window.addEventListener('draw:toggle-attr-table', handleToggleAttrTable)
+
+// ── 自动定位 ──────────────────────────────────────────────────────────────
+const isLocating = ref(false)
+const locateError = ref<{ message: string; hint: string } | null>(null)
+let locationMarkerCleanup: (() => void) | null = null
+let locateErrorTimer: ReturnType<typeof setTimeout> | null = null
+
+function _showLocateError(message: string, hint: string) {
+  locateError.value = { message, hint }
+  if (locateErrorTimer) clearTimeout(locateErrorTimer)
+  locateErrorTimer = setTimeout(() => {
+    locateError.value = null
+  }, 6000)
+}
+
+function _clearLocationMarker() {
+  if (locationMarkerCleanup) {
+    locationMarkerCleanup()
+    locationMarkerCleanup = null
+  }
+}
+
+let inspectMarkerCleanup: (() => void) | null = null
+
+function _clearInspectMarker() {
+  if (inspectMarkerCleanup) {
+    inspectMarkerCleanup()
+    inspectMarkerCleanup = null
+  }
+}
+
+async function _syncInspectMarker(point: { lng: number; lat: number } | null | undefined) {
+  const mapInstance = state.resources.map
+  if (!mapInstance || !point) {
+    _clearInspectMarker()
+    return
+  }
+  _clearInspectMarker()
+  const maplibregl = await import('maplibre-gl')
+  if (_isUnmounted || !state.resources.map) return
+  const el = document.createElement('div')
+  el.className = 'inspect-point-marker'
+  el.innerHTML = '<div class="inspect-dot"></div>'
+  const marker = new maplibregl.Marker({ element: el })
+    .setLngLat([point.lng, point.lat])
+    .addTo(mapInstance)
+  inspectMarkerCleanup = () => marker.remove()
+}
+
+// inspectPoint 是 {lng, lat} 浅对象，用字符串键浅 watch 替代 deep watch
+watch(
+  () => (props.inspectPoint ? `${props.inspectPoint.lng},${props.inspectPoint.lat}` : null),
+  () => {
+    void _syncInspectMarker(props.inspectPoint)
+  },
+)
+
+async function handleLocateMe() {
+  if (isLocating.value) return
+
+  // 若当前地图上已有定位标记，二次点击则清除定位标
+  if (locationMarkerCleanup !== null) {
+    _clearLocationMarker()
+    logStore.logOperation('locate-me', '已清除地图定位标记')
+    return
+  }
+
+  locateError.value = null
+  if (!navigator.geolocation) {
+    _showLocateError('浏览器不支持地理定位', '请使用 Chrome、Edge 或 Firefox 等现代浏览器')
+    logStore.logOperation('locate-me', '定位失败：浏览器不支持地理定位')
+    return
+  }
+  isLocating.value = true
+  logStore.logOperation('locate-me', '正在获取当前位置…')
+
+  navigator.geolocation.getCurrentPosition(
+    async (position) => {
+      const { longitude, latitude } = position.coords
+      const mapInstance = state.resources.map
+      if (!mapInstance) {
+        isLocating.value = false
+        return
+      }
+
+      // 飞行到用户位置
+      mapInstance.flyTo({
+        center: [longitude, latitude],
+        zoom: Math.max(mapInstance.getZoom(), 12),
+        duration: isReducedMotionActive() ? 0 : 1500,
+        curve: 1.42,
+      })
+
+      // 添加定位标记 (持续保留在地图上，直至再次点击消除)
+      _clearLocationMarker()
+      const maplibregl = await import('maplibre-gl')
+      if (_isUnmounted || !state.resources.map) {
+        isLocating.value = false
+        return
+      }
+      const el = document.createElement('div')
+      el.className = 'geolocation-marker'
+      el.innerHTML = '<div class="geo-pulse"></div><div class="geo-dot"></div>'
+      const marker = new maplibregl.Marker({ element: el })
+        .setLngLat([longitude, latitude])
+        .addTo(state.resources.map)
+      locationMarkerCleanup = () => marker.remove()
+
+      isLocating.value = false
+      logStore.logOperation(
+        'locate-me',
+        `已定位到 (${longitude.toFixed(4)}, ${latitude.toFixed(4)})`,
+      )
+    },
+    (err) => {
+      isLocating.value = false
+      let message: string
+      let hint: string
+      switch (err.code) {
+        case 1:
+          message = '定位权限被拒绝'
+          hint = '请点击地址栏左侧的锁形图标，将位置权限改为"允许"后刷新页面'
+          break
+        case 2:
+          message = '位置不可用'
+          hint = '请检查网络连接，或确认系统定位服务（GPS/Wi-Fi）已开启'
+          break
+        case 3:
+          message = '定位超时'
+          hint = '请移动到开阔地带或检查网络后重试'
+          break
+        default:
+          message = `定位失败: ${err.message}`
+          hint = '请稍后重试，或检查浏览器定位设置'
+      }
+      _showLocateError(message, hint)
+      logStore.logOperation('locate-me', `${message}（${hint}）`)
+    },
+    { enableHighAccuracy: true, timeout: 10000, maximumAge: 30000 },
+  )
+}
+</script>
+
+<template>
+  <section
+    ref="mapStageRef"
+    class="map-stage"
+    :class="[
+      stageAppearanceModel.stageClassNames,
+      { 'map-stage--flat-land-sea': flatLandSeaBackgroundColor !== undefined },
+      { 'map-stage--globe-natural': globeProjectionOn && globeDaylightMode === 'natural' },
+    ]"
+    :style="mapStageStyleVars"
+  >
+    <!-- 3D globe 深空背景：太阳系（相机联动）或静态星图
+         suppress-galaxy：「自然/无」档隐藏银河白带（左上亮来源），「标准」档保留 -->
+    <GlobeSolarSystemBackdrop
+      v-if="solarSystemActive"
+      :active="solarSystemActive"
+      :hour="currentHour"
+      :current-date="currentDate"
+      :camera="solarCamera"
+    />
+    <GlobeStarfield
+      v-else
+      :mode="globeBackgroundMode === 'solar_system' ? 'starfield' : globeBackgroundMode"
+      :active="globeProjectionOn"
+      :suppress-galaxy="globeDaylightMode !== 'standard'"
+    />
+
+    <div ref="mapContainer" class="map-host" :class="stageAppearanceModel.mapHostClassNames"></div>
+
+    <!-- Skeleton -->
+    <div class="map-skeleton" :class="stageAppearanceModel.skeletonClassNames" aria-hidden="true">
+      <div class="skeleton-sweep"></div>
+      <div class="skeleton-node skeleton-node-a"></div>
+      <div class="skeleton-node skeleton-node-b"></div>
+      <div class="skeleton-strip skeleton-strip-a"></div>
+      <div class="skeleton-strip skeleton-strip-b"></div>
+    </div>
+
+    <!-- Atmosphere layers -->
+    <div class="map-fog"></div>
+    <div class="basemap-transition-mask"></div>
+    <!-- 3D globe 下不渲染屏幕空间时间铬层（昼夜统一由地理夜半球遮罩负责，
+         避免"两条晨昏线"；v-if 比 CSS display:none 可靠，不受缓存/级联影响） -->
+    <div v-if="!globeProjectionOn" class="time-sheen"></div>
+    <div v-if="!globeProjectionOn" class="time-band"></div>
+    <!-- weather/grid-overlay 的方向性光斑与网格是 2D 氛围层：
+         「自然/无」档隐藏（亮暗只由晨昏线/统一亮度负责），「标准」档保留质感 -->
+    <div
+      v-if="!globeProjectionOn || globeDaylightMode === 'standard'"
+      class="weather-overlay"
+    ></div>
+    <div v-if="!globeProjectionOn" class="grid-overlay"></div>
+
+    <!-- Loading indicator -->
+    <div v-if="stageStatusModel.showLoading && !mapInitError" class="map-loading">
+      <span class="loading-dot"></span>
+      <span>{{ stageStatusModel.loadingLabel }}</span>
+    </div>
+
+    <!-- Map init failed / timed out（失败态要说真话，并说明其它功能仍可用） -->
+    <div v-if="mapInitError" class="map-init-error" role="alert">
+      <span class="map-init-error-icon">
+        <svg
+          width="16"
+          height="16"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <circle cx="12" cy="12" r="10" />
+          <line x1="12" y1="8" x2="12" y2="12" />
+          <line x1="12" y1="16" x2="12.01" y2="16" />
+        </svg>
+      </span>
+      <span class="map-init-error-body">
+        <span class="map-init-error-title">{{ mapInitError }}</span>
+        <span class="map-init-error-hint">
+          图层面板、数据查询等功能不受影响；若反复失败，请刷新页面或更换支持 WebGL2 的浏览器。
+        </span>
+        <!-- 原始英文异常信息折叠收好：需要排查时再展开，平时不糊用户一脸 -->
+        <details v-if="mapInitTechDetail" class="map-init-error-tech">
+          <summary>技术详情</summary>
+          <pre>{{ mapInitTechDetail }}</pre>
+        </details>
+      </span>
+      <button class="map-init-retry-btn" @click="handleReloadForMapInit">刷新页面</button>
+    </div>
+
+    <!-- Tile error banner -->
+    <div v-if="stageStatusModel.showTileError" class="tile-load-error">
+      <span class="tile-error-icon">
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <circle cx="12" cy="12" r="10" />
+          <line x1="12" y1="8" x2="12" y2="12" />
+          <line x1="12" y1="16" x2="12.01" y2="16" />
+        </svg>
+      </span>
+      <span>{{ stageStatusModel.tileErrorMessage }}</span>
+      <button class="tile-retry-btn" @click="actionBridge.retryTileLoad">
+        {{ stageStatusModel.retryButtonLabel }}
+      </button>
+    </div>
+
+    <!-- Weather tile loading indicator -->
+    <div
+      v-if="weatherTileStatusModel.show && weatherTileStatusModel.isLoading"
+      class="weather-loading"
+    >
+      <span class="weather-loading-dot"></span>
+      <span>正在加载天气数据…</span>
+    </div>
+
+    <!-- Weather tile partial coverage (holes being refilled) -->
+    <div
+      v-if="weatherTileStatusModel.show && weatherTileStatusModel.partial"
+      class="weather-load-partial"
+    >
+      <span class="weather-loading-dot"></span>
+      <span>{{ weatherTileStatusModel.partial }}</span>
+    </div>
+
+    <!-- Weather tile error banner -->
+    <div
+      v-if="weatherTileStatusModel.show && weatherTileStatusModel.error"
+      class="weather-load-error"
+    >
+      <span class="weather-error-icon">
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <path
+            d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"
+          />
+          <line x1="12" y1="9" x2="12" y2="13" />
+          <line x1="12" y1="17" x2="12.01" y2="17" />
+        </svg>
+      </span>
+      <span>{{ weatherTileStatusModel.error }}</span>
+    </div>
+
+    <!-- Layer info card removed: progress/status shown in layer sidebar + workflow panel -->
+
+    <!-- 绘制工具栏 -->
+    <DrawToolbar />
+
+    <!-- 分区统计卡片 -->
+    <ZonalStatsCard />
+
+    <!-- 矢量属性表 -->
+    <VectorAttributeTable v-if="attrTableVisible" @close="attrTableVisible = false" />
+
+    <!-- Hotspot pins -->
+    <div class="hotspot-layer" :class="stageDisplayModel.hotspotLayerClass" aria-hidden="true">
+      <button
+        v-for="pin in hotspotPins"
+        :key="pin.id"
+        class="hotspot-pin"
+        :class="{ selected: pin.selected }"
+        :style="{ left: pin.left, top: pin.top }"
+        type="button"
+        @click="actionBridge.handleHotspotPinClick(pin.id)"
+      >
+        <div class="hotspot-core"></div>
+        <div class="hotspot-label">
+          <strong>{{ pin.name }}</strong>
+          <span>{{ pin.value }}</span>
+        </div>
+      </button>
+    </div>
+
+    <!-- 定位失败提示 -->
+    <Transition name="cgda-pop">
+      <div v-if="locateError" class="locate-error-tip">
+        <span class="locate-error-icon"><AlertTriangle :size="14" aria-hidden="true" /></span>
+        <div class="locate-error-body">
+          <p class="locate-error-msg">{{ locateError.message }}</p>
+          <p class="locate-error-hint">{{ locateError.hint }}</p>
+        </div>
+        <button
+          class="locate-error-close"
+          aria-label="关闭定位错误提示"
+          @click="locateError = null"
+        >
+          ×
+        </button>
+      </div>
+    </Transition>
+  </section>
+</template>
+
+<style scoped src="./MapCanvas.styles.css" />

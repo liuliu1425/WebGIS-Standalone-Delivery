@@ -1,0 +1,29 @@
+{
+  "_readme": "机构模板示例：路径仅示意本实验室 I: 布局。他机构请复制为本机 BACKEND_DOWNLOAD_SOURCE_URI_MAP 指向文件，并将 file:///I:/Geograph_DataSet 替换为实际 BACKEND_DATA_ROOT（或 HTTP/S3 URI）。勿在生产照抄本文件。",
+  "wind-field": "file:///I:/Geograph_DataSet/Meteorological/Weather/WindField/10m/{hour}.json",
+  "wind-field-80m": "file:///I:/Geograph_DataSet/Meteorological/Weather/WindField/80m/{hour}.json",
+  "wind-field-120m": "file:///I:/Geograph_DataSet/Meteorological/Weather/WindField/120m/{hour}.json",
+  "wind-field-180m": "file:///I:/Geograph_DataSet/Meteorological/Weather/WindField/180m/{hour}.json",
+  "wind-field-850hPa": "file:///I:/Geograph_DataSet/Meteorological/Weather/WindField/850hPa/{hour}.json",
+  "wind-field-500hPa": "file:///I:/Geograph_DataSet/Meteorological/Weather/WindField/500hPa/{hour}.json",
+  "wind-field-200hPa": "file:///I:/Geograph_DataSet/Meteorological/Weather/WindField/200hPa/{hour}.json",
+
+  "precipitation": "file:///I:/Geograph_DataSet/Meteorological/Precipitation/{hour}.tif",
+  "temperature": "file:///I:/Geograph_DataSet/Meteorological/Weather/Temperature/{hour}.json",
+  "temperature-80m": "file:///I:/Geograph_DataSet/Meteorological/Weather/Temperature/80m/{hour}.json",
+  "temperature-120m": "file:///I:/Geograph_DataSet/Meteorological/Weather/Temperature/120m/{hour}.json",
+  "temperature-180m": "file:///I:/Geograph_DataSet/Meteorological/Weather/Temperature/180m/{hour}.json",
+
+  "pressure": "file:///I:/Geograph_DataSet/Meteorological/Weather/Pressure/{hour}.json",
+  "humidity": "file:///I:/Geograph_DataSet/Meteorological/Weather/Humidity/{hour}.json",
+  "visibility": "file:///I:/Geograph_DataSet/Meteorological/Weather/Visibility/{hour}.json",
+
+  "ndvi": "file:///I:/Geograph_DataSet/Ecological_Vegetation/NDVI/{layer_id}.tif",
+  "remote-sensing": "file:///I:/Geograph_DataSet/Ecological_Vegetation/Remote_Sensing/{layer_id}.tif",
+
+  "ref-fy-tb-202512-mwri": "file:///I:/Geograph_DataSet/Soil_Moisture/FY_MWRI/{layer_id}.tif",
+  "obs-station-sm-daily": "file:///I:/Geograph_DataSet/Station_Observation/{layer_id}.json",
+  "inversion-daily": "file:///I:/Geograph_DataSet/Inversion_Results/{hour}.json",
+  "block-inversion": "file:///I:/Geograph_DataSet/Inversion_Results/block_inversion/{layer_id}.json",
+  "omega-block": "file:///I:/Geograph_DataSet/Inversion_Results/omega_block/{layer_id}.json"
+}

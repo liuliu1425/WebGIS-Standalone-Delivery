@@ -1,0 +1,397 @@
+"""Short agent chat session history (per user / anon)."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import threading
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from app.core import config as app_config
+from app.services.agent.file_lock import interprocess_file_lock
+
+logger = logging.getLogger(__name__)
+
+_MAX_TURNS = 12
+_lock = threading.Lock()
+_SAFE_SESSION = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+# Session retention / quota (Phase 0 / M-2).
+_SESSION_TTL_HOURS = max(1, int(os.getenv("BACKEND_AGENT_SESSION_TTL_HOURS", "24")))
+_MAX_SESSIONS_PER_USER = max(
+    1, int(os.getenv("BACKEND_AGENT_MAX_SESSIONS_PER_USER", "40"))
+)
+
+
+def _sessions_root() -> Path:
+    s = app_config.settings
+    # Runtime writes must honor an explicitly isolated deployment root.
+    explicit = os.getenv("BACKEND_RUNTIME_ROOT", "").strip()
+    root = (Path(explicit) if explicit else
+            Path(s.data_root or s.workflow_state_dir or ".") / "_runtime")
+    path = root / "agent" / "sessions"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _session_path(user_key: str, session_id: str) -> Path:
+    if not _SAFE_SESSION.match(session_id):
+        raise ValueError("无效的 session_id")
+    safe_user = re.sub(r"[^A-Za-z0-9_-]", "_", user_key)[:64] or "anon"
+    folder = _sessions_root() / safe_user
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"{session_id}.json"
+
+
+def _parse_updated_at(raw: Any) -> datetime | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+def _is_expired(updated_at: datetime | None, *, now: datetime | None = None) -> bool:
+    if updated_at is None:
+        # Legacy files without timestamp: treat as expired so they get rewritten or dropped.
+        return True
+    ref = now or datetime.now(UTC)
+    return updated_at + timedelta(hours=_SESSION_TTL_HOURS) < ref
+
+
+def _user_session_dir(user_key: str) -> Path:
+    safe_user = re.sub(r"[^A-Za-z0-9_-]", "_", user_key)[:64] or "anon"
+    folder = _sessions_root() / safe_user
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def _enforce_session_quota(user_key: str, *, keep_path: Path | None = None) -> None:
+    """Drop oldest sessions when over per-user cap (by mtime / updated_at)."""
+    folder = _user_session_dir(user_key)
+    files = [p for p in folder.glob("*.json") if p.is_file()]
+    if keep_path is not None and keep_path not in files and keep_path.exists():
+        files.append(keep_path)
+    if len(files) <= _MAX_SESSIONS_PER_USER:
+        return
+
+    def _sort_key(p: Path) -> float:
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            ts = _parse_updated_at(
+                data.get("updated_at") if isinstance(data, dict) else None
+            )
+            if ts is not None:
+                return ts.timestamp()
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    files.sort(key=_sort_key)
+    overflow = len(files) - _MAX_SESSIONS_PER_USER
+    for victim in files[:overflow]:
+        if keep_path is not None and victim.resolve() == keep_path.resolve():
+            continue
+        try:
+            victim.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Failed to prune agent session %s: %s", victim, exc)
+
+
+def purge_expired_sessions(*, user_id: int | None = None) -> int:
+    """Delete expired session files. If user_id set, only that bucket; else all."""
+    removed = 0
+    now = datetime.now(UTC)
+    root = _sessions_root()
+    if user_id is not None:
+        dirs = [_user_session_dir(str(user_id))]
+    else:
+        dirs = [p for p in root.iterdir() if p.is_dir()] if root.exists() else []
+    with _lock:
+        for folder in dirs:
+            for path in folder.glob("*.json"):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    try:
+                        path.unlink(missing_ok=True)
+                        removed += 1
+                    except OSError:
+                        pass
+                    continue
+                updated = (
+                    _parse_updated_at(data.get("updated_at"))
+                    if isinstance(data, dict)
+                    else None
+                )
+                # Prefer file mtime when legacy missing updated_at
+                if updated is None:
+                    try:
+                        updated = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+                    except OSError:
+                        updated = None
+                if _is_expired(updated, now=now):
+                    try:
+                        path.unlink(missing_ok=True)
+                        removed += 1
+                    except OSError as exc:
+                        logger.warning(
+                            "Failed to delete expired session %s: %s", path, exc
+                        )
+    return removed
+
+
+def load_history(*, user_id: int | None, session_id: str) -> list[dict[str, str]]:
+    user_key = str(user_id) if user_id is not None else "anon"
+    path = _session_path(user_key, session_id)
+    with _lock:
+        with interprocess_file_lock(path, label="Agent 会话"):
+            if not path.exists():
+                return []
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return []
+            if not isinstance(data, dict):
+                return []
+            updated = _parse_updated_at(data.get("updated_at"))
+            if updated is None:
+                try:
+                    updated = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+                except OSError:
+                    updated = None
+            if _is_expired(updated):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return []
+            messages = data.get("messages")
+    if not isinstance(messages, list):
+        return []
+    out: list[dict[str, str]] = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "")
+        content = str(m.get("content") or "")
+        if role in {"user", "assistant"} and content:
+            out.append({"role": role, "content": content})
+    return out[-_MAX_TURNS:]
+
+
+def load_topic_state(*, user_id: int | None, session_id: str) -> dict[str, str]:
+    """读取该会话「已确认的取数对象」（图层/变量/区域/日期）。
+
+    与消息同一个文件（``state`` 键），因此共用 TTL 与配额；文件缺失、过期、
+    内容非法一律返回空 dict —— 调用方按「没有历史」处理，不要凭空补默认值。
+    """
+    from app.services.agent import dialogue_state
+
+    user_key = str(user_id) if user_id is not None else "anon"
+    try:
+        path = _session_path(user_key, session_id)
+    except ValueError:
+        return {}
+    with _lock:
+        with interprocess_file_lock(path, label="Agent 会话"):
+            if not path.exists():
+                return {}
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return {}
+            if not isinstance(data, dict):
+                return {}
+            updated = _parse_updated_at(data.get("updated_at"))
+            if updated is None:
+                try:
+                    updated = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+                except OSError:
+                    updated = None
+            if _is_expired(updated):
+                return {}
+            return dialogue_state.sanitize(data.get("state"))
+
+
+def append_turn(
+    *,
+    user_id: int | None,
+    session_id: str,
+    user_message: str,
+    assistant_message: str,
+    state: dict[str, Any] | None = None,
+) -> None:
+    """追加一轮问答；``state`` 非空时一并写入本会话的取数对象。"""
+    user_key = str(user_id) if user_id is not None else "anon"
+    path = _session_path(user_key, session_id)
+    now = datetime.now(UTC)
+    with _lock:
+        with interprocess_file_lock(path, label="Agent 会话"):
+            history: list[Any] = []
+            previous_state: Any = None
+            if path.exists():
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(data, dict) and isinstance(
+                        data.get("messages"), list
+                    ):
+                        updated = _parse_updated_at(data.get("updated_at"))
+                        if updated is None:
+                            try:
+                                updated = datetime.fromtimestamp(
+                                    path.stat().st_mtime, tz=UTC
+                                )
+                            except OSError:
+                                updated = None
+                        if not _is_expired(updated, now=now):
+                            history = list(data["messages"])
+                            # 过期会话不继承旧对象，否则「上次聊的是哪层」会跨天残留
+                            previous_state = data.get("state")
+                except (OSError, json.JSONDecodeError):
+                    history = []
+            history.append({"role": "user", "content": user_message})
+            history.append({"role": "assistant", "content": assistant_message})
+            # Keep last N *pairs* ≈ 2N messages
+            history = history[-(_MAX_TURNS * 2) :]
+            payload = {
+                "messages": history,
+                "updated_at": now.isoformat(),
+            }
+            from app.services.agent import dialogue_state
+
+            saved_state = dialogue_state.sanitize(
+                state if state is not None else previous_state
+            )
+            if saved_state:
+                payload["state"] = saved_state
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(path)
+            _enforce_session_quota(user_key, keep_path=path)
+
+
+def list_sessions(*, user_id: int | None, limit: int = 40) -> list[dict[str, Any]]:
+    """List non-expired sessions for a user (newest first).
+
+    Fail-closed: anonymous / missing user_id yields an empty list (no shared anon bucket listing).
+    """
+    if user_id is None:
+        return []
+    user_key = str(user_id)
+    folder = _user_session_dir(user_key)
+    now = datetime.now(UTC)
+    limit = max(1, min(100, int(limit)))
+    items: list[dict[str, Any]] = []
+    with _lock:
+        for path in folder.glob("*.json"):
+            if not path.is_file():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            updated = _parse_updated_at(data.get("updated_at"))
+            if updated is None:
+                try:
+                    updated = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+                except OSError:
+                    continue
+            if _is_expired(updated, now=now):
+                continue
+            sid = path.stem
+            if not _SAFE_SESSION.match(sid):
+                continue
+            messages = (
+                data.get("messages") if isinstance(data.get("messages"), list) else []
+            )
+            preview = ""
+            for m in reversed(messages):
+                if isinstance(m, dict) and str(m.get("role")) == "user":
+                    preview = str(m.get("content") or "").strip()[:80]
+                    if preview:
+                        break
+            items.append(
+                {
+                    "session_id": sid,
+                    "updated_at": updated.isoformat(),
+                    "preview": preview,
+                    "message_count": len(messages),
+                }
+            )
+    items.sort(key=lambda x: str(x.get("updated_at") or ""), reverse=True)
+    return items[:limit]
+
+
+def get_session_messages(
+    *, user_id: int | None, session_id: str
+) -> dict[str, Any] | None:
+    """Return session payload or None if missing/expired/unauthorized/invalid id.
+
+    Fail-closed for anonymous callers (no shared anon bucket reads).
+    """
+    if user_id is None:
+        return None
+    try:
+        history = load_history(user_id=user_id, session_id=session_id)
+    except ValueError:
+        return None
+    user_key = str(user_id)
+    try:
+        path = _session_path(user_key, session_id)
+    except ValueError:
+        return None
+    if not history and not path.exists():
+        return None
+    updated_at = ""
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                updated_at = str(data.get("updated_at") or "")
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {
+        "session_id": session_id,
+        "updated_at": updated_at,
+        "messages": history,
+    }
+
+
+def delete_session(*, user_id: int | None, session_id: str) -> bool:
+    """Delete one session file. Returns True if removed or already gone.
+
+    Anonymous callers cannot delete (fail-closed).
+    """
+    if user_id is None:
+        return False
+    user_key = str(user_id)
+    try:
+        path = _session_path(user_key, session_id)
+    except ValueError:
+        return False
+    with _lock:
+        if not path.exists():
+            return True
+        try:
+            path.unlink(missing_ok=True)
+            return True
+        except OSError as exc:
+            logger.warning("Failed to delete agent session %s: %s", path, exc)
+            return False

@@ -1,0 +1,1877 @@
+<script setup lang="ts">
+/**
+ * WorkflowEditorPanel.vue
+ *
+ * 工作流编辑器主面板（精简版）：
+ *   ┌──────────┬───────────────────────────┬──────────┐
+ *   │ 工作流    │                           │  节点库   │
+ *   │ 列表     │       LiteGraph 画布        │          │
+ *   │          │                           ├──────────┤
+ *   │          │                           │  属性     │
+ *   │          │                           │  检查器   │
+ *   └──────────┴───────────────────────────┴──────────┘
+ *
+ * 左右面板已拆分为 WorkflowLeftSidebar / WorkflowRightSidebar 独立组件。
+ * 顶部工具栏：保存 / 排列 / 适配视图 / 清空 / 运行
+ */
+import { onMounted, onBeforeUnmount, ref, shallowRef, computed, nextTick, toRef } from 'vue'
+import {
+  Hexagon,
+  Settings,
+  LayoutGrid,
+  Square,
+  Ban,
+  ChevronDown,
+  ChevronUp,
+  AlarmClock,
+  Trash2,
+  LoaderCircle,
+  Save,
+  AlertTriangle,
+  AlertCircle,
+  Check,
+  Rocket,
+  Play,
+  X,
+} from '../ui/icons'
+
+import { useWorkflowDefinitionsStore } from '../../stores/workflow-definitions'
+import { useUiLoadingStore } from '../../stores/ui-loading'
+import { useLogStore } from '../../stores/log'
+
+import WorkflowCanvas from './WorkflowCanvas.vue'
+import WorkflowLeftSidebar from './WorkflowLeftSidebar.vue'
+import WorkflowRightSidebar from './WorkflowRightSidebar.vue'
+import WorkflowRunDialog, { type WorkflowRunTarget } from './WorkflowRunDialog.vue'
+import WorkflowTimerPanel from './WorkflowTimerPanel.vue'
+import PipelineLauncher from './PipelineLauncher.vue'
+import NodeCacheDialog from './NodeCacheDialog.vue'
+import AppSelect from '../ui/AppSelect.vue'
+import { useUnsavedChangesGuard } from '../../composables/useUnsavedChangesGuard'
+import { WORKFLOW_COPY } from '../../ui-copy'
+import {
+  validateWorkflowBeforeRun,
+  formatValidationSummary,
+  groupIssuesByNode,
+  type ValidationResult,
+  type ValidationIssue,
+} from '../../composables/workflow-validator'
+import { applyPipelineParamsToGraph } from '../../composables/workflow-pipeline-params'
+
+import type { LGraphNodeClass } from './litegraph-setup'
+import type {
+  NodeTemplate,
+  WorkflowDefinitionNode,
+  WorkflowDefinitionLink,
+} from '../../services/workflow-definition-api'
+
+const emit = defineEmits<{
+  close: []
+  run: [
+    workflowId: string,
+    linkedLayerId: string | null,
+    target: WorkflowRunTarget,
+    canvasGraph?: { nodes: WorkflowDefinitionNode[]; links: WorkflowDefinitionLink[] } | null,
+  ]
+}>()
+
+const store = useWorkflowDefinitionsStore()
+const nodeTemplates = toRef(store, 'nodeTemplates')
+const currentDefinition = toRef(store, 'currentDefinition')
+const isReadonly = toRef(store, 'isReadonly')
+const error = toRef(store, 'error')
+const logStore = useLogStore()
+
+// 选中节点状态
+const selectedNode = shallowRef<LGraphNodeClass | null>(null)
+
+// 画布组件引用
+const canvasRef = ref<InstanceType<typeof WorkflowCanvas> | null>(null)
+
+/** 流配置内视图：画布 | 定时器 */
+const editorView = ref<'canvas' | 'timers'>('canvas')
+
+// 节点缓存管理对话框
+const nodeCacheDialogOpen = ref(false)
+
+// 保存状态
+const saving = ref(false)
+const saveError = ref<string | null>(null)
+const dirty = ref(false)
+
+// 是否存在当前工作流定义（须在 useUnsavedChangesGuard 之前声明，避免 TDZ）
+const hasDefinition = computed(() => currentDefinition.value !== null)
+
+// 未保存修改的页面离开拦截（有定义、非只读、dirty、非保存中——与保存按钮可用条件一致）
+useUnsavedChangesGuard(
+  () => hasDefinition.value && !isReadonly.value && dirty.value && !saving.value,
+)
+
+// 运行状态
+const running = ref(false)
+const runStatus = ref<'idle' | 'submitting' | 'submitted' | 'error'>('idle')
+// 运行按钮状态恢复定时器（组件销毁时需清理，避免修改已卸载组件的 ref）
+let _runStatusTimer2: ReturnType<typeof setTimeout> | null = null
+
+// 运行对话框
+const showRunDialog = ref(false)
+
+// 流水线启动器对话框
+const showPipelineLauncher = ref(false)
+
+// 流水线启动时待注入的 algorithm_params（由 PipelineLauncher 传入）
+const pendingPipelineParams = ref<Record<string, unknown> | null>(null)
+
+// 左右面板收起状态
+const leftSidebarCollapsed = ref(false)
+const rightSidebarCollapsed = ref(false)
+
+// 导入导出
+const fileInputRef = ref<HTMLInputElement | null>(null)
+
+// 新建对话框
+const showCreateDialog = ref(false)
+const newWorkflowId = ref('')
+const newWorkflowName = ref('')
+const newWorkflowDescription = ref('')
+const newWorkflowEngine = ref<'general' | 'weather' | 'python_provider' | 'gee'>('general')
+
+// 当前画布数据（未保存的修改）
+const currentGraphData = ref<{
+  nodes: WorkflowDefinitionNode[]
+  links: WorkflowDefinitionLink[]
+} | null>(null)
+
+// 校验状态
+const validationResult = ref<ValidationResult | null>(null)
+const showValidationPanel = ref(false)
+
+/** 画布序列化优先；LiteGraph 尚未刷入时回退到已加载的定义节点（避免流水线启动误报「画布为空」） */
+function resolveGraphForRun(): {
+  nodes: WorkflowDefinitionNode[]
+  links: WorkflowDefinitionLink[]
+} | null {
+  const fromCanvas = canvasRef.value?.getSerializedGraph() ?? null
+  if (fromCanvas?.nodes?.length) return fromCanvas
+  if (currentGraphData.value?.nodes?.length) return currentGraphData.value
+  const def = currentDefinition.value
+  if (def?.nodes?.length) {
+    return {
+      nodes: def.nodes as WorkflowDefinitionNode[],
+      links: (def.links ?? []) as WorkflowDefinitionLink[],
+    }
+  }
+  return fromCanvas ?? currentGraphData.value ?? null
+}
+
+/** 执行校验并更新状态（流水线启动时先注入日期等到图上再校验） */
+function runValidation(): ValidationResult {
+  let graphData = resolveGraphForRun()
+  if (pendingPipelineParams.value && graphData) {
+    graphData = applyPipelineParamsToGraph(graphData, pendingPipelineParams.value)
+  }
+  const result = validateWorkflowBeforeRun(graphData, nodeTemplates.value)
+  validationResult.value = result
+  return result
+}
+
+/** 按节点分组的校验问题（供 Inspector 使用） */
+const issuesByNode = computed(() => {
+  if (!validationResult.value) return new Map<number, ValidationIssue[]>()
+  return groupIssuesByNode(validationResult.value.issues)
+})
+
+/** 当前选中节点的校验问题 */
+const selectedNodeIssues = computed<ValidationIssue[]>(() => {
+  if (!selectedNode.value || !validationResult.value) return []
+  return issuesByNode.value.get(selectedNode.value.id) ?? []
+})
+
+const canSave = computed(
+  () => hasDefinition.value && !isReadonly.value && dirty.value && !saving.value,
+)
+const canRun = computed(() => hasDefinition.value && !running.value)
+const currentEngine = computed(() => currentDefinition.value?._meta?.engine ?? 'general')
+const currentLinkedLayerId = computed(() => currentDefinition.value?._meta?.linked_layer_id ?? null)
+const headerWorkflowLabel = computed(() => {
+  if (!currentDefinition.value) return ''
+  const name = currentDefinition.value.name
+  return dirty.value ? `${name} *` : name
+})
+
+// ─── 工作流属性编辑（名称/描述） ────────────────────────────────────────────
+const showPropsDialog = ref(false)
+const editName = ref('')
+const editDescription = ref('')
+
+function openPropsDialog() {
+  if (!currentDefinition.value) return
+  editName.value = currentDefinition.value.name
+  editDescription.value = currentDefinition.value.description ?? ''
+  showPropsDialog.value = true
+}
+
+async function saveProps() {
+  if (!currentDefinition.value || !editName.value.trim() || isReadonly.value) return
+  try {
+    await store.updateCurrent({
+      name: editName.value.trim(),
+      description: editDescription.value.trim() || undefined,
+    })
+    showPropsDialog.value = false
+  } catch (error) {
+    // store 自管错误态（error ref），对话框保持打开让用户修正
+    void error
+  }
+}
+
+// ─── 生命周期 ───────────────────────────────────────────────────────────────
+
+onMounted(async () => {
+  const loading = useUiLoadingStore()
+  // 编辑器壳已挂上：立刻关全局 loading，列表/模板在面板内继续加载
+  loading.hideImmediate()
+  try {
+    await Promise.all([store.loadNodeTemplates(), store.loadSummaries()])
+  } catch {
+    /* store 自管错误态 */
+  }
+})
+
+onBeforeUnmount(() => {
+  // 先清 LiteGraph 浮动输入框，再卸面板（避免未保存关闭时泄漏到主地图）
+  try {
+    ;(
+      canvasRef.value as { disposeLiteGraphFloatingUi?: () => void } | null
+    )?.disposeLiteGraphFloatingUi?.()
+  } catch {
+    /* ignore */
+  }
+  clearRunStatusTimers()
+})
+
+// ─── 事件处理 ───────────────────────────────────────────────────────────────
+
+// 工作流选择序列号：防止快速切换时旧请求覆盖新请求
+let _selectSeq = 0
+
+async function handleSelectWorkflow(workflowId: string) {
+  const seq = ++_selectSeq
+  selectedNode.value = null
+  dirty.value = false
+  saveError.value = null
+  const def = await store.loadDefinition(workflowId)
+  if (seq !== _selectSeq) return // 已有更新的选择请求
+  if (def?.nodes?.length) {
+    currentGraphData.value = {
+      nodes: def.nodes as WorkflowDefinitionNode[],
+      links: (def.links ?? []) as WorkflowDefinitionLink[],
+    }
+  } else {
+    currentGraphData.value = null
+  }
+  logStore.logOperation('workflow-select', `选中工作流: ${workflowId}`)
+}
+
+function handleCreateWorkflow() {
+  showCreateDialog.value = true
+  newWorkflowId.value = `user_${Date.now()}`
+  newWorkflowName.value = ''
+  newWorkflowDescription.value = ''
+  newWorkflowEngine.value = 'general'
+}
+
+async function confirmCreateWorkflow() {
+  if (!newWorkflowId.value.trim() || !newWorkflowName.value.trim()) return
+  try {
+    const created = await store.createNew({
+      workflow_id: newWorkflowId.value.trim(),
+      name: newWorkflowName.value.trim(),
+      description: newWorkflowDescription.value.trim() || undefined,
+      engine: newWorkflowEngine.value,
+      nodes: [],
+      links: [],
+    })
+    showCreateDialog.value = false
+    logStore.logOperation('workflow-create', `创建工作流: ${created.workflow_id}`)
+    // 自动选中新建的工作流
+    await store.loadDefinition(created.workflow_id)
+  } catch (err) {
+    console.error('[WorkflowEditorPanel] Failed to create workflow:', err)
+    saveError.value = err instanceof Error ? err.message : String(err)
+  }
+}
+
+function cancelCreateWorkflow() {
+  showCreateDialog.value = false
+}
+
+function handleGraphChange(payload: {
+  nodes: WorkflowDefinitionNode[]
+  links: WorkflowDefinitionLink[]
+}) {
+  currentGraphData.value = payload
+  if (!isReadonly.value) {
+    dirty.value = true
+  }
+}
+
+function handleNodeSelect(node: LGraphNodeClass | null) {
+  selectedNode.value = node
+}
+
+function handleAddNode(template: NodeTemplate) {
+  if (!hasDefinition.value || isReadonly.value || !canvasRef.value) return
+  const node = canvasRef.value.addNodeByType(template.type)
+  if (node) {
+    dirty.value = true
+    logStore.logOperation('workflow-add-node', `添加节点: ${template.type}`)
+  }
+}
+
+function handleUpdateProperty(key: string, value: unknown) {
+  if (!selectedNode.value || isReadonly.value) return
+  selectedNode.value.setProperty(key, value)
+  dirty.value = true
+}
+
+function handleUpdateTitle(title: string) {
+  if (!selectedNode.value || isReadonly.value) return
+  selectedNode.value.title = title
+  dirty.value = true
+}
+
+async function handleSave() {
+  if (!canSave.value || !currentDefinition.value) return
+  saving.value = true
+  saveError.value = null
+  try {
+    const payload = currentGraphData.value ?? {
+      nodes: currentDefinition.value.nodes,
+      links: currentDefinition.value.links,
+    }
+    await store.updateCurrent({
+      name: currentDefinition.value.name,
+      description: currentDefinition.value.description ?? undefined,
+      nodes: payload.nodes,
+      links: payload.links,
+    })
+    dirty.value = false
+    logStore.logOperation('workflow-save', `保存工作流: ${currentDefinition.value.workflow_id}`)
+  } catch (err) {
+    console.error('[WorkflowEditorPanel] Failed to save workflow:', err)
+    saveError.value = err instanceof Error ? err.message : String(err)
+  } finally {
+    saving.value = false
+  }
+}
+
+function handleArrange() {
+  canvasRef.value?.arrangeNodes()
+}
+
+function handleFitView() {
+  canvasRef.value?.fitView()
+}
+
+function handleClear() {
+  if (!hasDefinition.value || isReadonly.value) return
+  if (!confirm('确定要清空当前画布吗？所有节点和连线将被移除。')) return
+  canvasRef.value?.clearGraph()
+  dirty.value = true
+}
+
+function handleRun() {
+  if (!currentDefinition.value || running.value) return
+  saveError.value = null
+
+  // 运行前参数校验
+  const result = runValidation()
+  if (result.hasErrors) {
+    showValidationPanel.value = true
+    return
+  }
+  // 有警告但无错误时仍打开运行对话框，但显示警告
+  // 未关联图层时仍打开对话框，由用户点选图层后运行
+  showRunDialog.value = true
+}
+
+function proceedAfterValidation() {
+  showValidationPanel.value = false
+  showRunDialog.value = true
+}
+
+async function handleRunConfirm(target: WorkflowRunTarget) {
+  if (!currentDefinition.value) return
+  clearRunStatusTimers()
+  const linkedLayerId = target.layerId ?? currentDefinition.value._meta?.linked_layer_id ?? null
+  if (!linkedLayerId) {
+    saveError.value = '请先选择关联图层后再运行'
+    runStatus.value = 'error'
+    return
+  }
+  showRunDialog.value = false
+
+  // 有未保存修改时先自动保存，避免运行的是陈旧定义（只读系统流跳过）
+  if (dirty.value && !isReadonly.value) {
+    try {
+      await handleSave()
+    } catch {
+      /* handleSave 已写 saveError */
+      runStatus.value = 'error'
+      return
+    }
+  }
+
+  running.value = true
+  runStatus.value = 'submitting'
+
+  // 获取画布序列化数据，并注入流水线参数（如有）
+  let graphData = resolveGraphForRun()
+  if (pendingPipelineParams.value && graphData) {
+    graphData = applyPipelineParamsToGraph(graphData, pendingPipelineParams.value)
+    pendingPipelineParams.value = null
+  }
+
+  emit('run', currentDefinition.value.workflow_id, linkedLayerId, target, graphData)
+}
+
+/**
+ * 流水线启动回调：加载对应工作流定义，注入 algorithm_params，然后走正常的 run 流程。
+ */
+async function handlePipelineLaunch(workflowId: string, params: Record<string, unknown>) {
+  showPipelineLauncher.value = false
+  saveError.value = null
+
+  // 加载工作流定义（会更新 currentDefinition 和画布）
+  const def = await store.loadDefinition(workflowId)
+  if (!def?.nodes?.length) {
+    saveError.value = `无法加载流水线定义：${workflowId}（节点为空或请求失败）`
+    runStatus.value = 'error'
+    return
+  }
+  // 立刻写入图快照（含流水线日期注入），避免等 LiteGraph 异步 configure 完成
+  currentGraphData.value = applyPipelineParamsToGraph(
+    {
+      nodes: def.nodes as WorkflowDefinitionNode[],
+      links: (def.links ?? []) as WorkflowDefinitionLink[],
+    },
+    params,
+  )
+  selectedNode.value = null
+  dirty.value = false
+
+  // 暂存流水线参数：校验与确认提交时再注入一次（画布序列化可能仍是种子占位）
+  pendingPipelineParams.value = params
+
+  logStore.logOperation(
+    'workflow-pipeline-launch',
+    `启动流水线: ${workflowId}, params: ${JSON.stringify(params)}`,
+  )
+
+  // 等画布挂载/刷入；即便 LiteGraph 未就绪也可用 definition 节点校验/运行
+  await nextTick()
+  await new Promise<void>((resolve) => {
+    requestAnimationFrame(() => resolve())
+  })
+  handleRun()
+}
+
+/** 由 Dashboard 在提交结束（成功/失败）后回调，同步按钮与错误条 */
+function notifyRunOutcome(ok: boolean, message?: string) {
+  clearRunStatusTimers()
+  running.value = false
+  if (ok) {
+    runStatus.value = 'submitted'
+    saveError.value = null
+    _runStatusTimer2 = setTimeout(() => {
+      runStatus.value = 'idle'
+    }, 2500)
+  } else {
+    runStatus.value = 'error'
+    if (message) saveError.value = message
+    _runStatusTimer2 = setTimeout(() => {
+      runStatus.value = 'idle'
+    }, 4000)
+  }
+}
+
+/**
+ * 主界面时间轴停稳后：同步打开画布中 bind_timeline 的 time_range 节点。
+ * 只读种子图不写脏标记以外的持久化；可编辑图标 dirty。
+ */
+function applyBoundMainTimeline(range: { start_at: string; end_at: string }): number {
+  if (!hasDefinition.value || !canvasRef.value) return 0
+  const changed =
+    (
+      canvasRef.value as {
+        applyBoundMainTimeline?: (r: { start_at: string; end_at: string }) => number
+      }
+    ).applyBoundMainTimeline?.(range) ?? 0
+  if (changed > 0 && !isReadonly.value) {
+    dirty.value = true
+  }
+  return changed
+}
+
+function clearRunStatusTimers() {
+  if (_runStatusTimer2 !== null) {
+    clearTimeout(_runStatusTimer2)
+    _runStatusTimer2 = null
+  }
+}
+
+function handleRunCancel() {
+  showRunDialog.value = false
+}
+
+// ─── 导入导出 ───────────────────────────────────────────────────────────────
+
+function handleExport() {
+  if (!currentDefinition.value) return
+  const graphData = canvasRef.value?.getSerializedGraph()
+  const exportData = {
+    workflow_id: currentDefinition.value.workflow_id,
+    name: currentDefinition.value.name,
+    description: currentDefinition.value.description,
+    engine: currentDefinition.value._meta?.engine ?? 'general',
+    nodes: graphData?.nodes ?? currentDefinition.value.nodes,
+    links: graphData?.links ?? currentDefinition.value.links,
+    exported_at: new Date().toISOString(),
+    version: '1.0',
+  }
+  const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${currentDefinition.value.workflow_id}.json`
+  a.click()
+  URL.revokeObjectURL(url)
+  logStore.logOperation('workflow-export', `导出工作流: ${currentDefinition.value.workflow_id}`)
+}
+
+function handleImportClick() {
+  fileInputRef.value?.click()
+}
+
+async function handleImportFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  if (!input.files?.length) return
+  const file = input.files[0]
+  // File size guard: reject files over 10 MB to prevent DoS
+  const MAX_IMPORT_BYTES = 10 * 1024 * 1024
+  if (file.size > MAX_IMPORT_BYTES) {
+    saveError.value = `导入失败：文件过大（${(file.size / 1024 / 1024).toFixed(1)} MiB），上限 10 MiB`
+    input.value = ''
+    return
+  }
+  try {
+    const text = await file.text()
+    const data = JSON.parse(text)
+    if (!data || typeof data !== 'object') {
+      throw new Error('无效的 JSON：根对象不存在')
+    }
+    if (
+      !Array.isArray(data.nodes) ||
+      !Array.isArray(data.links) ||
+      typeof data.workflow_id !== 'string'
+    ) {
+      throw new Error('无效的工作流文件格式：缺少 nodes/links/workflow_id')
+    }
+    // Node count guard: reject workflows with too many nodes
+    const MAX_NODES = 500
+    if (data.nodes.length > MAX_NODES) {
+      throw new Error(`节点数量过多（${data.nodes.length}），上限 ${MAX_NODES}`)
+    }
+    // Basic node structure validation
+    // LiteGraph 序列化的 node.id 为 number，后端 int(lg_id) 也接受 number，
+    // 因此同时允许 string 和 number 类型
+    for (const node of data.nodes) {
+      if (
+        !node ||
+        typeof node !== 'object' ||
+        (typeof node.id !== 'string' && typeof node.id !== 'number')
+      ) {
+        throw new Error('工作流节点结构无效：缺少 id')
+      }
+    }
+    // Create new workflow with generated ID (imported ID is not reused)
+    const newId = `imported_${Date.now()}`
+    const created = await store.createNew({
+      workflow_id: newId,
+      name: data.name ?? file.name.replace(/\.json$/, ''),
+      description: data.description ?? '导入的工作流',
+      engine: data.engine ?? 'general',
+      nodes: data.nodes,
+      links: data.links,
+    })
+    await store.loadDefinition(created.workflow_id)
+    dirty.value = false
+    logStore.logOperation('workflow-import', `导入工作流: ${file.name} → ${newId}`)
+  } catch (err) {
+    console.error('[WorkflowEditorPanel] Import failed:', err)
+    saveError.value = `导入失败：${err instanceof Error ? err.message : String(err)}`
+  } finally {
+    input.value = '' // 重置 input 以允许重复导入同一文件
+  }
+}
+
+function handleClose() {
+  if (dirty.value && !isReadonly.value) {
+    if (!confirm('有未保存的修改，确定要关闭吗？')) return
+  }
+  // emit 前主动清理：widget 编辑框可能挂在 document.body，晚一拍卸载会闪到主界面
+  try {
+    ;(
+      canvasRef.value as { disposeLiteGraphFloatingUi?: () => void } | null
+    )?.disposeLiteGraphFloatingUi?.()
+  } catch {
+    /* ignore */
+  }
+  emit('close')
+}
+
+defineExpose({
+  notifyRunOutcome,
+  applyBoundMainTimeline,
+})
+</script>
+
+<template>
+  <div class="editor-overlay" @click.self="handleClose">
+    <div class="editor-panel">
+      <!-- 顶部工具栏 -->
+      <header class="editor-header">
+        <div class="header-left">
+          <Hexagon :size="18" class="header-icon" aria-hidden="true" />
+          <span class="header-title">{{ WORKFLOW_COPY.editorTitle }}</span>
+          <span v-if="currentDefinition" class="header-sep">/</span>
+          <span v-if="currentDefinition" class="header-workflow-name">{{
+            headerWorkflowLabel
+          }}</span>
+          <span v-if="isReadonly" class="readonly-badge">只读</span>
+          <span v-if="dirty && !isReadonly" class="dirty-badge" title="有未保存的修改"
+            >● 未保存</span
+          >
+          <button
+            class="header-btn"
+            type="button"
+            :disabled="!hasDefinition || isReadonly"
+            title="编辑工作流名称与说明描述"
+            @click="openPropsDialog"
+          >
+            <Settings :size="14" aria-hidden="true" />
+            <span>属性</span>
+          </button>
+        </div>
+
+        <div class="header-actions">
+          <button
+            class="header-btn"
+            type="button"
+            :disabled="!hasDefinition"
+            title="自动排列节点"
+            @click="handleArrange"
+          >
+            <LayoutGrid :size="14" aria-hidden="true" />
+            <span>排列</span>
+          </button>
+          <button
+            class="header-btn"
+            type="button"
+            :disabled="!hasDefinition"
+            title="适配视图"
+            @click="handleFitView"
+          >
+            <Square :size="14" aria-hidden="true" />
+            <span>适配</span>
+          </button>
+          <button
+            class="header-btn"
+            type="button"
+            :disabled="!hasDefinition || isReadonly"
+            title="清空画布"
+            @click="handleClear"
+          >
+            <Ban :size="14" aria-hidden="true" />
+            <span>清空</span>
+          </button>
+          <span class="action-divider"></span>
+          <button
+            class="header-btn"
+            type="button"
+            :disabled="!hasDefinition"
+            title="导出为 JSON"
+            @click="handleExport"
+          >
+            <ChevronDown :size="14" aria-hidden="true" />
+            <span>导出</span>
+          </button>
+          <button class="header-btn" type="button" title="从 JSON 导入" @click="handleImportClick">
+            <ChevronUp :size="14" aria-hidden="true" />
+            <span>导入</span>
+          </button>
+          <input
+            ref="fileInputRef"
+            type="file"
+            accept=".json,application/json"
+            style="display: none"
+            @change="handleImportFile"
+          />
+          <span class="action-divider"></span>
+          <button
+            class="header-btn"
+            type="button"
+            :class="{ active: editorView === 'timers' }"
+            title="工作流定时器（Cron / 间隔 / 事件）。侧栏边缘可拖拽调宽。"
+            @click="editorView = editorView === 'timers' ? 'canvas' : 'timers'"
+          >
+            <AlarmClock :size="14" aria-hidden="true" />
+            <span>{{ editorView === 'timers' ? '返回画布' : '定时器' }}</span>
+          </button>
+          <span class="action-divider"></span>
+          <button
+            class="header-btn"
+            type="button"
+            title="节点缓存管理（查看/清理算法模块产物缓存）"
+            @click="nodeCacheDialogOpen = true"
+          >
+            <Trash2 :size="14" aria-hidden="true" />
+            <span>缓存</span>
+          </button>
+          <span class="action-divider"></span>
+          <button class="header-btn primary" type="button" :disabled="!canSave" @click="handleSave">
+            <LoaderCircle v-if="saving" :size="14" class="animate-spin" aria-hidden="true" />
+            <Save v-else :size="14" aria-hidden="true" />
+            <span>{{ saving ? '保存中...' : '保存' }}</span>
+          </button>
+          <!-- 校验状态指示器 -->
+          <button
+            v-if="validationResult"
+            class="header-btn validation-btn"
+            :class="{
+              'has-errors': validationResult.hasErrors,
+              'has-warnings': validationResult.hasWarnings && !validationResult.hasErrors,
+              'all-good': !validationResult.hasErrors && !validationResult.hasWarnings,
+            }"
+            type="button"
+            :title="formatValidationSummary(validationResult)"
+            @click="showValidationPanel = !showValidationPanel"
+          >
+            <AlertTriangle v-if="validationResult.hasErrors" :size="14" aria-hidden="true" />
+            <AlertCircle v-else-if="validationResult.hasWarnings" :size="14" aria-hidden="true" />
+            <Check v-else :size="14" aria-hidden="true" />
+            <span v-if="validationResult.errorCount > 0">{{ validationResult.errorCount }}</span>
+            <span v-else-if="validationResult.warningCount > 0">{{
+              validationResult.warningCount
+            }}</span>
+          </button>
+          <button
+            class="header-btn pipeline"
+            type="button"
+            title="端到端流水线"
+            @click="showPipelineLauncher = true"
+          >
+            <Rocket :size="14" aria-hidden="true" />
+            <span>流水线</span>
+          </button>
+          <button
+            class="header-btn run"
+            type="button"
+            :class="{
+              submitting: runStatus === 'submitting',
+              submitted: runStatus === 'submitted',
+            }"
+            :disabled="!canRun"
+            :title="
+              runStatus === 'submitting'
+                ? '正在提交...'
+                : runStatus === 'submitted'
+                  ? '已提交，查看状态面板'
+                  : '运行工作流'
+            "
+            @click="handleRun"
+          >
+            <LoaderCircle
+              v-if="runStatus === 'submitting'"
+              :size="14"
+              class="animate-spin"
+              aria-hidden="true"
+            />
+            <Check v-else-if="runStatus === 'submitted'" :size="14" aria-hidden="true" />
+            <Play v-else :size="14" aria-hidden="true" />
+            <span>{{
+              runStatus === 'submitting'
+                ? '提交中...'
+                : runStatus === 'submitted'
+                  ? '已提交'
+                  : '运行'
+            }}</span>
+          </button>
+          <span class="action-divider"></span>
+          <button class="header-btn close" type="button" title="关闭" @click="handleClose">
+            <X :size="14" aria-hidden="true" />
+          </button>
+        </div>
+      </header>
+
+      <!-- 错误提示 -->
+      <Transition name="cgda-fade">
+        <div v-if="error || saveError" class="editor-error-bar">
+          <AlertTriangle :size="14" class="error-icon" aria-hidden="true" />
+          <span class="error-text">{{ saveError ?? error }}</span>
+          <button class="error-dismiss" type="button" @click="saveError = null">
+            <X :size="14" aria-hidden="true" />
+          </button>
+        </div>
+      </Transition>
+
+      <!-- 校验结果面板 -->
+      <Transition name="cgda-fade-scale">
+        <div v-if="showValidationPanel && validationResult" class="validation-panel">
+          <div class="validation-header">
+            <span class="validation-title">
+              <AlertTriangle v-if="validationResult.hasErrors" :size="14" aria-hidden="true" />
+              <AlertCircle v-else-if="validationResult.hasWarnings" :size="14" aria-hidden="true" />
+              <Check v-else :size="14" aria-hidden="true" />
+              <span>运行前校验：{{ formatValidationSummary(validationResult) }}</span>
+            </span>
+            <div class="validation-actions">
+              <button
+                v-if="!validationResult.hasErrors"
+                class="validation-action-btn proceed"
+                type="button"
+                @click="proceedAfterValidation"
+              >
+                继续运行
+              </button>
+              <button
+                class="validation-action-btn close"
+                type="button"
+                @click="showValidationPanel = false"
+              >
+                关闭
+              </button>
+            </div>
+          </div>
+          <div v-if="validationResult.issues.length > 0" class="validation-list">
+            <div
+              v-for="(issue, idx) in validationResult.issues"
+              :key="idx"
+              class="validation-item"
+              :class="{ error: issue.severity === 'error', warning: issue.severity === 'warning' }"
+            >
+              <X
+                v-if="issue.severity === 'error'"
+                :size="14"
+                class="validation-icon"
+                aria-hidden="true"
+              />
+              <AlertTriangle v-else :size="14" class="validation-icon" aria-hidden="true" />
+              <span class="validation-node">{{ issue.nodeTitle || '全局' }}</span>
+              <span v-if="issue.field" class="validation-field">{{ issue.field }}</span>
+              <span class="validation-message">{{ issue.message }}</span>
+            </div>
+          </div>
+          <div v-else class="validation-empty">所有节点参数校验通过</div>
+        </div>
+      </Transition>
+
+      <!-- 主体三栏布局 -->
+      <div class="editor-body">
+        <!-- 左侧：工作流列表（独立组件） -->
+        <WorkflowLeftSidebar
+          v-model:collapsed="leftSidebarCollapsed"
+          @select="handleSelectWorkflow"
+          @create="handleCreateWorkflow"
+        />
+
+        <!-- 中间：画布 或 定时器 -->
+        <main v-if="editorView === 'timers'" class="editor-timers-area">
+          <WorkflowTimerPanel
+            embedded
+            :default-workflow-id="currentDefinition?.workflow_id ?? ''"
+          />
+        </main>
+        <main v-else class="editor-canvas-area">
+          <div v-if="!hasDefinition" class="canvas-placeholder">
+            <div class="placeholder-content">
+              <div class="placeholder-orbit" aria-hidden="true">
+                <span class="orbit-ring orbit-ring--outer"></span>
+                <span class="orbit-ring orbit-ring--inner"></span>
+                <span class="flow-node flow-node--source"></span>
+                <span class="flow-node flow-node--transform"></span>
+                <span class="flow-node flow-node--output"></span>
+                <span class="flow-link flow-link--source"></span>
+                <span class="flow-link flow-link--output"></span>
+                <span class="flow-core"></span>
+              </div>
+              <h2 class="placeholder-title">工作流编辑器</h2>
+              <p class="placeholder-text">从左侧选择工作流或范例，也可点击「新建」创建空白流</p>
+              <p class="placeholder-hint">
+                范例可一键「从范例新建」为可编辑副本；支持天气 / Python / GEE 节点
+              </p>
+            </div>
+          </div>
+          <WorkflowCanvas
+            v-else
+            ref="canvasRef"
+            :definition="currentDefinition"
+            :node-templates="nodeTemplates"
+            :readonly="isReadonly"
+            @change="handleGraphChange"
+            @node-select="handleNodeSelect"
+          />
+        </main>
+
+        <!-- 右侧：节点库 + 属性检查器（画布模式才显示） -->
+        <WorkflowRightSidebar
+          v-if="editorView === 'canvas'"
+          v-model:collapsed="rightSidebarCollapsed"
+          :selected-node="selectedNode"
+          :readonly="isReadonly"
+          :validation-issues="selectedNodeIssues"
+          @add-node="handleAddNode"
+          @update-property="handleUpdateProperty"
+          @update-title="handleUpdateTitle"
+        />
+      </div>
+    </div>
+
+    <!-- 运行工作流：产出目标选择对话框 -->
+    <WorkflowRunDialog
+      :visible="showRunDialog"
+      :workflow-id="currentDefinition?.workflow_id ?? ''"
+      :workflow-name="currentDefinition?.name ?? ''"
+      :workflow-description="currentDefinition?.description ?? ''"
+      :linked-layer-id="currentLinkedLayerId"
+      :engine="currentEngine"
+      @confirm="handleRunConfirm"
+      @cancel="handleRunCancel"
+    />
+
+    <!-- 新建工作流对话框 -->
+    <Transition name="cgda-modal">
+      <div v-if="showCreateDialog" class="create-dialog-overlay" @click.self="cancelCreateWorkflow">
+        <div
+          class="create-dialog cgda-modal-panel"
+          role="dialog"
+          aria-modal="true"
+          aria-label="新建工作流"
+        >
+          <h3 class="dialog-title">新建工作流</h3>
+          <div class="dialog-form">
+            <div class="form-row">
+              <label class="form-label">工作流 ID</label>
+              <input
+                v-model="newWorkflowId"
+                type="text"
+                class="form-input"
+                placeholder="唯一标识符"
+              />
+            </div>
+            <div class="form-row">
+              <label class="form-label">名称 *</label>
+              <input
+                v-model="newWorkflowName"
+                type="text"
+                class="form-input"
+                placeholder="显示名称"
+              />
+            </div>
+            <div class="form-row">
+              <label class="form-label">描述</label>
+              <textarea
+                v-model="newWorkflowDescription"
+                class="form-textarea"
+                rows="2"
+                placeholder="可选描述"
+              ></textarea>
+            </div>
+            <div class="form-row">
+              <label class="form-label">引擎</label>
+              <AppSelect
+                v-model="newWorkflowEngine"
+                :options="[
+                  { label: '通用', value: 'general' },
+                  { label: '天气引擎', value: 'weather' },
+                  { label: 'Python 处理器', value: 'python_provider' },
+                  { label: 'GEE', value: 'gee' },
+                ]"
+              />
+            </div>
+          </div>
+          <div class="dialog-actions">
+            <button class="dialog-btn cancel" type="button" @click="cancelCreateWorkflow">
+              取消
+            </button>
+            <button
+              class="dialog-btn primary"
+              type="button"
+              :disabled="!newWorkflowId.trim() || !newWorkflowName.trim()"
+              @click="confirmCreateWorkflow"
+            >
+              创建
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- 流水线启动器对话框 -->
+    <PipelineLauncher
+      :visible="showPipelineLauncher"
+      @close="showPipelineLauncher = false"
+      @launch="handlePipelineLaunch"
+    />
+
+    <!-- 工作流属性编辑对话框（名称/描述） -->
+    <Teleport to="body">
+      <Transition name="cgda-modal">
+        <div v-if="showPropsDialog" class="props-mask" @click.self="showPropsDialog = false">
+          <div
+            class="props-dialog cgda-modal-panel"
+            role="dialog"
+            aria-modal="true"
+            aria-label="工作流属性"
+          >
+            <div class="props-header">
+              <span class="props-title">工作流属性</span>
+              <button
+                class="props-close"
+                type="button"
+                aria-label="关闭"
+                @click="showPropsDialog = false"
+              >
+                ×
+              </button>
+            </div>
+            <div class="props-body">
+              <div class="form-row">
+                <label class="form-label">名称 *</label>
+                <input v-model="editName" type="text" class="form-input" placeholder="显示名称" />
+              </div>
+              <div class="form-row">
+                <label class="form-label">说明描述</label>
+                <textarea
+                  v-model="editDescription"
+                  class="form-textarea"
+                  rows="3"
+                  placeholder="说明该工作流的用途、输入输出与注意事项（运行对话框与列表展示）"
+                ></textarea>
+              </div>
+            </div>
+            <div class="dialog-actions">
+              <button class="dialog-btn cancel" type="button" @click="showPropsDialog = false">
+                取消
+              </button>
+              <button
+                class="dialog-btn primary"
+                type="button"
+                :disabled="!editName.trim()"
+                @click="saveProps"
+              >
+                保存
+              </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <NodeCacheDialog :open="nodeCacheDialogOpen" @close="nodeCacheDialogOpen = false" />
+  </div>
+</template>
+
+<style scoped>
+.editor-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 997;
+  display: flex;
+  align-items: stretch;
+  justify-content: stretch;
+  background: var(--surface-1);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+.editor-panel {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  background: var(--surface-2);
+  /* 局部抬高 rem 基准（全局 :root 仍为 15px），改善导师反馈的「字太小」 */
+  font-size: 19px;
+}
+
+/* ── 顶部工具栏 ──────────────────────────────────────────────────── */
+.editor-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.52rem 0.72rem;
+  border-bottom: 1px solid var(--border-default);
+  background: var(--surface-1);
+  flex: none;
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 0.42rem;
+  min-width: 0;
+}
+
+.header-icon {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+  color: var(--accent);
+}
+
+.header-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.header-sep {
+  color: var(--text-disabled);
+}
+
+.header-workflow-name {
+  font-size: var(--font-size-caption);
+  color: var(--accent-strong);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.readonly-badge,
+.dirty-badge {
+  padding: 0.08rem 0.42rem;
+  border-radius: 0.32rem;
+  font-size: var(--font-size-caption);
+  font-weight: 600;
+}
+
+.readonly-badge {
+  background: var(--warning-border);
+  color: var(--accent-warm);
+  border: 1px solid var(--warning-border);
+}
+
+.dirty-badge {
+  background: rgba(255, 220, 120, 0.18);
+  color: var(--warning);
+  border: 1px solid rgba(255, 220, 120, 0.2);
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.28rem;
+}
+
+.header-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.22rem;
+  padding: 0.32rem 0.56rem;
+  border: 1px solid var(--border-default);
+  border-radius: 0.42rem;
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--font-size-caption);
+  font-weight: 500;
+  transition:
+    color var(--motion-fast) var(--ease-soft),
+    background var(--motion-fast) var(--ease-soft),
+    border-color var(--motion-fast) var(--ease-soft),
+    box-shadow var(--motion-fast) var(--ease-soft);
+}
+
+.header-btn:hover:not(:disabled) {
+  border-color: var(--border-accent);
+  color: var(--accent);
+  background: var(--accent-surface);
+}
+
+.header-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.header-btn.primary {
+  border-color: var(--border-strong);
+  background: var(--accent-border);
+  color: var(--accent);
+}
+
+.header-btn.primary:hover:not(:disabled) {
+  background: var(--border-strong);
+}
+
+.header-btn.run {
+  border-color: rgba(120, 255, 160, 0.3);
+  background: rgba(40, 180, 90, 0.16);
+  color: var(--success);
+}
+
+.header-btn.run:hover:not(:disabled) {
+  background: rgba(40, 180, 90, 0.28);
+}
+
+.header-btn.run.submitting {
+  border-color: var(--warning-border);
+  background: rgba(180, 130, 40, 0.2);
+  color: var(--warning);
+  pointer-events: none;
+}
+
+.header-btn.run.submitted {
+  border-color: rgba(120, 255, 160, 0.5);
+  background: rgba(40, 180, 90, 0.28);
+  color: var(--success);
+}
+
+.header-btn.run.submitting span:first-child,
+.header-btn.run.submitted span:first-child {
+  animation: spin 1s linear infinite;
+}
+
+.header-btn.run.submitted span:first-child {
+  animation: none;
+}
+
+.header-btn.pipeline {
+  border-color: var(--warning-border);
+  background: rgba(180, 130, 40, 0.14);
+  color: var(--accent-warm);
+}
+
+.header-btn.pipeline:hover:not(:disabled) {
+  border-color: var(--warning-border);
+  background: rgba(180, 130, 40, 0.24);
+  color: var(--accent-warm);
+}
+
+.header-btn.close {
+  padding: 0.32rem 0.46rem;
+  color: var(--text-faint);
+}
+
+.action-divider {
+  width: 1px;
+  height: 1rem;
+  background: var(--border-default);
+  margin: 0 0.18rem;
+}
+
+/* ── 错误提示栏 ──────────────────────────────────────────────────── */
+.editor-error-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.42rem;
+  padding: 0.36rem 0.72rem;
+  border-bottom: 1px solid rgba(255, 120, 120, 0.2);
+  background: rgba(90, 30, 30, 0.18);
+  color: var(--danger);
+  font-size: var(--font-size-caption);
+}
+
+.error-icon {
+  font-size: var(--font-size-caption);
+}
+
+.error-text {
+  flex: 1;
+}
+
+.error-dismiss {
+  border: none;
+  background: transparent;
+  color: var(--danger);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--font-size-caption);
+}
+
+/* ── 主体三栏 ───────────────────────────────────────────────────── */
+.editor-body {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+.editor-canvas-area {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  background: var(--surface-base);
+  min-width: 0;
+}
+
+.editor-timers-area {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-sunken);
+}
+
+.header-btn.active {
+  border-color: var(--border-strong);
+  color: var(--accent);
+  background: var(--accent-surface);
+}
+
+.canvas-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+}
+
+.placeholder-content {
+  width: min(34rem, calc(100% - 2rem));
+  text-align: center;
+  color: var(--text-disabled);
+}
+
+.placeholder-orbit {
+  position: relative;
+  width: 8.5rem;
+  height: 5.5rem;
+  margin: 0 auto 1rem;
+  filter: drop-shadow(0 10px 24px color-mix(in srgb, var(--accent) 14%, transparent));
+}
+.orbit-ring {
+  position: absolute;
+  inset: 0.6rem 1.2rem;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
+  border-radius: 50%;
+  transform: rotate(-18deg) skewX(-14deg);
+}
+.orbit-ring--inner {
+  inset: 1.15rem 2.1rem;
+  border-color: color-mix(in srgb, var(--accent-strong) 42%, transparent);
+  transform: rotate(24deg) skewX(10deg);
+}
+.flow-node,
+.flow-core {
+  position: absolute;
+  display: block;
+  border-radius: 0.35rem;
+  border: 1px solid var(--accent-border);
+  background: var(--surface-2);
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--accent) 9%, transparent),
+    0 5px 14px rgb(0 0 0 / 0.18);
+}
+.flow-node {
+  width: 1.05rem;
+  height: 0.78rem;
+}
+.flow-node--source {
+  left: 0.55rem;
+  top: 2.3rem;
+}
+.flow-node--transform {
+  left: 3.72rem;
+  top: 0.45rem;
+  border-radius: 50%;
+}
+.flow-node--output {
+  right: 0.55rem;
+  top: 2.3rem;
+}
+.flow-link {
+  position: absolute;
+  height: 1px;
+  transform-origin: left center;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  opacity: 0.78;
+}
+.flow-link--source {
+  left: 1.42rem;
+  top: 2.7rem;
+  width: 2.45rem;
+  transform: rotate(-30deg);
+}
+.flow-link--output {
+  left: 4.72rem;
+  top: 1.16rem;
+  width: 2.48rem;
+  transform: rotate(30deg);
+}
+.flow-core {
+  left: 3.78rem;
+  top: 2.3rem;
+  width: 0.92rem;
+  height: 0.92rem;
+  border-radius: 50%;
+  border-color: var(--accent-strong);
+  background: var(--accent-surface);
+  box-shadow:
+    0 0 0 4px color-mix(in srgb, var(--accent) 11%, transparent),
+    0 0 22px color-mix(in srgb, var(--accent) 36%, transparent);
+  animation: core-pulse 2.8s ease-in-out infinite;
+}
+@keyframes core-pulse {
+  0%,
+  100% {
+    transform: scale(0.92);
+    opacity: 0.76;
+  }
+  50% {
+    transform: scale(1.08);
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .flow-core {
+    animation: none;
+  }
+}
+
+.placeholder-title {
+  margin: 0 0 0.42rem;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--text-faint);
+}
+
+.placeholder-text {
+  margin: 0 0 0.22rem;
+  font-size: var(--font-size-caption);
+  color: var(--text-disabled);
+}
+
+.placeholder-hint {
+  margin: 0;
+  font-size: var(--font-size-caption);
+  color: var(--text-disabled);
+}
+
+/* ── 新建对话框 ──────────────────────────────────────────────────── */
+.create-dialog-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1001;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-1);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+.create-dialog {
+  width: 24rem;
+  max-width: 92vw;
+  padding: 1.1rem;
+  border: 1px solid var(--border-default);
+  border-radius: 0.72rem;
+  background: var(--surface-2);
+  box-shadow: 0 18px 48px rgba(1, 8, 16, 0.4);
+}
+
+.dialog-title {
+  margin: 0 0 0.82rem;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.dialog-form {
+  margin-bottom: 0.82rem;
+}
+
+.form-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.28rem;
+  margin-bottom: 0.62rem;
+}
+
+.form-label {
+  font-size: var(--font-size-caption);
+  color: var(--text-faint);
+  font-weight: 500;
+}
+
+.form-input,
+.form-select,
+.form-textarea {
+  padding: 0.4rem 0.52rem;
+  border: 1px solid var(--border-default);
+  border-radius: 0.42rem;
+  background: var(--surface-raised);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--font-size-caption);
+}
+
+.form-textarea {
+  resize: vertical;
+  min-height: 2.4rem;
+  font-family: inherit;
+}
+
+.form-input:focus,
+.form-select:focus,
+.form-textarea:focus {
+  outline: none;
+  border-color: var(--border-strong);
+}
+
+.form-select {
+  cursor: pointer;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.42rem;
+}
+
+.dialog-btn {
+  padding: 0.4rem 0.92rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 0.42rem;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--font-size-caption);
+  font-weight: 500;
+  transition:
+    color var(--motion-fast) var(--ease-soft),
+    background var(--motion-fast) var(--ease-soft),
+    border-color var(--motion-fast) var(--ease-soft),
+    box-shadow var(--motion-fast) var(--ease-soft);
+}
+
+.dialog-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.dialog-btn.cancel:hover {
+  background: var(--border-subtle);
+}
+
+.dialog-btn.primary {
+  border-color: var(--border-strong);
+  background: var(--accent-border);
+  color: var(--accent);
+}
+
+.dialog-btn.primary:hover:not(:disabled) {
+  background: var(--border-strong);
+}
+
+/* ── 响应式 ──────────────────────────────────────────────────────── */
+@media (max-width: 768px) {
+  .editor-body {
+    flex-direction: column;
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ── 校验面板 ─────────────────────────────────────────────── */
+.validation-btn.has-errors {
+  border-color: rgba(232, 70, 58, 0.4);
+  background: rgba(232, 70, 58, 0.14);
+  color: var(--danger);
+}
+.validation-btn.has-warnings {
+  border-color: rgba(239, 170, 23, 0.36);
+  background: rgba(239, 170, 23, 0.12);
+  color: var(--accent-warm);
+}
+.validation-btn.all-good {
+  border-color: rgba(29, 201, 129, 0.3);
+  background: rgba(29, 201, 129, 0.08);
+  color: var(--success);
+}
+
+.validation-panel {
+  border-bottom: 1px solid var(--border-default);
+  background: var(--surface-1);
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.validation-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.52rem 0.86rem;
+  border-bottom: 1px solid var(--border-subtle);
+  position: sticky;
+  top: 0;
+  background: var(--surface-2);
+  z-index: 1;
+}
+
+.validation-title {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: var(--font-size-caption);
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.validation-actions {
+  display: flex;
+  gap: 0.32rem;
+}
+
+.validation-action-btn {
+  padding: 0.24rem 0.62rem;
+  border-radius: 0.32rem;
+  border: 1px solid var(--border-default);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--font-size-caption);
+  cursor: pointer;
+  transition:
+    color var(--motion-fast) var(--ease-soft),
+    background var(--motion-fast) var(--ease-soft),
+    border-color var(--motion-fast) var(--ease-soft),
+    box-shadow var(--motion-fast) var(--ease-soft);
+}
+
+.validation-action-btn.proceed {
+  border-color: rgba(29, 201, 129, 0.36);
+  background: rgba(29, 201, 129, 0.1);
+  color: var(--success);
+}
+
+.validation-action-btn.proceed:hover {
+  border-color: rgba(29, 201, 129, 0.56);
+  background: rgba(29, 201, 129, 0.2);
+}
+
+.validation-action-btn.close:hover {
+  border-color: var(--border-strong);
+  color: var(--text-secondary);
+}
+
+.validation-list {
+  padding: 0.32rem 0;
+}
+
+.validation-item {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.36rem 0.86rem;
+  font-size: var(--font-size-caption);
+  border-bottom: 1px solid var(--border-subtle);
+  transition: background var(--motion-fast) var(--ease-soft);
+}
+
+.validation-item:hover {
+  background: var(--border-subtle);
+}
+
+.validation-item.error .validation-icon {
+  color: var(--danger);
+}
+
+.validation-item.warning .validation-icon {
+  color: var(--accent-warm);
+}
+
+.validation-icon {
+  flex-shrink: 0;
+  font-size: var(--font-size-caption);
+}
+
+.validation-node {
+  flex-shrink: 0;
+  color: var(--text-secondary);
+  font-weight: 500;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.validation-field {
+  flex-shrink: 0;
+  padding: 0.08rem 0.36rem;
+  border-radius: 0.24rem;
+  background: var(--border-subtle);
+  color: var(--text-muted);
+  font-size: var(--font-size-caption);
+  font-family: var(--font-mono);
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.validation-message {
+  flex: 1;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.validation-empty {
+  padding: 1rem;
+  text-align: center;
+  font-size: var(--font-size-caption);
+  color: var(--success);
+}
+
+/* ── 工作流属性对话框 ──────────────────────────────────────────────────── */
+.props-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 1300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-1);
+  backdrop-filter: blur(4px);
+}
+
+.props-dialog {
+  width: min(460px, 90vw);
+  border-radius: 12px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-1);
+  color: var(--text-primary);
+  box-shadow: 0 20px 44px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+}
+
+.props-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border-default);
+}
+
+.props-title {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-strong);
+}
+
+.props-close {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 19px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.props-body {
+  padding: 0.9rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+
+/* ── 按钮按压反馈 ─────────────────────────────────────────── */
+.header-btn:active,
+.dialog-btn:active,
+.validation-action-btn:active {
+  transform: translateY(1px);
+  box-shadow: inset 0 1px 3px var(--shadow-ambient);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .header-btn.run.submitting span:first-child,
+  .header-btn.run.submitted span:first-child,
+  .placeholder-icon {
+    animation: none;
+  }
+  .header-btn:active,
+  .dialog-btn:active,
+  .validation-action-btn:active {
+    transform: none;
+  }
+  .cgda-fade-enter-active,
+  .cgda-fade-leave-active,
+  .cgda-fade-scale-enter-active,
+  .cgda-fade-scale-leave-active {
+    transition: opacity 0ms;
+  }
+}
+
+:global(html.reduce-motion) .header-btn:active,
+:global(html.reduce-motion) .dialog-btn:active,
+:global(html.reduce-motion) .validation-action-btn:active {
+  transform: none;
+}
+
+/* ── 动画：错误条滑入 ──────────────────────────────────────── */
+.cgda-fade-enter-active {
+  transition:
+    opacity var(--motion-base) var(--ease-standard),
+    max-height var(--motion-slow) var(--ease-standard),
+    margin var(--motion-slow) var(--ease-standard);
+  overflow: hidden;
+}
+.cgda-fade-leave-active {
+  transition:
+    opacity var(--motion-fast) var(--ease-soft),
+    max-height var(--motion-base) var(--ease-standard),
+    margin var(--motion-base) var(--ease-standard);
+  overflow: hidden;
+}
+.cgda-fade-enter-from,
+.cgda-fade-leave-to {
+  opacity: 0;
+  max-height: 0;
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+/* ── 动画：校验面板下滑展开 ────────────────────────────────── */
+.cgda-fade-scale-enter-active {
+  transition:
+    opacity var(--motion-base) var(--ease-standard),
+    max-height var(--motion-slow) var(--ease-emphasized);
+  overflow: hidden;
+}
+.cgda-fade-scale-leave-active {
+  transition:
+    opacity var(--motion-fast) var(--ease-soft),
+    max-height var(--motion-base) var(--ease-standard);
+  overflow: hidden;
+}
+.cgda-fade-scale-enter-from,
+.cgda-fade-scale-leave-to {
+  opacity: 0;
+  max-height: 0;
+}
+</style>

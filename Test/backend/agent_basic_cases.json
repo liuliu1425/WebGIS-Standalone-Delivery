@@ -1,0 +1,127 @@
+[
+  {
+    "id": "S01",
+    "kind": "selected",
+    "command": "当前选中查看的是哪个图层？"
+  },
+  {
+    "id": "S02",
+    "kind": "selected",
+    "command": "告诉我现在选中的图层。"
+  },
+  {
+    "id": "S03",
+    "kind": "visible",
+    "command": "列出当前勾选显示的图层。"
+  },
+  {
+    "id": "S04",
+    "kind": "visible",
+    "command": "现在地图上显示了哪些图层？"
+  },
+  {
+    "id": "S05",
+    "kind": "date",
+    "command": "当前选中图层的日期是多少？只查询，不修改。"
+  },
+  {
+    "id": "S06",
+    "kind": "date",
+    "command": "现在选中的图层是哪一天的数据？"
+  },
+  {
+    "id": "S07",
+    "kind": "show",
+    "command": "显示风云卫星平均版植被光学厚度VOD。"
+  },
+  {
+    "id": "S08",
+    "kind": "show",
+    "command": "勾选SMAP动态版土壤水分SM。"
+  },
+  {
+    "id": "S09",
+    "kind": "hide",
+    "command": "隐藏风云卫星平均版植被光学厚度VOD。"
+  },
+  {
+    "id": "S10",
+    "kind": "hide",
+    "command": "取消勾选SMAP动态版土壤水分SM。"
+  },
+  {
+    "id": "S11",
+    "kind": "solo",
+    "command": "只显示风云卫星平均版植被光学厚度VOD，隐藏其他图层。"
+  },
+  {
+    "id": "S12",
+    "kind": "solo",
+    "command": "仅保留SMAP动态版土壤水分SM显示，其余图层全部隐藏。"
+  },
+  {
+    "id": "S13",
+    "kind": "set_date",
+    "command": "将风云卫星平均版植被光学厚度VOD切换到2025-07-20。"
+  },
+  {
+    "id": "S14",
+    "kind": "set_date",
+    "command": "把SMAP动态版土壤水分SM的日期改为2025年7月21日。"
+  },
+  {
+    "id": "S15",
+    "kind": "missing",
+    "command": "显示不存在的星辰99图层。"
+  },
+  {
+    "id": "S16",
+    "kind": "missing",
+    "command": "隐藏不存在的星辰99图层。"
+  },
+  {
+    "id": "S17",
+    "kind": "missing",
+    "command": "只显示不存在的星辰99图层，其他图层全部隐藏。"
+  },
+  {
+    "id": "S18",
+    "kind": "missing",
+    "command": "把不存在的星辰99图层切到2025-07-20。"
+  },
+  {
+    "id": "S19",
+    "kind": "invalid_date",
+    "command": "把风云平均版VOD切到2025年2月29日。"
+  },
+  {
+    "id": "S20",
+    "kind": "invalid_date",
+    "command": "将SMAP动态版SM日期改为2025-13-10。"
+  },
+  {
+    "id": "S21",
+    "kind": "compound",
+    "command": "请同时告诉我当前图层、当前日期和勾选显示的图层列表。只查询，不修改。"
+  },
+  {
+    "id": "S22",
+    "kind": "compound",
+    "command": "现在选中的是哪个图层？它的日期是多少？哪些图层正在显示？"
+  },
+  {
+    "id": "S23",
+    "kind": "count",
+    "command": "页面已添加的图层一共有多少个？只查询。"
+  },
+  {
+    "id": "S24",
+    "kind": "date",
+    "command": "查询当前选中图层的日期。"
+  },
+  {
+    "id": "S25",
+    "kind": "date",
+    "command": "当前选中的图层现在是几月几号？"
+  }
+]

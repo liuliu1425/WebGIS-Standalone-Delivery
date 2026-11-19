@@ -1,0 +1,701 @@
+"""工作流定义持久化服务
+
+管理系统预设工作流（只读）和用户自定义工作流（可编辑），
+以 JSON 文件形式存储在 .data/workflow_definitions/ 下。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import sys
+import tempfile
+from datetime import datetime, UTC
+from pathlib import Path
+from typing import Any
+
+import contextlib
+
+logger = logging.getLogger(__name__)
+
+
+# ─── 自定义异常（供 router 层按类型映射 HTTP 状态码） ────────────────────────
+class WorkflowNotFoundError(Exception):
+    """工作流定义不存在。"""
+
+
+class WorkflowExistsError(Exception):
+    """工作流定义已存在（创建时 ID 冲突或并发竞态）。"""
+
+
+# ─── 路径常量 ────────────────────────────────────────────────────────────────
+# 基于 __file__ 解析 backend 根目录，避免依赖 CWD（FastAPI 进程 CWD 可能不是 Code/backend）
+_BACKEND_ROOT = (
+    Path(__file__).resolve().parents[2]
+)  # app/services/x.py -> app/services -> app -> backend
+
+
+def _current_data_root() -> Path:
+    """调用时解析 data_root（惰性：尊重测试对 cfg_mod.settings 的替换与运行时变更）。"""
+    from app.core.config import settings
+
+    root = Path(settings.data_root or ".data")
+    if not root.is_absolute():
+        root = _BACKEND_ROOT / root
+    return root
+
+
+def definitions_root() -> Path:
+    """Keep mutable definitions in an explicitly isolated runtime directory.
+
+    Without an override, retain the existing data-root location so saved
+    workflows in older deployments remain available. Seed data placeholders
+    continue to resolve against the scientific data root.
+    """
+    runtime_root = os.getenv("BACKEND_RUNTIME_ROOT", "").strip()
+    if not runtime_root:
+        return _current_data_root() / "workflow_definitions"
+    root = Path(runtime_root)
+    if not root.is_absolute():
+        root = _BACKEND_ROOT / root
+    return root / "workflow_definitions"
+
+
+def system_dir() -> Path:
+    return definitions_root() / "system"
+
+
+def user_dir() -> Path:
+    return definitions_root() / "user"
+
+
+# 合法的 workflow_id 字符集（防路径穿越）
+_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_\-]*$")
+
+
+_SEED_SYSTEM_DIR = _BACKEND_ROOT / "workflow_seeds" / "system"
+
+
+def _json_escape(value: str) -> str:
+    """把字符串转义成可安全嵌入 JSON 字符串字面量的形式（不含外层引号）。
+
+    占位符替换发生在**原始 JSON 文本**上，Windows 路径里的单反斜杠若直接注入会
+    产生非法转义（如 ``\\G``）导致整份种子解析失败，故必须先转义。
+    """
+    return json.dumps(value)[1:-1]
+
+
+# 平台常量（模块级以便测试 monkeypatch；硬编码清理 A3）
+_IS_WINDOWS = sys.platform == "win32"
+
+
+def _expand_seed_placeholders(content: str) -> str:
+    """展开种子中的 ``{DATA_ROOT}`` / ``{DATA_ROOT_WIN}``（去硬编码批 1）。"""
+    from app.core.config import settings
+
+    root = (getattr(settings, "data_root", None) or "").strip()
+    root_posix = root.replace("\\", "/")
+    # 跨平台（硬编码清理 A3）：非 Windows 下 {DATA_ROOT_WIN} 退化为 posix
+    # root（占位符名保留兼容旧种子）——反斜杠展开在 Linux 生成非法路径。
+    root_win = root_posix.replace("/", "\\") if _IS_WINDOWS else root_posix
+    return content.replace("{DATA_ROOT_WIN}", _json_escape(root_win)).replace(
+        "{DATA_ROOT}", _json_escape(root_posix)
+    )
+
+
+def _sync_system_seeds() -> None:
+    """Sync packaged system workflow templates into the runtime system dir.
+
+    Missing files are created; existing files are overwritten when seed content
+    differs so shipped fixes (node type renames, meta flags) reach .data/.
+    Definitions whose seed no longer ships are removed, making "delete a seed"
+    self-contained (no manual .data cleanup needed after seed removal).
+    """
+    if not _SEED_SYSTEM_DIR.is_dir():
+        return
+    seed_names = {src.name for src in _SEED_SYSTEM_DIR.glob("*.json")}
+    for src in sorted(_SEED_SYSTEM_DIR.glob("*.json")):
+        dest = system_dir() / src.name
+        try:
+            content = _expand_seed_placeholders(src.read_text(encoding="utf-8"))
+            try:
+                # 占位符展开后必须仍是合法 JSON，否则宁可保留旧定义也不写坏文件。
+                json.loads(content)
+            except json.JSONDecodeError as exc:
+                logger.error(
+                    "Seed %s invalid JSON after placeholder expansion, skipped: %s",
+                    src.name,
+                    exc,
+                )
+                continue
+            existed = dest.exists()
+            if existed and dest.read_text(encoding="utf-8") == content:
+                continue
+            dest.write_text(content, encoding="utf-8")
+            logger.info(
+                "%s system workflow definition: %s",
+                "Updated" if existed else "Seeded",
+                dest.name,
+            )
+        except OSError as exc:
+            logger.warning("Failed to seed workflow %s: %s", src.name, exc)
+
+    # 孤儿清理：运行时 system 目录中已无对应种子的定义一并移除。
+    # 仅覆盖 .json 定义文件；种子仍在但内容非法（上面对 continue 的场景）
+    # 时旧定义保留，避免误删可用回退。
+    if not system_dir().is_dir():
+        return
+    for stale in sorted(system_dir().glob("*.json")):
+        if stale.name in seed_names:
+            continue
+        try:
+            stale.unlink()
+            logger.info("Removed orphan system workflow definition: %s", stale.name)
+        except OSError as exc:
+            logger.warning("Failed to remove orphan workflow %s: %s", stale.name, exc)
+
+
+def _ensure_dirs() -> None:
+    """确保目录存在，并同步仓库内 system 种子模板。"""
+    system_dir().mkdir(parents=True, exist_ok=True)
+    user_dir().mkdir(parents=True, exist_ok=True)
+    (user_dir() / ".gitkeep").touch(exist_ok=True)
+    _sync_system_seeds()
+
+
+# get_definition 首读惰性同步标记（每进程一次）
+_SEED_SYNC_DONE = False
+
+
+def _validate_id(workflow_id: str) -> None:
+    """校验 workflow_id 格式，防路径穿越。"""
+    if not _ID_PATTERN.match(workflow_id):
+        raise ValueError(
+            f"Invalid workflow_id: {workflow_id!r} (allowed: alphanumeric, dash, underscore)"
+        )
+
+
+def _now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _build_meta(
+    kind: str,
+    engine: str,
+    name: str,
+    description: str | None,
+    author: str = "user",
+    linked_layer_id: str | None = None,
+    tags: list[str] | None = None,
+    category: str | None = None,
+    owner_user_id: int | None = None,
+) -> dict[str, Any]:
+    """构建 _meta 声明头。
+
+    Args:
+        tags: 工作流标签列表（如 ["pipeline", "inversion"]），用于前端分类过滤。
+            词汇表见 ``Docs/03-规范协议/workflow_seed_conventions.md``。
+        category: 工作流主分类（如 "inversion"/"weather"/"data_access"/"analysis"/"demo"）。
+        owner_user_id: 用户定义属主；system 档为 None。
+    """
+    meta = {
+        "kind": kind,  # "system" | "user"
+        "engine": engine,  # "weather" | "python_provider" | "gee" | "common"
+        "name": name,
+        "description": description,
+        "created_at": _now_iso(),
+        "updated_at": _now_iso(),
+        "author": author,
+        "readonly": kind == "system",
+        "linked_layer_id": linked_layer_id,
+    }
+    if kind == "user":
+        # 用户创建的工作流默认私有。公开状态只能由管理员通过专用接口修改，
+        # 不能信任 create/update 请求体中的 _meta。
+        meta["published"] = False
+        # A user workflow stays private while it is drafted or under review.
+        # This value is deliberately server-owned: create/update payloads must
+        # never be able to make a workflow look reviewed or publishable.
+        meta["review_status"] = "draft"
+    if tags is not None:
+        meta["tags"] = tags
+    if category is not None:
+        meta["category"] = category
+    if owner_user_id is not None:
+        meta["owner_user_id"] = int(owner_user_id)
+    return meta
+
+
+def can_mutate_user_definition(
+    meta: dict[str, Any],
+    *,
+    role: str | None,
+    user_id: int | None,
+) -> bool:
+    """Whether *role*/*user_id* may update/delete a user workflow definition.
+
+    *admin* always may. Owner may when ``owner_user_id`` matches.
+    Legacy files without ``owner_user_id`` are admin-only (fail-closed).
+    """
+    if role == "admin":
+        return True
+    if meta.get("kind") == "system" or meta.get("readonly", False):
+        return False
+    owner = meta.get("owner_user_id")
+    if owner is None:
+        return False
+    if user_id is None:
+        return False
+    try:
+        return int(owner) == int(user_id)
+    except (TypeError, ValueError):
+        return False
+
+
+_REVIEW_STATUSES = frozenset({"draft", "submitted", "approved", "rejected"})
+
+
+def review_status(meta: dict[str, Any]) -> str:
+    """Return a safe review state for a user workflow.
+
+    Older definitions predate review metadata and remain editable drafts.
+    Unknown on-disk values fail closed as ``submitted`` rather than granting
+    the owner another edit path by accident.
+    """
+    value = str(meta.get("review_status") or "draft")
+    return value if value in _REVIEW_STATUSES else "submitted"
+
+
+def submit_for_review(workflow_id: str, *, owner_user_id: int, note: str | None = None) -> dict[str, Any]:
+    """Freeze an owner workflow and make it visible to administrators only."""
+    definition = get_definition(workflow_id)
+    if definition is None:
+        raise WorkflowNotFoundError(f"Workflow definition not found: {workflow_id}")
+    meta = definition.get("_meta") if isinstance(definition.get("_meta"), dict) else {}
+    if meta.get("kind") != "user" or not is_definition_owner(meta, owner_user_id):
+        raise PermissionError("Only the owner may submit a user workflow for review")
+    state = review_status(meta)
+    if state == "submitted":
+        raise ValueError("Workflow is already awaiting review")
+    if state == "approved":
+        raise ValueError("Approved workflow must be duplicated before further changes")
+    meta["review_status"] = "submitted"
+    meta["review_submitted_at"] = _now_iso()
+    meta["review_note"] = (note or "").strip()[:1000] or None
+    meta.pop("review_decision_note", None)
+    meta.pop("reviewed_at", None)
+    meta.pop("reviewed_by_user_id", None)
+    meta["updated_at"] = _now_iso()
+    path = _resolve_file(workflow_id)
+    if path is None:
+        raise WorkflowNotFoundError(f"Workflow definition not found: {workflow_id}")
+    _write_file(path, definition)
+    return definition
+
+
+def decide_review(
+    workflow_id: str,
+    *,
+    approved: bool,
+    reviewer_user_id: int | None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    """Record an administrator decision without publishing or altering nodes."""
+    definition = get_definition(workflow_id)
+    if definition is None:
+        raise WorkflowNotFoundError(f"Workflow definition not found: {workflow_id}")
+    meta = definition.get("_meta") if isinstance(definition.get("_meta"), dict) else {}
+    if meta.get("kind") != "user":
+        raise ValueError("Only user workflows may enter review")
+    if review_status(meta) != "submitted":
+        raise ValueError("Only submitted workflows may be reviewed")
+    meta["review_status"] = "approved" if approved else "rejected"
+    meta["reviewed_at"] = _now_iso()
+    meta["reviewed_by_user_id"] = reviewer_user_id
+    meta["review_decision_note"] = (note or "").strip()[:1000] or None
+    meta["updated_at"] = _now_iso()
+    path = _resolve_file(workflow_id)
+    if path is None:
+        raise WorkflowNotFoundError(f"Workflow definition not found: {workflow_id}")
+    _write_file(path, definition)
+    return definition
+
+
+def list_review_submissions() -> list[dict[str, Any]]:
+    """Return submitted user workflows for the administrator review queue."""
+    rows: list[dict[str, Any]] = []
+    for item in list_definitions():
+        if item.get("kind") == "user" and item.get("review_status") == "submitted":
+            rows.append(item)
+    return rows
+
+
+def can_view_definition(
+    meta: dict[str, Any],
+    *,
+    role: str | None,
+    user_id: int | None,
+) -> bool:
+    """Whether a principal may discover/read a workflow definition.
+
+    System definitions keep their existing ACL behaviour. User definitions are
+    private to their owner unless an admin explicitly publishes them. Legacy
+    user files without an owner/published marker fail closed for non-admins.
+    """
+    if role == "admin":
+        return True
+    if meta.get("kind") == "system":
+        return True
+    if meta.get("published") is True:
+        return True
+    owner = meta.get("owner_user_id")
+    if owner is None or user_id is None:
+        return False
+    try:
+        return int(owner) == int(user_id)
+    except (TypeError, ValueError):
+        return False
+
+
+def is_definition_owner(meta: dict[str, Any], user_id: int | None) -> bool:
+    """Return True only when *user_id* is the declared user-definition owner."""
+    if meta.get("kind") == "system" or user_id is None:
+        return False
+    owner = meta.get("owner_user_id")
+    if owner is None:
+        return False
+    try:
+        return int(owner) == int(user_id)
+    except (TypeError, ValueError):
+        return False
+
+
+def set_definition_published(workflow_id: str, published: bool) -> dict[str, Any]:
+    """Set public visibility for a user definition (router enforces admin)."""
+    definition = get_definition(workflow_id)
+    if definition is None:
+        raise WorkflowNotFoundError(f"Workflow definition not found: {workflow_id}")
+    meta = definition.get("_meta")
+    if not isinstance(meta, dict) or meta.get("kind") == "system":
+        raise ValueError("System workflow publication cannot be changed")
+    meta["published"] = bool(published)
+    meta["updated_at"] = _now_iso()
+    path = _resolve_file(workflow_id)
+    if path is None:
+        raise WorkflowNotFoundError(f"Workflow definition not found: {workflow_id}")
+    _write_file(path, definition)
+    return definition
+
+
+def _resolve_file(workflow_id: str) -> Path | None:
+    """在 system/ 和 user/ 目录（及打包种子目录）中查找工作流定义文件。"""
+    _validate_id(workflow_id)
+    sys_file = system_dir() / f"{workflow_id}.json"
+    if sys_file.exists():
+        return sys_file
+    usr_file = user_dir() / f"{workflow_id}.json"
+    if usr_file.exists():
+        return usr_file
+    seed_file = _SEED_SYSTEM_DIR / f"{workflow_id}.json"
+    if seed_file.exists():
+        return seed_file
+    return None
+
+
+def _read_file(path: Path) -> dict[str, Any]:
+    """读取并解析 JSON 文件。
+
+    捕获 FileNotFoundError（TOCTOU：_resolve_file 检查 exists() 后文件被并发删除）
+    并转换为 WorkflowNotFoundError，供 router 层映射为 404。
+    """
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError as exc:
+        raise WorkflowNotFoundError(
+            f"Workflow definition file disappeared: {path.name}"
+        ) from exc
+    try:
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"Workflow definition must be a JSON object, got {type(data)}"
+            )
+        return data
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in {path.name}: {exc}") from exc
+
+
+def _write_file(path: Path, data: dict[str, Any], exclusive: bool = False) -> None:
+    """原子写入 JSON 文件（UTF-8, 缩进 2）。
+
+    Args:
+        path: 目标文件路径
+        data: 要写入的数据
+        exclusive: True 时使用独占创建模式（O_CREAT | O_EXCL），文件已存在则抛
+            FileExistsError，用于 create_definition 防止并发竞态覆盖。
+            False 时（默认，用于 update_definition）使用临时文件 + os.replace
+            原子替换，保证进程崩溃不会损坏已有文件。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(data, ensure_ascii=False, indent=2)
+
+    if exclusive:
+        # 独占创建：O_EXCL 保证文件不存在时才创建，防止并发覆盖
+        # 注意：此分支写入非原子（进程崩溃留下空文件），但不会覆盖已有数据
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+        except Exception:
+            # 写入失败时清理占位文件
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+            raise
+    else:
+        # 原子覆盖：写入同目录临时文件后 os.replace 原子替换
+        # 进程崩溃时已有文件保持完整，临时文件残留为 .{name}.{random}.tmp
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp_path, path)
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+            raise
+
+
+# ─── 公开接口 ────────────────────────────────────────────────────────────────
+def list_definitions() -> list[dict[str, Any]]:
+    """列出所有工作流定义（system + user），返回摘要列表。"""
+    _ensure_dirs()
+    results: list[dict[str, Any]] = []
+
+    for directory, default_kind in [(system_dir(), "system"), (user_dir(), "user")]:
+        if not directory.exists():
+            continue
+        for path in sorted(directory.glob("*.json")):
+            try:
+                data = _read_file(path)
+                meta = data.get("_meta", {})
+                # hidden 标记：编译烟测载体（stub_v1 sample）不出现在用户列表；
+                # get_definition 按 id 直取与运行不受影响（定时器/已保存引用仍可用）
+                if "hidden" in (meta.get("tags") or []):
+                    continue
+                results.append(
+                    {
+                        "workflow_id": data.get("workflow_id", path.stem),
+                        "kind": meta.get("kind", default_kind),
+                        "engine": meta.get("engine", "unknown"),
+                        "name": meta.get("name", data.get("workflow_id", path.stem)),
+                        "description": meta.get("description"),
+                        "readonly": meta.get("readonly", default_kind == "system"),
+                        "owner_user_id": meta.get("owner_user_id"),
+                        "published": meta.get("published", False),
+                        "review_status": review_status(meta) if meta.get("kind", default_kind) == "user" else None,
+                        "review_submitted_at": meta.get("review_submitted_at"),
+                        "is_template": bool(meta.get("is_template", False)),
+                        "linked_layer_id": meta.get("linked_layer_id"),
+                        "updated_at": meta.get("updated_at"),
+                        "node_count": len(data.get("nodes", [])),
+                        "tags": meta.get("tags", []),
+                        "category": meta.get("category"),
+                    }
+                )
+            except Exception as exc:
+                logger.warning("Failed to read workflow definition %s: %s", path, exc)
+
+    return results
+
+
+def get_definition(workflow_id: str) -> dict[str, Any] | None:
+    """获取单个工作流定义的完整内容。
+
+    首次读取前惰性同步 system 种子（2026-08-25 修复）：此前同步仅在
+    list/create 路径触发，服务重启后若无人访问列表页，种子修复
+    （如 ω 反演默认时间窗 {TODAY-10}~{TODAY-3}）到不了运行时定义目录，
+    读路径永远拿到旧内容——「改了种子不生效」的根因。每进程只同步
+    一次；同步幂等（内容相同跳过），多 worker 竞态无害。
+    """
+    global _SEED_SYNC_DONE
+    if not _SEED_SYNC_DONE:
+        try:
+            _ensure_dirs()
+        except OSError as exc:
+            logger.warning("Seed sync on first read failed: %s", exc)
+        _SEED_SYNC_DONE = True
+    path = _resolve_file(workflow_id)
+    if path is None:
+        return None
+    return _read_file(path)
+
+
+def create_definition(
+    payload: dict[str, Any],
+    *,
+    owner_user_id: int | None = None,
+) -> dict[str, Any]:
+    """创建用户工作流定义。
+
+    使用 O_EXCL 独占创建模式防止并发竞态：两个并发请求创建相同 workflow_id 时，
+    仅一个成功，另一个抛 WorkflowExistsError（router 映射为 409 Conflict）。
+    """
+    _ensure_dirs()
+
+    workflow_id = payload.get("workflow_id")
+    if not workflow_id or not isinstance(workflow_id, str):
+        raise ValueError("workflow_id is required and must be a string")
+    _validate_id(workflow_id)
+
+    # system 定义不会动态创建，预检查安全（无 TOCTOU 风险）
+    sys_file = system_dir() / f"{workflow_id}.json"
+    if sys_file.exists():
+        raise WorkflowExistsError(
+            f"workflow_id '{workflow_id}' is reserved by system definition"
+        )
+
+    usr_file = user_dir() / f"{workflow_id}.json"
+
+    engine = payload.get("engine", "common")
+    name = payload.get("name", workflow_id)
+    description = payload.get("description")
+
+    meta = _build_meta(
+        kind="user",
+        engine=engine,
+        name=name,
+        description=description,
+        author="user",
+        linked_layer_id=payload.get("linked_layer_id"),
+        tags=payload.get("tags"),
+        category=payload.get("category"),
+        owner_user_id=owner_user_id,
+    )
+
+    definition = {
+        "_meta": meta,
+        "workflow_id": workflow_id,
+        "name": name,
+        "description": description,
+        "nodes": payload.get("nodes", []),
+        "links": payload.get("links", []),
+        "extra": payload.get("extra", {}),
+    }
+
+    # exclusive=True：O_EXCL 保证独占创建，文件已存在时抛 FileExistsError
+    # 移除前置 usr_file.exists() 检查，避免 TOCTOU 窗口
+    try:
+        _write_file(usr_file, definition, exclusive=True)
+    except FileExistsError as exc:
+        raise WorkflowExistsError(
+            f"workflow_id '{workflow_id}' already exists. Use PUT to update."
+        ) from exc
+    logger.info("Created user workflow definition: %s", workflow_id)
+    return definition
+
+
+def update_definition(workflow_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """更新用户工作流定义。system 定义不可更新。"""
+    _validate_id(workflow_id)
+
+    path = _resolve_file(workflow_id)
+    if path is None:
+        raise WorkflowNotFoundError(f"Workflow definition not found: {workflow_id}")
+
+    existing = _read_file(path)
+    meta = existing.get("_meta", {})
+
+    if meta.get("kind") == "system" or meta.get("readonly", False):
+        raise ValueError(f"Cannot modify system workflow definition: {workflow_id}")
+    state = review_status(meta)
+    if state in {"submitted", "approved"}:
+        raise ValueError(
+            "Submitted or approved workflow must be duplicated before further changes"
+        )
+
+    # 更新字段
+    meta["updated_at"] = _now_iso()
+    # A rejected workflow becomes a new editable draft as soon as its owner
+    # changes it; previous review evidence remains, but it must be submitted
+    # again before an administrator can approve it.
+    if state == "rejected":
+        meta["review_status"] = "draft"
+    if "name" in payload:
+        meta["name"] = payload["name"]
+    if "description" in payload:
+        meta["description"] = payload["description"]
+    if "engine" in payload:
+        meta["engine"] = payload["engine"]
+    if "linked_layer_id" in payload:
+        meta["linked_layer_id"] = payload["linked_layer_id"]
+    if "tags" in payload:
+        meta["tags"] = payload["tags"]
+    if "category" in payload:
+        meta["category"] = payload["category"]
+
+    definition = {
+        "_meta": meta,
+        "workflow_id": workflow_id,
+        "name": meta.get("name", workflow_id),
+        "description": meta.get("description"),
+        "nodes": payload.get("nodes", existing.get("nodes", [])),
+        "links": payload.get("links", existing.get("links", [])),
+        "extra": payload.get("extra", existing.get("extra", {})),
+    }
+
+    _write_file(path, definition)
+    logger.info("Updated user workflow definition: %s", workflow_id)
+    return definition
+
+
+def delete_definition(workflow_id: str) -> bool:
+    """删除用户工作流定义。system 定义不可删除。"""
+    _validate_id(workflow_id)
+
+    path = _resolve_file(workflow_id)
+    if path is None:
+        raise WorkflowNotFoundError(f"Workflow definition not found: {workflow_id}")
+
+    existing = _read_file(path)
+    meta = existing.get("_meta", {})
+
+    if meta.get("kind") == "system" or meta.get("readonly", False):
+        raise ValueError(f"Cannot delete system workflow definition: {workflow_id}")
+
+    path.unlink()
+    logger.info("Deleted user workflow definition: %s", workflow_id)
+    return True
+
+
+def duplicate_definition(
+    source_id: str,
+    new_id: str,
+    new_name: str | None = None,
+    *,
+    owner_user_id: int | None = None,
+) -> dict[str, Any]:
+    """复制现有工作流定义为新的用户工作流。"""
+    source = get_definition(source_id)
+    if source is None:
+        raise WorkflowNotFoundError(f"Source workflow not found: {source_id}")
+
+    source_meta = (
+        source.get("_meta", {}) if isinstance(source.get("_meta"), dict) else {}
+    )
+    # 从范例/系统流新建时保留关联图层，便于副本可直接运行；纯用户复制同样继承，可在编辑器改绑。
+    payload = {
+        "workflow_id": new_id,
+        "name": new_name or f"{source_meta.get('name', source_id)} (copy)",
+        "description": source_meta.get("description"),
+        "engine": source_meta.get("engine", "common"),
+        "linked_layer_id": source_meta.get("linked_layer_id"),
+        "nodes": source.get("nodes", []),
+        "links": source.get("links", []),
+        "extra": source.get("extra", {}),
+    }
+
+    return create_definition(payload, owner_user_id=owner_user_id)

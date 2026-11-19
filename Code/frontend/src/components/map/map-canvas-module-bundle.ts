@@ -1,0 +1,339 @@
+import { createAdminBoundaryModule } from './admin-boundary-module'
+import { createBasemapModule } from './basemap-module'
+import { createDrawModule, type DrawModule, type DrawStateSnapshot } from './draw-module'
+import type { DrawFeature, DrawVertex } from '../../stores/draw-store'
+import { createHotspotPinsModule } from './hotspot-pins-module'
+import { createMapInteractionModule } from './map-interaction-module'
+import { createMapCanvasRuntimeModule } from './map-canvas-runtime-module'
+import { createMapCanvasWeatherOverlayModule } from './map-canvas-weather-overlay-module'
+import {
+  createMapCanvasNonWeatherLayerSyncModule,
+  type MapCanvasNonWeatherLayerSyncModule,
+} from './map-canvas-non-weather-layer-sync-module'
+import { createMeasureModule } from './measure-module'
+import { createSelectedLayerFocusModule } from './selected-layer-focus-module'
+import type { WeatherOverlayModule } from './weather-overlay-module'
+import type { TileSourceConfig } from '../../services/api-config'
+
+type MapInstance = import('maplibre-gl').Map
+type TileSourceId = import('../../services/api-config').TileSourceId
+type LayerHotspot = import('../../stores/layers/types').LayerHotspot
+type ActiveLayerDisplay = import('../../stores/layers/types').ActiveLayerDisplay
+type ActiveLayer = import('../../stores/layers/types').ActiveLayer
+type InteractionMode = import('../../stores/ui').InteractionMode
+type MeasureState = import('../../stores/ui').MeasureState
+type MeasurePoint = import('../../stores/ui').MeasurePoint
+type DebugLogger = (module: string, ...args: unknown[]) => void
+
+interface LayersStoreLike {
+  activeLayers: ActiveLayer[]
+  activeLayersDisplay: ActiveLayerDisplay[]
+  particleFlowCatalogId: string | null
+  windDisplayMode: import('./wind-display-mode').WindDisplayMode
+  smoothRendering: boolean
+  isWeatherEngineLayer: (catalogId: string) => boolean
+  setMapViewport: (
+    center: { lng: number; lat: number },
+    bbox: { west: number; south: number; east: number; north: number; crs: 'EPSG:4326' } | null,
+    zoom?: number,
+    options?: { immediate?: boolean },
+  ) => void
+  /** P1 lifecycle 双写：把地图 overlay 时间状态回传给 layers lifecycle 域。 */
+  setMapOverlayTimeStates?: (
+    states: Array<{
+      layerId: string
+      category: string
+      timeList: string[]
+      currentTime: string | null
+    }>,
+  ) => void
+}
+
+interface WeatherTileManagerLike {
+  getMergedGeojsonForViewport: (
+    catalogId: string,
+  ) => import('./weather-overlay-registry').WeatherOverlayState['geojsonData']
+  getViewportBounds: (
+    catalogId: string,
+  ) => import('./weather-overlay-registry').WeatherOverlayState['viewportBounds']
+  dataVersion: number
+}
+
+export interface MapCanvasModuleBundle {
+  basemapModule: ReturnType<typeof createBasemapModule>
+  adminBoundaryModule: ReturnType<typeof createAdminBoundaryModule>
+  weatherOverlayModule: WeatherOverlayModule
+  nonWeatherLayerSyncModule: MapCanvasNonWeatherLayerSyncModule
+  hotspotPinsModule: ReturnType<typeof createHotspotPinsModule>
+  mapInteractionModule: ReturnType<typeof createMapInteractionModule>
+  mapCanvasRuntimeModule: ReturnType<typeof createMapCanvasRuntimeModule>
+  selectedLayerFocusModule: ReturnType<typeof createSelectedLayerFocusModule>
+  measureModule: ReturnType<typeof createMeasureModule>
+  drawModule: DrawModule
+}
+
+interface CreateMapCanvasModuleBundleOptions {
+  map: MapInstance
+  layersStore: LayersStoreLike
+  weatherTileManager: WeatherTileManagerLike
+  getCurrentHour: () => number
+  getMapReady: () => boolean
+  getTileConfig: (sourceId: TileSourceId) => TileSourceConfig | undefined
+  getCurrentTileSourceId: () => TileSourceId
+  setTileLoadFailed: (failed: boolean) => void
+  setTileFailedProvider: (provider: string | null) => void
+  setSourceTransitioning: (transitioning: boolean) => void
+  onAfterSourceSwitch: () => void
+  onProviderFailover?: (nextSourceId: TileSourceId, failedProvider: string) => void
+  getFailoverCandidates?: (
+    currentSourceId: TileSourceId,
+    excludeProviders: ReadonlySet<string>,
+  ) => TileSourceId[]
+  setLoadingLabel: (label: string) => void
+  getSelectedLayer: () => ActiveLayerDisplay | null | undefined
+  getSelectedHotspotId: () => string | null
+  setSelectedHotspotId: (hotspotId: string | null) => void
+  emitVisibleHotspotsChange: (hotspots: LayerHotspot[]) => void
+  emitHotspotSelect: (hotspot: LayerHotspot | null) => void
+  setHotspotPins: (
+    pins: Array<{
+      id: string
+      name: string
+      value: string
+      left: string
+      top: string
+      selected: boolean
+    }>,
+  ) => void
+  getInteractionMode: () => InteractionMode
+  setIsMapInteracting: (interacting: boolean) => void
+  scheduleHotspotSync: () => void
+  emitMapPointSelect: (point: { lng: number; lat: number }) => void
+  getHasAdminBoundary: () => boolean
+  getAdminBoundaryOpacity: () => number
+  syncAdminOverlay: () => void
+  debugLog: DebugLogger
+  weatherDebounceMs?: number
+  // ── 测量模式相关 ──
+  getMeasureState: () => MeasureState
+  addMeasurePoint: (p: MeasurePoint) => void
+  undoLastMeasurePoint: () => void
+  completeMeasure: () => void
+  setHoverPoint: (p: MeasurePoint | null) => void
+  clearMeasure: () => void
+  // ── 绘制模式相关 ──
+  getDrawState: () => DrawStateSnapshot
+  addDrawVertex: (v: DrawVertex) => void
+  undoDrawVertex: () => void
+  setDrawHoverPoint: (p: DrawVertex | null) => void
+  addDrawFeature: (f: DrawFeature) => void
+  clearDrawVertices: () => void
+  setDrawDrawingFlag: (v: boolean) => void
+  scheduleDrawPersist: () => void
+  /** 绘制会话中抑制草稿/编辑矢量在 imported-layer 上的二次渲染 */
+  shouldSuppressImportedMapRender?: (instanceId: string) => boolean
+  getImportedMapSuppressKey?: () => string
+  /** 闭合后由 imported 展示完成面时，draw fill/line 省略已完成要素 */
+  omitCompletedDrawFeatures?: () => boolean
+  dependencies?: {
+    createBasemapModule?: typeof createBasemapModule
+    createAdminBoundaryModule?: typeof createAdminBoundaryModule
+    createMapCanvasWeatherOverlayModule?: typeof createMapCanvasWeatherOverlayModule
+    createMapCanvasNonWeatherLayerSyncModule?: typeof createMapCanvasNonWeatherLayerSyncModule
+    createHotspotPinsModule?: typeof createHotspotPinsModule
+    createMapInteractionModule?: typeof createMapInteractionModule
+    createMapCanvasRuntimeModule?: typeof createMapCanvasRuntimeModule
+    createSelectedLayerFocusModule?: typeof createSelectedLayerFocusModule
+    createMeasureModule?: typeof createMeasureModule
+    createDrawModule?: typeof createDrawModule
+  }
+}
+
+export function createMapCanvasModuleBundle(
+  options: CreateMapCanvasModuleBundleOptions,
+): MapCanvasModuleBundle {
+  const createBasemapModuleImpl = options.dependencies?.createBasemapModule ?? createBasemapModule
+  const createAdminBoundaryModuleImpl =
+    options.dependencies?.createAdminBoundaryModule ?? createAdminBoundaryModule
+  const createMapCanvasWeatherOverlayModuleImpl =
+    options.dependencies?.createMapCanvasWeatherOverlayModule ?? createMapCanvasWeatherOverlayModule
+  const createMapCanvasNonWeatherLayerSyncModuleImpl =
+    options.dependencies?.createMapCanvasNonWeatherLayerSyncModule ??
+    createMapCanvasNonWeatherLayerSyncModule
+  const createHotspotPinsModuleImpl =
+    options.dependencies?.createHotspotPinsModule ?? createHotspotPinsModule
+  const createMapInteractionModuleImpl =
+    options.dependencies?.createMapInteractionModule ?? createMapInteractionModule
+  const createMapCanvasRuntimeModuleImpl =
+    options.dependencies?.createMapCanvasRuntimeModule ?? createMapCanvasRuntimeModule
+  const createSelectedLayerFocusModuleImpl =
+    options.dependencies?.createSelectedLayerFocusModule ?? createSelectedLayerFocusModule
+  const createMeasureModuleImpl = options.dependencies?.createMeasureModule ?? createMeasureModule
+  const createDrawModuleImpl = options.dependencies?.createDrawModule ?? createDrawModule
+
+  const basemapModule = createBasemapModuleImpl({
+    map: options.map,
+    getTileConfig: options.getTileConfig,
+    getCurrentTileSourceId: options.getCurrentTileSourceId,
+    setTileLoadFailed: options.setTileLoadFailed,
+    setTileFailedProvider: options.setTileFailedProvider,
+    setSourceTransitioning: options.setSourceTransitioning,
+    onAfterSourceSwitch: options.onAfterSourceSwitch,
+    onProviderFailover: options.onProviderFailover,
+    getFailoverCandidates: options.getFailoverCandidates,
+  })
+
+  const adminBoundaryModule = createAdminBoundaryModuleImpl({
+    map: options.map,
+    setLoadingLabel: options.setLoadingLabel,
+  })
+
+  const weatherOverlayModule = createMapCanvasWeatherOverlayModuleImpl({
+    map: options.map,
+    getMapReady: options.getMapReady,
+    layersStore: options.layersStore,
+    weatherTileManager: options.weatherTileManager,
+    getCurrentHour: options.getCurrentHour,
+    debugLog: options.debugLog,
+    debounceMs: options.weatherDebounceMs,
+  })
+
+  const mapInteractionModule = createMapInteractionModuleImpl({
+    map: options.map,
+    layersStore: options.layersStore,
+    getInteractionMode: options.getInteractionMode,
+    setIsMapInteracting: options.setIsMapInteracting,
+    scheduleHotspotSync: options.scheduleHotspotSync,
+    emitMapPointSelect: options.emitMapPointSelect,
+  })
+
+  let drawBringToFront: (() => void) | null = null
+
+  const nonWeatherLayerSyncModule = createMapCanvasNonWeatherLayerSyncModuleImpl({
+    map: options.map,
+    getMapReady: options.getMapReady,
+    getActiveLayers: () => options.layersStore.activeLayers,
+    getActiveVisibleCatalogIds: () =>
+      options.layersStore.activeLayersDisplay.filter((l) => l.visible).map((l) => l.catalogId),
+    onOverlayTimeStatesChanged: (states) => options.layersStore.setMapOverlayTimeStates?.(states),
+    restoreMapCursor: () => mapInteractionModule.applyInteractionMode(),
+    shouldSuppressImportedMapRender: (instanceId) =>
+      options.shouldSuppressImportedMapRender?.(instanceId) === true,
+    onAfterLayerStackOrder: () => drawBringToFront?.(),
+    getImportedMapSuppressKey: () => options.getImportedMapSuppressKey?.() ?? '',
+  })
+
+  const hotspotPinsModule = createHotspotPinsModuleImpl({
+    map: options.map,
+    getHotspots: () => options.getSelectedLayer()?.hotspots ?? [],
+    getSelectedHotspotId: options.getSelectedHotspotId,
+    setSelectedHotspotId: options.setSelectedHotspotId,
+    emitVisibleHotspotsChange: options.emitVisibleHotspotsChange,
+    emitHotspotSelect: options.emitHotspotSelect,
+    setHotspotPins: options.setHotspotPins,
+  })
+
+  // measureModule 在 mapCanvasRuntimeModule 之前创建，
+  // 以便 onInteractionModeChange 回调能引用它（避免 TDZ）
+  const measureModule = createMeasureModuleImpl({
+    map: options.map,
+    getInteractionMode: options.getInteractionMode,
+    getMeasureState: options.getMeasureState,
+    addMeasurePoint: options.addMeasurePoint,
+    undoLastMeasurePoint: options.undoLastMeasurePoint,
+    completeMeasure: options.completeMeasure,
+    setHoverPoint: options.setHoverPoint,
+    clearMeasure: options.clearMeasure,
+  })
+
+  const drawModule = createDrawModuleImpl({
+    map: options.map,
+    getInteractionMode: options.getInteractionMode,
+    getDrawState: options.getDrawState,
+    addVertex: options.addDrawVertex,
+    undoLastVertex: options.undoDrawVertex,
+    setHoverPoint: options.setDrawHoverPoint,
+    addFeature: options.addDrawFeature,
+    clearActiveVertices: options.clearDrawVertices,
+    setDrawingFlag: options.setDrawDrawingFlag,
+    scheduleDraftPersist: options.scheduleDrawPersist,
+    omitCompletedFeatures: () => options.omitCompletedDrawFeatures?.() === true,
+  })
+  drawBringToFront = () => {
+    if (options.getInteractionMode() === 'draw') drawModule.bringToFront()
+  }
+
+  const mapCanvasRuntimeModule = createMapCanvasRuntimeModuleImpl({
+    getTileSourceId: options.getCurrentTileSourceId,
+    getMapReady: options.getMapReady,
+    getInteractionMode: options.getInteractionMode,
+    getHasAdminBoundary: options.getHasAdminBoundary,
+    getAdminBoundaryOpacity: options.getAdminBoundaryOpacity,
+    getMeasureSyncKey: () => {
+      const s = options.getMeasureState()
+      return `${s.points.length}:${s.isDrawing ? 1 : 0}`
+    },
+    getDrawSyncKey: () => {
+      const s = options.getDrawState()
+      // 含要素几何摘要：同长度删除/替换也必须触发 sync，避免边界残留；
+      // 多边形含环数（内环变化同样触发，编辑带洞要素不残留）
+      const geomKey = s.features
+        .map((f) => {
+          const g = f.geometry
+          if (g.type === 'Polygon') return `P${g.coordinates.map((r) => r.length).join('_')}`
+          if (g.type === 'LineString') return `L${g.coordinates.length}`
+          // DrawFeature.geometry 现为 Polygon | LineString（stores/draw-store.ts），
+          // 故上面的分支已穷尽，此处 TS 会推断为 never。保留兜底（而非删除）以便未来
+          // 扩宽几何类型时仍产出稳定的同步 key，而不是抛出或静默丢帧。
+          return String((g as { type?: unknown }).type ?? 'unknown')
+        })
+        .join(',')
+      const omit = options.omitCompletedDrawFeatures?.() === true ? 1 : 0
+      return `${s.drawMode}:${s.features.length}:${geomKey}:${s.activeVertices.length}:${s.isDrawing ? 1 : 0}:${omit}:${s.selectedFeatureIndex ?? -1}`
+    },
+    onTileSourceChange: (sourceId) => {
+      basemapModule.scheduleTileSourceSwitch(sourceId)
+    },
+    onInteractionModeChange: () => {
+      mapInteractionModule.applyInteractionMode()
+      measureModule.applyMeasureMode()
+      drawModule.applyDrawMode()
+      // 报障 2026-08-22：进入绘制/测量模式时确保交互层置顶——
+      // 数据层后添加会压过绘制层，导致绘制中被数据图层遮挡
+      drawModule.bringToFront()
+      // 非「点选」模式：清除选中点，避免移动/测量模式下残留 inspect 圆点与选中高亮
+      const mode = options.getInteractionMode()
+      if (mode !== 'select') {
+        options.setSelectedHotspotId(null)
+        options.emitHotspotSelect(null)
+      }
+    },
+    onAdminBoundaryOverlayChange: options.syncAdminOverlay,
+    onMeasureStateChange: () => {
+      measureModule.syncFromStore()
+    },
+    onDrawStateChange: () => {
+      drawModule.syncFromStore()
+    },
+  })
+
+  const selectedLayerFocusModule = createSelectedLayerFocusModuleImpl({
+    map: options.map,
+    getSelectedLayer: options.getSelectedLayer,
+    scheduleHotspotSync: options.scheduleHotspotSync,
+    debugLog: options.debugLog,
+  })
+
+  return {
+    basemapModule,
+    adminBoundaryModule,
+    weatherOverlayModule,
+    nonWeatherLayerSyncModule,
+    hotspotPinsModule,
+    mapInteractionModule,
+    mapCanvasRuntimeModule,
+    selectedLayerFocusModule,
+    measureModule,
+    drawModule,
+  }
+}

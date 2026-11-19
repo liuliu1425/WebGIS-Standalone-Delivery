@@ -1,0 +1,71 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "合成西区"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              0.1,
+              1.1
+            ],
+            [
+              0.9,
+              1.1
+            ],
+            [
+              0.9,
+              1.9
+            ],
+            [
+              0.1,
+              1.9
+            ],
+            [
+              0.1,
+              1.1
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "合成东区"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              2.1,
+              1.1
+            ],
+            [
+              2.9,
+              1.1
+            ],
+            [
+              2.9,
+              1.9
+            ],
+            [
+              2.1,
+              1.9
+            ],
+            [
+              2.1,
+              1.1
+            ]
+          ]
+        ]
+      }
+    }
+  ]
+}

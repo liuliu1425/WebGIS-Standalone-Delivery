@@ -1,0 +1,1027 @@
+<script setup lang="ts">
+/**
+ * DashboardView — 仪表盘主视图（编排壳）。
+ *
+ * 职责：初始化 store / 组装 composables / 声明少量内联 handler / 渲染模板。
+ * 时间轴同步、天气覆盖、地图点查、工作流编辑器运行等逻辑均委托给 composables。
+ *
+ * 拆分历史：原 1659 行 → CSS 提取(-196) → composable 提取(-1050)
+ */
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, ref, toRef, watch } from 'vue'
+import { Globe } from '../components/ui/icons'
+import { useDataImportFlow } from '../data-manager/core/workspace-store'
+
+import PanelDock from '../components/ui/PanelDock.vue'
+import InfoPanel from '../components/InfoPanel.vue'
+import LayerSidebar from '../components/LayerSidebar.vue'
+import SidebarMiniLegend from '../components/layer-sidebar/SidebarMiniLegend.vue'
+import MapCanvas from '../components/MapCanvas.vue'
+import ModeToolbar from '../components/ModeToolbar.vue'
+import TimeSeriesWorkspace from '../components/timeseries/TimeSeriesWorkspace.vue'
+import TimelineActionBanner from '../components/TimelineActionBanner.vue'
+import OnlinePlanPanel from '../components/OnlinePlanPanel.vue'
+import LogPanel from '../components/toolbar/LogPanel.vue'
+import AgentCompanion from '../components/agent/AgentCompanion.vue'
+import { registerOnDemandFrameProvider } from '../components/agent/agent-ui-intent'
+import TimelinePanel from '../components/TimelinePanel.vue'
+import TimelineScrubber from '../components/TimelineScrubber.vue'
+import DrawSessionExitModal from '../components/map/DrawSessionExitModal.vue'
+import WorkflowStatusPanel from '../components/workflow/WorkflowStatusPanel.vue'
+import { useGlobeRenderEngine } from '../components/map/globe-engine/use-globe-render-engine'
+import { resolveLayerExtentBounds } from '../components/map/globe-engine/layer-extent'
+import {
+  isTileSourceUsable,
+  resolveKnownTileSourceId,
+  TILE_SOURCE_MAP,
+  type TileSourceId,
+} from '../services/api-config'
+import {
+  is3DViewExperimentalEnabled,
+  isAgentCompanionEnabled,
+  subscribe3DViewExperimental,
+  subscribeAgentCompanion,
+} from '../services/settings-local'
+import { isReducedMotionActive } from '../services/motion-preference'
+import { importLazyChunk } from '../utils/lazy-chunk'
+import type { OverlayTimeState } from '../components/map/overlay-image-module'
+import { useUiStore } from '../stores/ui'
+import { useUiLoadingStore } from '../stores/ui-loading'
+import { useLayerWorkspace, useLayerLifecycle, useWorkflowRun } from '../stores/layers/selectors'
+import { syncWorkspaceOnBoot, teardownWorkspaceSync } from '../stores/layers/workspace-sync'
+import { defaultPrimaryOverlayId, ensureDefaultLayers } from '../stores/layers/default-layers'
+import { useLogStore } from '../stores/log'
+import { useSettingsStore } from '../stores/settings'
+import { useWeatherTileManager } from '../stores/weather-tile-manager'
+import { useWeatherSyncStatusStore } from '../stores/weather-sync-status'
+import { useWeatherEngineStore } from '../stores/weather-engine'
+import { useWorkflowOutputLayersStore } from '../stores/workflow-output-layers'
+import { buildFallbackActiveLayerDisplay } from '../components/map/map-stage-view-model'
+import {
+  resolveAnalysisStageKind,
+  resolveAnalysisStageLabel,
+} from '../components/info-panel/analysis-panel-summary'
+
+// ── Composables ──────────────────────────────────────────────────────────
+import { usePanelManager } from './dashboard/usePanelManager'
+import { useWeatherCoverage } from './dashboard/useWeatherCoverage'
+import { useTimelineSync } from './dashboard/useTimelineSync'
+import { useMapInspect } from './dashboard/useMapInspect'
+import { useDrawSessionTransition } from '../composables/useDrawSessionTransition'
+import { useTimelineControls } from './dashboard/useTimelineControls'
+import { useOnDemandFrame } from './dashboard/useOnDemandFrame'
+import { useOnDemandFrameStore } from '../stores/layers/ondemand-frame'
+import { useFileDrop } from './dashboard/useFileDrop'
+import { useWorkflowEditorRun } from './dashboard/useWorkflowEditorRun'
+import { useOnlineTemporalIntegration } from './dashboard/useOnlineTemporalIntegration'
+import { useTimelineActionConfirm } from './dashboard/useTimelineActionConfirm'
+
+// ── Store 设置 ────────────────────────────────────────────────────────────
+const uiStore = useUiStore()
+const { requestInteractionMode } = useDrawSessionTransition()
+
+async function handleEnterSelectMode() {
+  await requestInteractionMode('select')
+}
+const workspace = useLayerWorkspace()
+const workflowRun = useWorkflowRun()
+const lifecycle = useLayerLifecycle()
+const logStore = useLogStore()
+const uiLoading = useUiLoadingStore()
+const weatherTileManager = useWeatherTileManager()
+const weatherSyncStatus = useWeatherSyncStatusStore()
+const weatherEngine = useWeatherEngineStore()
+const workflowOutputStore = useWorkflowOutputLayersStore()
+/** 仅用于助手切底图前校验「该底图有没有可用密钥」 */
+const settingsStore = useSettingsStore()
+
+uiLoading.showImmediate('初始化地图数据...')
+void workspace.ensureRuntimeLayerCatalog().finally(() => uiLoading.hideImmediate())
+// 先完成跨设备工作区同步（远端较新时接管 localStorage），再从快照恢复图层。
+// 全程开启水合保护：防止 MapCanvas 草稿恢复的早期落盘在矢量图层恢复前
+// 重写快照，把未恢复的导入图层永久抹掉（见 workspace-hydrate 注释）。
+void (async () => {
+  workflowRun.setWorkspaceHydrationGuard(true)
+  try {
+    await syncWorkspaceOnBoot()
+    await workflowRun.restoreActiveWorkflows()
+  } finally {
+    workflowRun.setWorkspaceHydrationGuard(false)
+  }
+  // 默认图层：打开网页即自动挂载（如 SMAP 平均散射约束产品的 ω）。
+  // 刻意放在水合保护之外——挂载结果能正常落盘，下次打开直接由快照恢复；
+  // 且原有恢复流程先跑完，已存在的层不会被重复添加（见 default-layers.ts）。
+  await ensureDefaultLayers()
+  // 打开网页即把初始视野落到默认图层的整体范围（详见 focusDefaultLayerExtent）
+  void focusDefaultLayerExtent()
+})()
+
+// Dashboard 卸载时清理所有 429 重试定时器，防止已取消的工作流被重新提交
+onBeforeUnmount(() => {
+  workflowRun.cleanupAllRetryTimers()
+  teardownWorkspaceSync()
+  _unsubscribe3DView?.()
+  _unsubscribe3DView = null
+  _unsubscribeAgentCompanion?.()
+  _unsubscribeAgentCompanion = null
+})
+
+const tileSourceId = toRef(uiStore, 'tileSourceId')
+/**
+ * 「海陆底图（无国界）」叠加层开关（顶栏 底图 → 底图叠加 里勾选）。
+ * 只影响显示：在底图之上盖一张海陆双色图，挡住地名与国界；默认开启。
+ * 放在视图层而不是 store，避免动到持久化/快照那套（改了要升 schema）。
+ */
+const landSeaBasemap = ref(true)
+const currentHour = toRef(uiStore, 'currentHour')
+const currentDate = toRef(uiStore, 'currentDate')
+const hourLabel = toRef(uiStore, 'hourLabel')
+const isPlaying = toRef(uiStore, 'isPlaying')
+const playIntervalMs = toRef(uiStore, 'playIntervalMs')
+const unifiedTimeLock = toRef(uiStore, 'unifiedTimeLock')
+const { selectedLayerDisplay, isSubmitting, selectedInstanceId } = workspace
+const {
+  workflowError,
+  workflowProgressTimeSeek,
+  pointWeather,
+  pointWeatherLoading,
+  pointWeatherError,
+} = workflowRun
+const weatherStatusVersion = toRef(weatherTileManager, 'statusVersion')
+const weatherActivityVersion = toRef(weatherTileManager, 'activityVersion')
+
+const activeLayer = computed(() => selectedLayerDisplay.value ?? buildFallbackActiveLayerDisplay())
+const seriesMapContext = computed(() => {
+  const layer = workspace.activeLayers.value.find(l => l.instanceId === selectedInstanceId.value)
+  const productId = layer?.importedRaster?.overlayLayerId || ''
+  return {
+    productId,
+    observationKey: overlayTimeStates.value.find(s => s.layerId === productId)?.currentTime || '',
+    visible: layer?.visible ?? false,
+  }
+})
+
+const has3dCompatibleLayer = computed(() => Boolean(activeLayer.value.instanceId))
+
+const stageLabel = computed(() => {
+  const layer = activeLayer.value
+  const hasRealSelection = Boolean(layer.instanceId)
+  const isWeather = hasRealSelection && workspace.isWeatherEngineLayer(layer.catalogId)
+  const canRun =
+    hasRealSelection &&
+    !layer.isAdminBoundary &&
+    !layer.isImported &&
+    !layer.isImportedRaster &&
+    !isWeather &&
+    workspace.supportsAnalysisWorkflow(layer.catalogId)
+  return resolveAnalysisStageLabel(
+    resolveAnalysisStageKind({
+      hasRealSelection,
+      isWeather,
+      isImported: !!layer.isImported,
+      isImportedRaster: !!layer.isImportedRaster,
+      isAdminBoundary: !!layer.isAdminBoundary,
+      canRunWorkflow: canRun,
+    }),
+  )
+})
+
+// ── 共享 ref ──────────────────────────────────────────────────────────────
+const overlayTimeStates = ref<OverlayTimeState[]>([])
+const dashboardRef = ref<HTMLElement | null>(null)
+const mapShellRef = ref<HTMLElement | null>(null)
+const mapCanvasRef = ref<InstanceType<typeof MapCanvas> | null>(null)
+const timeSeriesOpen = ref(false)
+const timeSeriesResultsVisible = ref(false)
+const timeSeriesTimelineInset = ref(0)
+function locateSeriesPoint(point: [number, number] | null, fly = true): boolean {
+  return mapCanvasRef.value?.locateAnalysisPoint(point, fly) ?? false
+}
+function pickSeriesPoint(done: (point: [number, number]) => void, ended: () => void) {
+  return mapCanvasRef.value?.pickAnalysisPoint(done, ended) ?? false
+}
+function drawSeriesRegion(mode: 'rectangle'|'polygon', done: (geometry: GeoJSON.Polygon) => void): boolean {
+  return mapCanvasRef.value?.beginAnalysisRegion(mode, done) ?? false
+}
+function cancelSeriesDrawing() { mapCanvasRef.value?.cancelAnalysisRegion() }
+function previewSeriesRegion(geometry: GeoJSON.Geometry | null, name = '') { mapCanvasRef.value?.previewAnalysisRegion(geometry, name) }
+const cesiumHostRef = ref<{
+  flyTo?: (lng: number, lat: number, heightMeters?: number) => void
+  flyToBounds: (b: [number, number, number, number]) => void
+  getCanvas: () => HTMLCanvasElement | null
+  capturePngDataUrl?: () => string | null
+  getHostElement: () => HTMLElement | null
+} | null>(null)
+
+// ── Composable 调用（解构为顶层变量，模板自动解包） ──────────────────────
+
+const {
+  screenshotOpen,
+  workflowStatusOpen,
+  logOpen,
+  settingsOpen,
+  workflowEditorOpen,
+  workflowEditorRef,
+  analysisPanelRef,
+  handleOpenScreenshot,
+  handleCloseScreenshot,
+  handleOpenSettings,
+  handleCloseSettings,
+  handleOpenWorkflowStatus,
+  handleCloseWorkflowStatus,
+  handleOpenWorkflowEditor,
+  handleCloseWorkflowEditor,
+} = usePanelManager(uiLoading, mapCanvasRef)
+
+const { weatherCoverage, coverageSourceLabel } = useWeatherCoverage(
+  weatherEngine,
+  weatherSyncStatus,
+  selectedLayerDisplay,
+  unifiedTimeLock,
+  activeLayer,
+)
+
+const {
+  tileForecastHour,
+  selectedCatalogId,
+  hasTimelineLayer,
+  timelineLayerName,
+  timelineAvailabilityLabel,
+  timelineObservationLabel,
+  activeLayerGranularity,
+  timelineSegments,
+  refreshImportedRasterEffectiveTimes,
+} = useTimelineSync(
+  uiStore,
+  logStore,
+  weatherTileManager,
+  weatherCoverage,
+  mapCanvasRef,
+  selectedLayerDisplay,
+  activeLayer,
+  overlayTimeStates,
+  currentHour,
+  currentDate,
+  unifiedTimeLock,
+  isPlaying,
+  weatherStatusVersion,
+  weatherActivityVersion,
+  workflowProgressTimeSeek,
+  analysisPanelRef,
+)
+
+/**
+ * 按需补帧：**用户自己拖时间轴**、以及**助手下发 set_timeline 切到某一天**才去 NAS 取图。
+ * 打开页面 / 勾选图层 / 添加图层 / 切图层都不会触发（见 useOnDemandFrame 头注释），
+ * 所以「一进来还是整月合成」这条不变。
+ *
+ * 没点选图层时（时间轴顶部写「未选择图层」）要动的是**地图上当前可见的**补帧层：
+ * 用户勾了几个层再改日期，期望这几层都跟着变。
+ *
+ * 助手那条走 `ensureFrameForLayer`（2026-11-02）：它按助手点名的图层取数，不看页面选中层，
+ * 否则页面选中的是 ω（未登记按天取数）时会被判成「不用取」，画面停在整段块上。
+ */
+const onDemandFrameStore = useOnDemandFrameStore()
+
+/**
+ * 「补帧身份键」：优先用 `importedRaster.overlayLayerId`（= 后端登记表与产物目录
+ * 真正用的 `imported-<sha1>`），查不到再退回 `catalogId`。
+ *
+ * 2026-11-05 用户实测「风云平均只有月历、SMAP 平均正常」：只查 catalogId 时
+ * 永远命中不了登记表（catalogId 可能是 `method-*`），时间轴就退回 meta 的
+ * `native_step`；风云平均恰好是 `1M`/单片 ⇒ 月历，SMAP 平均是 `1d`/73 片 ⇒ 看着没事。
+ */
+function ondemandKeyOfLayer(layer: {
+  catalogId?: string | null
+  importedRaster?: { overlayLayerId?: string | null } | null
+}): string {
+  const overlayId = layer?.importedRaster?.overlayLayerId
+  if (overlayId && onDemandFrameStore.isOnDemandLayer(overlayId)) return overlayId
+  const catalogId = layer?.catalogId
+  if (catalogId && onDemandFrameStore.isOnDemandLayer(catalogId)) return catalogId
+  return ''
+}
+
+const visibleOnDemandCatalogIds = computed(() =>
+  workspace.activeLayers.value
+    .filter((l) => l.visible)
+    .map((l) => ondemandKeyOfLayer(l))
+    .filter((id): id is string => Boolean(id)),
+)
+
+/** 当前选中层若接了按天取数，给出它的补帧键；否则空串（调用方据此静默或提示） */
+const selectedOnDemandId = computed(() => {
+  const catalogId = selectedCatalogId.value
+  const layer = catalogId
+    ? workspace.activeLayers.value.find((l) => l.catalogId === catalogId)
+    : null
+  if (!layer) return ''
+  return ondemandKeyOfLayer(layer)
+})
+
+const { notifyUserDateChange, ensureFrameForLayer } = useOnDemandFrame({
+  selectedCatalogId,
+  selectedOnDemandId,
+  visibleOnDemandIds: visibleOnDemandCatalogIds,
+  currentDate,
+  isPlaying,
+  onFrameReady: refreshImportedRasterEffectiveTimes,
+  logOperation: (tag, message) => logStore.logOperation(tag, message),
+})
+
+/**
+ * 助手切日期要真去 NAS 取那天，靠这条模块级注册直连（2026-11-02）。
+ *
+ * prop 链是 DashboardView → AgentCompanion → AgentChatPanel → handlers 四跳，
+ * 任何一跳漏传都只表现为「回执说落在时间块内」，跟「这天真没单日帧」分不出来。
+ * 注册表是同一份函数引用，props 那边仍保留，作为可选覆盖。
+ */
+registerOnDemandFrameProvider(ensureFrameForLayer)
+onBeforeUnmount(() => registerOnDemandFrameProvider(null))
+
+// ── 图层平台子系统：选中图层生命周期（时间轴徽标数据源） ──
+const selectedLayerLifecycle = computed(() => {
+  const catalogId = selectedCatalogId.value
+  if (!catalogId) return null
+  return lifecycle.getLifecycle(catalogId)
+})
+
+// ── 实验性 3D 视图（外观设置勾选）──
+// 勾选后 3D 模式按「渲染引擎」挂载 MapLibre globe 或 Cesium 空壳；未勾选时保持「尚未实现」遮罩。
+const enable3DView = ref(is3DViewExperimentalEnabled())
+let _unsubscribe3DView: (() => void) | null = null
+{
+  _unsubscribe3DView = subscribe3DViewExperimental(() => {
+    enable3DView.value = is3DViewExperimentalEnabled()
+  })
+}
+const globeRenderEngine = useGlobeRenderEngine()
+
+/** 2D 或 MapLibre 3D：挂 MapCanvas */
+const showMapLibreCanvas = computed(
+  () =>
+    uiStore.viewMode === '2d' ||
+    (uiStore.viewMode === '3d' && enable3DView.value && globeRenderEngine.value === 'maplibre'),
+)
+/** Cesium 实验 3D：与 MapCanvas 互斥 */
+const showCesiumHost = computed(
+  () => uiStore.viewMode === '3d' && enable3DView.value && globeRenderEngine.value === 'cesium',
+)
+const globeProjectionOn = computed(
+  () => uiStore.viewMode === '3d' && enable3DView.value && globeRenderEngine.value === 'maplibre',
+)
+
+const CesiumGlobeHost = defineAsyncComponent(() =>
+  importLazyChunk(() => import('../components/map/globe-engine/CesiumGlobeHost.vue')),
+)
+
+const agentCompanionEnabled = ref(isAgentCompanionEnabled())
+let _unsubscribeAgentCompanion: (() => void) | null = null
+{
+  _unsubscribeAgentCompanion = subscribeAgentCompanion(() => {
+    agentCompanionEnabled.value = isAgentCompanionEnabled()
+  })
+}
+
+const {
+  banner: timelineActionBanner,
+  handleReuse: handleTimelineReuse,
+  handleRerun: handleTimelineRerun,
+  handleCancelConfirm: handleTimelineCancelConfirm,
+  handleDismissNotice: handleTimelineDismissNotice,
+  handleDismissRecovery: handleTimelineDismissRecovery,
+  handleSwitchOnlineRerun: handleTimelineSwitchOnline,
+  handleOpenPlan: handleTimelineOpenPlan,
+  syncWorkflowTimelineNow,
+} = useTimelineActionConfirm({
+  workspace,
+  workflowRun,
+  uiStore,
+  selectedCatalogId,
+  currentDate,
+  currentHour,
+  activeLayerGranularity,
+  isPlaying,
+  logOperation: (tag, message) => logStore.logOperation(tag, message),
+  syncBoundWorkflowTimeline: (range) => {
+    if (!workflowEditorOpen.value) return
+    const n = workflowEditorRef.value?.applyBoundMainTimeline?.({
+      start_at: range.start_at,
+      end_at: range.end_at,
+    })
+    if (n && n > 0) {
+      logStore.logOperation('timeline-wf-sync', `同步工作流时间窗 ×${n} · ${range.timeKey}`)
+    }
+  },
+})
+
+// 打开工作流编辑器后对齐一次 bind_timeline 时间窗（定义/画布就绪后）
+watch(workflowEditorOpen, (open) => {
+  if (!open) return
+  void nextTick(() => {
+    window.setTimeout(() => syncWorkflowTimelineNow(), 120)
+  })
+})
+
+// ── Online Temporal Integration ──
+// 在线时间获取编排器：当用户选中 fetchable 段时自动触发工作流获取数据
+// 顶栏确认卡打开时暂停自动提交，避免与用户确认重跑双通道抢跑
+const onlineTemporal = useOnlineTemporalIntegration({
+  workspace,
+  workflowRun,
+  selectedCatalogId,
+  currentDate,
+  currentHour,
+  activeLayerGranularity,
+  timelineSegments,
+  isPlaying,
+  pauseAutoFetch: toRef(timelineActionBanner, 'hasConfirm'),
+  logOperation: (tag, message) => logStore.logOperation(tag, message),
+})
+
+const {
+  selectedMapPoint,
+  selectedHotspot,
+  visibleHotspots,
+  overlayPointValues,
+  selectedOverlayTimeSeries,
+  allOverlayTimeSeries,
+  handleMapPointSelect,
+  clearMapPointInspect,
+  handleHotspotSelect,
+  handleHotspotSelectFromPanel,
+  handleVisibleHotspotsChange,
+  handleOverlayTimeUpdate,
+  fetchSelectedOverlaySeries,
+} = useMapInspect(
+  logStore,
+  uiStore,
+  selectedLayerDisplay,
+  tileForecastHour,
+  mapCanvasRef,
+  overlayTimeStates,
+  activeLayer,
+)
+
+const {
+  handleTimelineStep,
+  handleTimelineChange,
+  handleTimelineDateChange,
+  handleTimelineTogglePlay,
+  handleTimelinePlayInterval,
+  handleTimelineToggleUnified,
+  handleToggleLayerLock,
+} = useTimelineControls(
+  uiStore,
+  logStore,
+  selectedCatalogId,
+  activeLayer,
+  hourLabel,
+  unifiedTimeLock,
+  isPlaying,
+  notifyUserDateChange,
+)
+
+const dataImportFlow = useDataImportFlow()
+const { dropActive, onMapShellDragEnter, onMapShellDragOver, onMapShellDragLeave, onMapShellDrop } =
+  useFileDrop(dataImportFlow, workflowEditorOpen, settingsOpen, mapShellRef)
+
+const { handleRunWorkflowFromEditor } = useWorkflowEditorRun(
+  logStore,
+  workflowOutputStore,
+  workflowEditorOpen,
+  workflowStatusOpen,
+  workflowEditorRef,
+)
+
+// ── 异步组件 ──────────────────────────────────────────────────────────────
+// chunk 加载失败（弱网/刷新竞态）时 loader promise reject，组件永不挂载，
+// usePanelManager 的 showImmediate 将无人配对 hideImmediate → 顶栏光带
+// 永久加载（2026-08-25 反馈）。此处统一兜底关 loading 后再抛出。
+function withLoadingGuard<T>(loader: () => Promise<T>) {
+  return async (): Promise<T> => {
+    try {
+      return await importLazyChunk(loader)
+    } catch (err) {
+      try {
+        uiLoading.hideImmediate()
+      } catch {
+        /* store 未就绪时忽略 */
+      }
+      throw err
+    }
+  }
+}
+const ScreenshotExport = defineAsyncComponent(
+  withLoadingGuard(() => import('../components/ScreenshotExport.vue')),
+)
+const SettingsPanel = defineAsyncComponent(
+  withLoadingGuard(() => import('../components/settings/SettingsPanel.vue')),
+)
+const WorkflowEditorPanel = defineAsyncComponent(
+  withLoadingGuard(() => import('../components/workflow/WorkflowEditorPanel.vue')),
+)
+
+// ── 面板尺寸 ──────────────────────────────────────────────────────────────
+// 2026-08-25 用户反馈：图层/分析面板纵向拉伸要能拉到主界面最底——
+// maxHeight 随视口高度动态计算（overlay 顶部 + 12px 底部呼吸余量）；
+// 小屏（结果 < 540）保持原 540 下限，行为不回退。
+// 2026-10-20：顶栏改单行后 overlay 顶部从 9.5rem(152px) 收到 4.3rem(≈69px)，
+// 这里跟着改，面板才能一直拉到主界面最底。
+const SIDE_PANEL_TOP_OFFSET = 69
+function computeSidePanelMaxHeight(): number {
+  if (typeof window === 'undefined') return 540
+  return Math.max(540, window.innerHeight - SIDE_PANEL_TOP_OFFSET - 12)
+}
+const sidePanelMaxHeight = ref(computeSidePanelMaxHeight())
+function handleSidePanelResize(): void {
+  sidePanelMaxHeight.value = computeSidePanelMaxHeight()
+}
+if (typeof window !== 'undefined') {
+  window.addEventListener('resize', handleSidePanelResize)
+}
+onBeforeUnmount(() => {
+  if (typeof window !== 'undefined') {
+    window.removeEventListener('resize', handleSidePanelResize)
+  }
+})
+const sidePanelDimensions = computed(() => ({
+  defaultHeight: 372,
+  minHeight: 236,
+  maxHeight: sidePanelMaxHeight.value,
+  minWidth: 280,
+  maxWidth: 420,
+}))
+// 默认高度（2026-10-20）：372 → 450——展开默认加载的风云卫星组（组头 + 3 个图层）时
+// 能整组完整显示，不再把第三个图层切掉。
+// 2026-10-22（用户：要让风云与 SMAP 两个组都露出来）：固定高度这条路走不通——
+// 组数、组是否展开、成员行高都会变，猜一个数字必然要么裁切、要么下方留一大片空白
+// （截图里 SMAP 组下面空了近 200px 就是这个原因）。改为**高度跟随内容**
+// （PanelDock 的 auto-height）：高度 = 内容实际高度，被面板最大高度钳制，
+// 内容再多就在面板内部滚动。用户手动拖过尺寸后即以他的尺寸为准。
+// 默认宽度：292 → 312 → 326（用户第 2 轮：再宽一点点，让组名
+// 「风云卫星微波反演产品」与「3 层」胶囊同排不挤）
+const layerPanelDimensions = computed(() => ({
+  ...sidePanelDimensions.value,
+  defaultWidth: 326,
+  defaultHeight: 450,
+}))
+const analysisPanelDimensions = computed(() => ({
+  ...sidePanelDimensions.value,
+  defaultWidth: 304,
+}))
+
+// ── 内联 handler ──────────────────────────────────────────────────────────
+function handleTileSourceChange(sourceId: TileSourceId) {
+  uiStore.setTileSource(sourceId)
+  logStore.logOperation('tile-source-change', `切换底图源: ${sourceId}`)
+}
+function handleLayerSelect(layerId: string) {
+  if (selectedInstanceId.value !== layerId) workspace.selectLayer(layerId)
+  logStore.logOperation('layer-select', `选中图层: ${layerId}`)
+}
+function handleZoomToLayer(instanceId: string): boolean {
+  if (showCesiumHost.value) {
+    const layer = workspace.activeLayers.value.find((l) => l.instanceId === instanceId)
+    const display = workspace.activeLayersDisplay.value.find((l) => l.instanceId === instanceId)
+    if (!layer && !display) return false
+    const bounds = resolveLayerExtentBounds(
+      {
+        instanceId,
+        importedVectorBounds: layer?.importedVector?.bounds,
+        importedRasterBounds: layer?.importedRaster?.bounds ?? display?.importedRasterBounds,
+        importedBounds: display?.importedBounds,
+        overlayLayerId:
+          layer?.importedRaster?.overlayLayerId ?? display?.importedRasterOverlayLayerId,
+        catalogId: layer?.catalogId ?? display?.catalogId,
+      },
+      overlayTimeStates.value.map((s) => ({ layerId: s.layerId, bounds: s.bounds ?? null })),
+    )
+    if (!bounds) return false
+    cesiumHostRef.value?.flyToBounds(bounds)
+    logStore.logOperation('layer-zoom', `缩放到图层(Cesium): ${instanceId}`)
+    return true
+  }
+  const ok = Boolean(mapCanvasRef.value?.fitToLayerExtent?.(instanceId))
+  if (ok) logStore.logOperation('layer-zoom', `缩放到图层: ${instanceId}`)
+  return ok
+}
+
+/**
+ * 打开网页时把初始视野落到**默认图层的整体范围**（而不是停在默认中心 / 缩放）。
+ *
+ * 为什么需要：地图初始视野来自「默认中心 + 缩放」（默认华南，zoom≈4.8），而默认
+ * 图层是风云全球产品（EASE-Grid 2.0 全球 9km，覆盖 ±180° / ±85°）——停在区域级
+ * 缩放下几乎看不到数据（稀疏轨道条带被放大后基本是空白）。
+ *
+ * 做法：复用侧栏右键「缩放到图层」的同一条路径（`handleZoomToLayer`），视野＝整个
+ * 图层。图层边界来自 `importedRaster.bounds`（挂载 / 快照恢复都带）或 overlay 元数据
+ * 加载结果（`overlayTimeStates`）；两者都没就绪时最多等约 3 秒。失败静默——失败表现
+ * 是「停在默认视野」，不影响其它任何功能。
+ */
+async function focusDefaultLayerExtent(): Promise<void> {
+  const overlayId = defaultPrimaryOverlayId()
+  if (!overlayId) return
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    // Initialization may finish after the user has already located an analysis
+    // point or uploaded a boundary. Do not overwrite that explicit view.
+    if (timeSeriesOpen.value || timeSeriesResultsVisible.value) return
+    const layer = workspace.activeLayers.value.find(
+      (item) => item.importedRaster?.overlayLayerId === overlayId,
+    )
+    const boundsReady =
+      Boolean(layer?.importedRaster?.bounds) ||
+      overlayTimeStates.value.some((state) => state.layerId === overlayId && Boolean(state.bounds))
+    if (layer && boundsReady && handleZoomToLayer(layer.instanceId)) {
+      logStore.logOperation('map-zoom', '打开网页缩放到默认图层范围')
+      return
+    }
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 250))
+  }
+}
+
+function handleFitChina(): boolean {
+  const chinaBounds: [number, number, number, number] = [73.5, 18.0, 135.0, 53.5]
+  if (showCesiumHost.value) {
+    cesiumHostRef.value?.flyToBounds(chinaBounds)
+    logStore.logOperation('map-zoom', '缩放到中国全境范围(Cesium)')
+    return true
+  }
+  const canvas = mapCanvasRef.value
+  if (canvas?.fitBounds) {
+    const duration = isReducedMotionActive() ? 0 : 1000
+    // 未就绪时 fitBounds 返回 false，如实上报（同 P0-2 口径）
+    const ok = canvas.fitBounds(chinaBounds, { padding: 40, duration }) !== false
+    if (!ok) return false
+    logStore.logOperation('map-zoom', '缩放到中国全境范围')
+    return true
+  }
+  return false
+}
+
+function handleLocateCoordinate(lng: number, lat: number, zoom = 10): boolean {
+  if (Number.isNaN(lng) || Number.isNaN(lat)) return false
+  if (lng < -180 || lng > 180 || lat < -90 || lat > 90) return false
+  if (showCesiumHost.value) {
+    if (!cesiumHostRef.value?.flyTo) return false
+    cesiumHostRef.value.flyTo(lng, lat)
+    logStore.logOperation('map-locate', `定位坐标(Cesium): ${lng.toFixed(4)}, ${lat.toFixed(4)}`)
+    return true
+  }
+  const canvas = mapCanvasRef.value
+  if (!canvas?.flyTo) return false
+  const duration = isReducedMotionActive() ? 0 : 1200
+  // 地图未就绪（初始化中 / 失败 / 已卸载）时 flyTo 返回 false：如实上报，
+  // 避免 Agent 回复"已定位到经纬度"但画面没动（外部测试报告 P0-2）。
+  const ok = canvas.flyTo({ center: [lng, lat], zoom, duration }) !== false
+  if (!ok) {
+    logStore.logOperation('map-locate', '定位坐标失败：地图未就绪')
+    return false
+  }
+  logStore.logOperation('map-locate', `定位坐标: ${lng.toFixed(4)}, ${lat.toFixed(4)}`)
+  return true
+}
+
+/**
+ * 助手发起底图切换。返回 true=已切换；字符串=失败原因（直接给用户看）。
+ * 2026-10-22：手动底图菜单会禁用「缺密钥」的底图，助手这条路径原先没做同样的检查，
+ * 结果切到了需要密钥的卫星底图——界面回「已切换」，地图却是一片空白。
+ */
+function handleSetBasemap(sourceId: string): boolean | string {
+  const resolved = resolveKnownTileSourceId(sourceId)
+  if (!resolved || resolved === 'none') {
+    return '没有这个底图，可用的有：天地图影像/街道、高德卫星/街道、Esri 影像、OSM 标准等'
+  }
+  const cfg = TILE_SOURCE_MAP.get(resolved)
+  if (!cfg) return '没有这个底图'
+  if (!isTileSourceUsable(cfg, (key) => settingsStore.isBasemapApiKeyAvailable(key))) {
+    return `「${cfg.label}」需要先在设置里配置地图密钥才能显示，当前不可用`
+  }
+  handleTileSourceChange(resolved)
+  return true
+}
+
+/**
+ * 助手状态问答用的「地图是否就绪」。
+ * 直接读 MapCanvas 已有的真源（isMapInteractive / mapInitError），不另造状态；
+ * 当前模式没有 MapCanvas（Cesium 实验 3D）时返回 undefined = 未知，不谎报未就绪。
+ */
+function handleIsMapReady(): boolean | undefined {
+  const fn = mapCanvasRef.value?.isMapReady
+  if (typeof fn !== 'function') return undefined
+  return fn()
+}
+
+function handleGetMapError(): string | null {
+  const fn = mapCanvasRef.value?.getMapError
+  if (typeof fn !== 'function') return null
+  return fn()
+}
+
+async function captureActiveMapCanvas(): Promise<string | null> {
+  if (showCesiumHost.value) {
+    try {
+      const fromHost = cesiumHostRef.value?.capturePngDataUrl?.()
+      if (fromHost) return fromHost
+      const canvas = cesiumHostRef.value?.getCanvas()
+      return canvas?.toDataURL('image/png') ?? null
+    } catch {
+      return null
+    }
+  }
+  const fn = mapCanvasRef.value?.captureMapCanvas
+  if (!fn) return null
+  return Promise.resolve(fn())
+}
+function handleToggleLayerVisibility(instanceId: string) {
+  workspace.toggleLayerVisibility(instanceId)
+}
+function handleSetLayerOpacity(payload: { instanceId: string; opacity: number }) {
+  workspace.setLayerOpacity(payload.instanceId, payload.opacity)
+}
+
+/** 用户点击时间轴上的 fetchable 段时，手动触发在线获取 */
+function handleFetchSegment(_segment: { index: number; label: string; state: string }) {
+  const catalogId = selectedCatalogId.value
+  if (!catalogId) return
+  const timeKey = onlineTemporal.orchestrator.currentTimeKey.value
+  if (!timeKey) return
+  void onlineTemporal.orchestrator.triggerOnlineFetch(catalogId, timeKey)
+  logStore.logOperation('online-temporal', `手动触发获取 ${catalogId} @ ${timeKey}`)
+}
+</script>
+
+<template>
+  <main ref="dashboardRef" class="dashboard">
+    <section
+      ref="mapShellRef"
+      class="map-shell"
+      :class="{ 'drop-active': dropActive, 'map-shell--3d': uiStore.viewMode === '3d' }"
+      @dragenter="onMapShellDragEnter"
+      @dragover="onMapShellDragOver"
+      @dragleave="onMapShellDragLeave"
+      @drop="onMapShellDrop"
+    >
+      <MapCanvas
+        v-if="showMapLibreCanvas"
+        ref="mapCanvasRef"
+        :tile-source-id="tileSourceId"
+        :land-sea-basemap="landSeaBasemap"
+        :current-hour="currentHour"
+        :current-date="currentDate"
+        :inspect-point="selectedMapPoint"
+        :globe-projection="globeProjectionOn"
+        @visible-hotspots-change="handleVisibleHotspotsChange"
+        @hotspot-select="handleHotspotSelect"
+        @map-point-select="handleMapPointSelect"
+        @overlay-time-update="handleOverlayTimeUpdate"
+      />
+
+      <CesiumGlobeHost
+        v-else-if="showCesiumHost"
+        ref="cesiumHostRef"
+        :tile-source-id="tileSourceId"
+        :hour="currentHour"
+        :current-date="currentDate"
+        :time-key="onlineTemporal.orchestrator.currentTimeKey.value"
+      />
+
+      <div
+        v-else
+        class="view-placeholder-3d"
+        :class="{ 'view-placeholder-3d--layer-ready': has3dCompatibleLayer }"
+      >
+        <div class="placeholder-3d-stars" aria-hidden="true">
+          <i v-for="n in 10" :key="n" :style="{ '--star-index': n }"></i>
+        </div>
+        <div class="placeholder-3d-orbit orbit--one" aria-hidden="true"></div>
+        <div class="placeholder-3d-orbit orbit--two" aria-hidden="true"></div>
+        <div class="placeholder-3d-planet" aria-hidden="true">
+          <div class="planet-grid"></div>
+          <div class="planet-glow"></div>
+        </div>
+        <div class="placeholder-3d-inner">
+          <div class="placeholder-3d-icon"><Globe :size="30" aria-hidden="true" /></div>
+          <h2 class="placeholder-3d-title">3D 地球视图</h2>
+          <p class="placeholder-3d-desc">该功能尚未实现</p>
+          <p class="placeholder-3d-hint">点击顶栏「2D」按钮可返回平面地图</p>
+          <p class="placeholder-3d-hint">
+            可在 设置 → 外观 → 地图显示 勾选「启用3D视图（实验测试）」提前体验地球投影
+          </p>
+        </div>
+      </div>
+
+      <div v-if="dropActive" class="import-drop-overlay" aria-hidden="true">
+        <div class="import-drop-card">
+          <span class="import-drop-title">释放以导入数据</span>
+          <span class="import-drop-desc"
+            >SHP(+旁路) / GeoJSON / CSV·Excel·TXT / TIF·NC·HDF·MAT</span
+          >
+        </div>
+      </div>
+
+      <div class="overlay overlay-top cgda-boot-reveal cgda-boot-reveal--1">
+        <ModeToolbar
+          :tile-source-id="tileSourceId"
+          :land-sea-basemap="landSeaBasemap"
+          :get-map-ready="handleIsMapReady"
+          :get-map-error="handleGetMapError"
+          @change-tile-source="handleTileSourceChange"
+          @toggle-land-sea="landSeaBasemap = !landSeaBasemap"
+          @open-screenshot="handleOpenScreenshot"
+          @open-settings="handleOpenSettings"
+          @open-workflow-status="handleOpenWorkflowStatus"
+          @open-workflow-editor="handleOpenWorkflowEditor"
+          @open-time-series="timeSeriesOpen = !timeSeriesOpen"
+          @open-log="logOpen = true"
+        />
+      </div>
+
+      <!-- 左下角浮层：图层面板下 / 比例尺上；Teleport 到 body 并置顶，可拖动 -->
+      <TimelineActionBanner
+        @reuse="handleTimelineReuse"
+        @rerun="handleTimelineRerun"
+        @cancel="handleTimelineCancelConfirm"
+        @dismiss-notice="handleTimelineDismissNotice"
+        @switch-online="handleTimelineSwitchOnline"
+        @open-plan="handleTimelineOpenPlan"
+        @dismiss-recovery="handleTimelineDismissRecovery"
+      />
+      <OnlinePlanPanel />
+
+      <div class="overlay overlay-left cgda-boot-reveal cgda-boot-reveal--2">
+        <PanelDock
+          panel-label="图层"
+          panel-key="layers"
+          position="left"
+          handle-position="bottom-right"
+          auto-height
+          :max-offset-x="100"
+          :max-offset-y="110"
+          :default-width="layerPanelDimensions.defaultWidth"
+          :default-height="layerPanelDimensions.defaultHeight"
+          :min-width="layerPanelDimensions.minWidth"
+          :min-height="layerPanelDimensions.minHeight"
+          :max-width="layerPanelDimensions.maxWidth"
+          :max-height="layerPanelDimensions.maxHeight"
+        >
+          <LayerSidebar @select-layer="handleLayerSelect" @zoom-to-layer="handleZoomToLayer" />
+          <!-- 2026-11-05 用户要求：面板收起时保留一个小色标（当前选中层的配色） -->
+          <template #head-extra="{ collapsed: panelCollapsed }">
+            <SidebarMiniLegend v-if="panelCollapsed" />
+          </template>
+        </PanelDock>
+      </div>
+
+      <div v-show="!timeSeriesOpen" class="overlay overlay-right cgda-boot-reveal cgda-boot-reveal--3">
+        <PanelDock
+          ref="analysisPanelRef"
+          panel-label="分析"
+          panel-key="analysis"
+          position="right"
+          handle-position="bottom-left"
+          :max-offset-x="80"
+          :max-offset-y="110"
+          :default-width="analysisPanelDimensions.defaultWidth"
+          :default-height="analysisPanelDimensions.defaultHeight"
+          :min-width="analysisPanelDimensions.minWidth"
+          :min-height="analysisPanelDimensions.minHeight"
+          :max-width="analysisPanelDimensions.maxWidth"
+          :max-height="analysisPanelDimensions.maxHeight"
+        >
+          <InfoPanel
+            :active-layer="activeLayer"
+            :stage-label="stageLabel"
+            :visible-hotspots="visibleHotspots"
+            :selected-layer="selectedLayerDisplay"
+            :selected-hotspot="selectedHotspot"
+            :selected-map-point="selectedMapPoint"
+            :inspect-hour="tileForecastHour"
+            :is-submitting="isSubmitting"
+            :workflow-error="workflowError"
+            :point-weather="pointWeather"
+            :point-weather-loading="pointWeatherLoading"
+            :point-weather-error="pointWeatherError"
+            :overlay-time-states="overlayTimeStates"
+            :overlay-point-values="overlayPointValues"
+            :selected-overlay-time-series="selectedOverlayTimeSeries"
+            :all-overlay-time-series="allOverlayTimeSeries"
+            @toggle-layer-visibility="handleToggleLayerVisibility"
+            @set-layer-opacity="handleSetLayerOpacity"
+            @select-hotspot="handleHotspotSelectFromPanel"
+            @clear-map-point="clearMapPointInspect"
+            @enter-select-mode="handleEnterSelectMode"
+            @query-overlay-series="
+              (p: { lng: number; lat: number }) => fetchSelectedOverlaySeries(p.lng, p.lat)
+            "
+          />
+        </PanelDock>
+      </div>
+
+      <div
+        v-show="!timeSeriesResultsVisible"
+        class="overlay overlay-bottom cgda-boot-reveal cgda-boot-reveal--4"
+        :style="timeSeriesTimelineInset ? { bottom: 'calc(0.72rem + ' + timeSeriesTimelineInset + 'px)' } : undefined"
+      >
+        <TimelinePanel
+          panel-label="时间轴"
+          panel-key="timeline"
+          :max-offset-x="140"
+          :max-offset-y="70"
+          :default-width="720"
+          :default-height="235"
+          :min-width="460"
+          :min-height="210"
+          :max-width="980"
+          :max-height="330"
+        >
+          <TimelineScrubber
+            :current-hour="currentHour"
+            :current-date="currentDate"
+            :hour-label="hourLabel"
+            :accent-color="hasTimelineLayer ? activeLayer.accentColor : 'var(--text-secondary)'"
+            :availability-label="timelineAvailabilityLabel"
+            :observation-time-label="timelineObservationLabel"
+            :timeline-segments="timelineSegments"
+            :coverage-source-label="coverageSourceLabel"
+            :unified-time-lock="unifiedTimeLock"
+            :is-playing="isPlaying"
+            :play-interval-ms="playIntervalMs"
+            :granularity="hasTimelineLayer ? activeLayerGranularity : 'hour'"
+            :active-layer-name="timelineLayerName"
+            :online-fetch-in-progress="
+              onlineTemporal.orchestrator.currentFetchStatus.value?.status === 'in-flight' ||
+              onlineTemporal.orchestrator.currentFetchStatus.value?.status === 'submitting'
+            "
+            :lifecycle-state="selectedLayerLifecycle?.lifecycleState ?? 'unknown'"
+            :lifecycle-message="selectedLayerLifecycle?.message ?? null"
+            @step="handleTimelineStep"
+            @change-hour="handleTimelineChange"
+            @change-date="handleTimelineDateChange"
+            @toggle-play="handleTimelineTogglePlay"
+            @change-play-interval="handleTimelinePlayInterval"
+            @toggle-unified-time="handleTimelineToggleUnified"
+            @toggle-layer-lock="handleToggleLayerLock"
+            @fetch-segment="handleFetchSegment"
+          />
+        </TimelinePanel>
+      </div>
+
+      <AgentCompanion
+        v-if="agentCompanionEnabled"
+        :fit-to-layer-extent="handleZoomToLayer"
+        :fit-china="handleFitChina"
+        :locate-coordinate="handleLocateCoordinate"
+        :set-basemap="handleSetBasemap"
+        :is-map-ready="handleIsMapReady"
+        :get-map-error="handleGetMapError"
+        :ensure-ondemand-frame="ensureFrameForLayer"
+      />
+    </section>
+
+    <TimeSeriesWorkspace
+      :open="timeSeriesOpen"
+      :map-context="seriesMapContext"
+      :locate="locateSeriesPoint"
+      :pick="pickSeriesPoint"
+      :draw="drawSeriesRegion"
+      :cancel-draw="cancelSeriesDrawing"
+      :preview="previewSeriesRegion"
+      @close="timeSeriesOpen = false"
+      @results-visible="timeSeriesResultsVisible = $event"
+      @timeline-inset="timeSeriesTimelineInset = $event"
+    />
+
+    <ScreenshotExport
+      v-if="screenshotOpen"
+      :dashboard-el="dashboardRef"
+      :map-shell-el="mapShellRef"
+      :map-stage-el="
+        showCesiumHost
+          ? (cesiumHostRef?.getHostElement?.() ?? null)
+          : (mapCanvasRef?.getMapStageElement() ?? null)
+      "
+      :capture-map-canvas="captureActiveMapCanvas"
+      :set-wind-animation-paused="
+        showCesiumHost ? null : (mapCanvasRef?.setWindAnimationPaused ?? null)
+      "
+      :active-layer-name="activeLayer.name"
+      :hour-label="hourLabel"
+      @close="handleCloseScreenshot"
+    />
+
+    <DrawSessionExitModal />
+    <WorkflowStatusPanel v-if="workflowStatusOpen" @close="handleCloseWorkflowStatus" />
+    <LogPanel v-if="logOpen" @close="logOpen = false" />
+    <Transition name="cgda-drawer">
+      <SettingsPanel v-if="settingsOpen" @close="handleCloseSettings" />
+    </Transition>
+    <WorkflowEditorPanel
+      v-if="workflowEditorOpen"
+      ref="workflowEditorRef"
+      @close="handleCloseWorkflowEditor"
+      @run="handleRunWorkflowFromEditor"
+    />
+  </main>
+</template>
+
+<style scoped src="./dashboard/DashboardView.styles.css"></style>

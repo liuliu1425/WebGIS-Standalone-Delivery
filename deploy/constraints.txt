@@ -1,0 +1,8 @@
+# Test image only. Verified by reading the working formal Python environment.
+# Celery 5.4 requires redis-py <6. Kombu 5.7 selects a transport requiring >=6.1.
+# Keep the known-working transport combination, without changing formal packages.
+kombu==5.6.2
+redis==5.3.1
+billiard==4.2.4
+amqp==5.3.1
+vine==5.1.0

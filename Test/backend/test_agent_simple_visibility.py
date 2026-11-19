@@ -1,0 +1,352 @@
+# -*- coding: utf-8 -*-
+"""纯图层显隐确定性捷径测试（2026-11-10 用例 04 工具预算耗尽）。
+
+根因：一句「只显示风云…组中的植被光学厚度，保持其他不变」，模型却反复
+search_layers / get_layer_meta 查满 4 跳预算，没轮到下发显示就答「工具次数用完」。
+显隐没有取数语义、目标层往往就挂在页面上，应由本地规则一步定位一步下发。
+"""
+
+from app.services.agent.orchestrator import (
+    _guard_layer_variable_intents,
+    _map_actions_reply,
+    _request_limit_reply,
+    _resolve_deterministic_map_actions,
+    _resolve_simple_visibility,
+)
+
+
+def _ctx(*names: str) -> dict:
+    """构造 client_context.active_layers（前端格式：name 是侧栏变量名）。"""
+    layers = []
+    for i, name in enumerate(names):
+        layers.append(
+            {
+                "catalog_id": f"imported-{i:03d}",
+                "overlay_layer_id": f"overlay-{i:03d}",
+                "name": name,
+                "visible": False,
+                "selected": False,
+            }
+        )
+    return {"active_layers": layers}
+
+
+def test_show_vod_only_keeps_others_hits_target_layer():
+    """用例 04：只显示「植被光学厚度」，命中 VOD 层而非 SM 层。"""
+    ctx = _ctx("植被光学厚度", "土壤水分")
+    intent = _resolve_simple_visibility(
+        "请只显示风云卫星微波反演产品平均散射约束模型组中的植被光学厚度，"
+        "保持该组土壤水分显示状态不变，其他图层也保持不变。完成后报告这两层的显示状态。",
+        ctx,
+    )
+    assert intent is not None
+    assert intent["name"] == "set_layer_visibility"
+    assert intent["args"]["catalog_id"] == "imported-000"  # 植被光学厚度
+    assert intent["args"]["visible"] is True
+
+
+def test_hide_layer_sets_visible_false():
+    """隐藏指令下发 visible=false。"""
+    ctx = _ctx("土壤水分")
+    intent = _resolve_simple_visibility("隐藏风云卫星的土壤水分图层", ctx)
+    assert intent is not None
+    assert intent["args"]["visible"] is False
+    assert intent["args"]["catalog_id"] == "imported-000"
+
+
+def test_show_simple_layer_hits():
+    """简单「显示植被光学厚度」命中。"""
+    ctx = _ctx("植被光学厚度")
+    intent = _resolve_simple_visibility("显示植被光学厚度图层", ctx)
+    assert intent is not None
+    assert intent["args"]["visible"] is True
+
+
+def test_show_current_selected_layer_uses_its_exact_instance():
+    """「显示当前图层」是操作，不是列图层；重复产品时也只操作选中的实例。"""
+    ctx = {
+        "selected_layer_id": "inst-vod-hidden",
+        "active_layers": [
+            {
+                "catalog_id": "imported-fy-vod",
+                "instance_id": "inst-vod-visible",
+                "name": "植被光学厚度",
+                "visible": True,
+                "selected": False,
+            },
+            {
+                "catalog_id": "imported-fy-vod",
+                "instance_id": "inst-vod-hidden",
+                "name": "植被光学厚度",
+                "visible": False,
+                "selected": True,
+            },
+        ],
+    }
+    intent = _resolve_simple_visibility("显示当前图层", ctx)
+    assert intent is not None
+    assert intent["name"] == "set_layer_visibility"
+    assert intent["args"]["catalog_id"] == "imported-fy-vod"
+    assert intent["args"]["instance_id"] == "inst-vod-hidden"
+
+
+def test_solo_show_current_selected_layer_marks_exclusive_display():
+    """“只显示当前图层”必须下发 solo，而不是退化成普通显示。"""
+    ctx = {
+        "selected_layer_id": "inst-vod-hidden",
+        "active_layers": [
+            {
+                "catalog_id": "imported-sm",
+                "instance_id": "inst-sm",
+                "name": "土壤水分",
+                "visible": True,
+                "selected": False,
+            },
+            {
+                "catalog_id": "imported-fy-vod",
+                "instance_id": "inst-vod-hidden",
+                "name": "植被光学厚度",
+                "visible": False,
+                "selected": True,
+            },
+        ],
+    }
+    intent = _resolve_simple_visibility("只显示当前图层", ctx)
+    assert intent is not None
+    assert intent["args"]["catalog_id"] == "imported-fy-vod"
+    assert intent["args"]["instance_id"] == "inst-vod-hidden"
+    assert intent["args"]["visible"] is True
+    assert intent["args"]["solo"] is True
+
+
+def test_regular_show_is_not_marked_exclusive():
+    """普通“显示”保持其他图层，不得附带 solo。"""
+    intent = _resolve_simple_visibility("显示植被光学厚度", _ctx("植被光学厚度"))
+    assert intent is not None
+    assert intent["args"].get("solo") is None
+
+
+def test_solo_show_named_layer_stays_on_local_visibility_path():
+    """明确指定 VOD 的“只显示”也应本地执行，不能消耗模型 token。"""
+    intent = _resolve_simple_visibility("只显示植被光学厚度", _ctx("植被光学厚度", "土壤水分"))
+    assert intent is not None
+    assert intent["args"]["catalog_id"] == "imported-000"
+    assert intent["args"]["solo"] is True
+
+
+def test_stats_query_does_not_trigger():
+    """含取数语义不触发捷径，留给模型。"""
+    ctx = _ctx("土壤水分")
+    assert _resolve_simple_visibility("帮我算一下广州的土壤水分平均值", ctx) is None
+
+
+def test_timeline_switch_does_not_trigger():
+    """切日期不触发。"""
+    ctx = _ctx("土壤水分")
+    assert _resolve_simple_visibility("切换到2025年12月15日", ctx) is None
+
+
+def test_basemap_switch_does_not_trigger():
+    """切底图不触发。"""
+    ctx = _ctx("土壤水分")
+    assert _resolve_simple_visibility("切换为天地图影像底图", ctx) is None
+
+
+def test_show_catalog_layer_uses_local_catalog_fallback():
+    """显示未加载的明确目录层应本地添加，不进入模型工具链。"""
+    ctx = _ctx("土壤水分")
+    intent = _resolve_simple_visibility("显示 CMFD 降水图层", ctx)
+    assert intent is not None
+    assert intent["args"]["catalog_id"] == "cmfd-precip-cn"
+    assert intent["args"]["visible"] is True
+
+
+def test_show_precip_and_switch_date_is_deterministic():
+    ctx = {
+        "active_layers": [
+            {
+                "catalog_id": "cmfd-precip-cn",
+                "name": "CMFD 区域降水",
+                "visible": False,
+            },
+            {
+                "catalog_id": "imported-sm",
+                "name": "土壤水分",
+                "visible": True,
+            },
+        ]
+    }
+    notes: list[str] = []
+    intents = _resolve_deterministic_map_actions(
+        "显示 CMFD 降水图层，并把日期切到 2025-07-15", ctx, notes=notes
+    )
+    assert intents is not None
+    # 2026-11-11 老师复测第 3 条：CMFD 区域降水是**静态数据**（盘上 time_list 为空）。
+    # 旧口径照旧下发 set_timeline，页面拒绝执行，正文却写「已切到」——说做成了、
+    # 其实没做。现在只下发显示，日期这一步在正文里明确说不支持。
+    assert [item["name"] for item in intents] == ["set_layer_visibility"]
+    assert intents[0]["args"]["catalog_id"] == "cmfd-precip-cn"
+    reply = _map_actions_reply(intents, [], notes)
+    assert "静态数据" in reply
+    assert "不支持切换日期" in reply
+    assert "已把时间轴切到" not in reply
+
+
+def test_show_dynamic_layer_and_switch_date_emits_both():
+    """有时序的图层：显示 + 切日期两条都要下发，日期绑到新显示的那层。"""
+    ctx = {
+        "active_layers": [
+            {
+                "catalog_id": "imported-nas-smap-avg-sm",
+                "name": "土壤水分",
+                "visible": False,
+            }
+        ]
+    }
+    intents = _resolve_deterministic_map_actions(
+        "显示土壤水分图层，并把日期切到 2025-07-15", ctx
+    )
+    assert intents is not None
+    assert [item["name"] for item in intents] == [
+        "set_layer_visibility",
+        "set_timeline",
+    ]
+    assert intents[0]["args"]["catalog_id"] == "imported-nas-smap-avg-sm"
+    assert intents[1]["args"] == {
+        "date": "2025-07-15",
+        "catalog_id": "imported-nas-smap-avg-sm",
+    }
+
+
+def test_named_layer_date_switch_beats_selected_other_variable():
+    """点名土壤水分时，不能把日期改到当前选中的 VOD。"""
+    ctx = {
+        "selected_layer_id": "imported-nas-smap-avg-vod",
+        "active_layers": [
+            {
+                "catalog_id": "imported-nas-smap-avg-sm",
+                "name": "土壤水分",
+                "visible": True,
+                "selected": False,
+            },
+            {
+                "catalog_id": "imported-nas-smap-avg-vod",
+                "name": "植被光学厚度 VOD",
+                "visible": False,
+                "selected": True,
+            },
+        ],
+    }
+    intents = _resolve_deterministic_map_actions("土壤水分切到 2025-07-12", ctx)
+    assert intents is not None
+    timeline = next(item for item in intents if item["name"] == "set_timeline")
+    assert timeline["args"]["catalog_id"] == "imported-nas-smap-avg-sm"
+
+
+def test_composite_show_average_vod_does_not_enable_dynamic_vod():
+    ctx = {
+        "active_layers": [
+            {
+                "catalog_id": "imported-nas-smap-avg-vod",
+                "name": "SMAP 平均版 植被光学厚度 VOD",
+                "visible": False,
+            },
+            {
+                "catalog_id": "imported-nas-smap-dyn-vod",
+                "name": "SMAP 动态版 植被光学厚度 VOD",
+                "visible": False,
+            },
+        ]
+    }
+    intents = _resolve_deterministic_map_actions("显示平均版 VOD 并切到 2025-07-20", ctx)
+    assert intents is not None
+    visibility = [item for item in intents if item["name"] == "set_layer_visibility"]
+    assert [(item["args"]["catalog_id"], item["args"]["visible"]) for item in visibility] == [
+        ("imported-nas-smap-avg-vod", True)
+    ]
+    timeline = next(item for item in intents if item["name"] == "set_timeline")
+    assert timeline["args"]["catalog_id"] == "imported-nas-smap-avg-vod"
+
+
+def test_composite_show_vod_and_hide_cmfd_keeps_vod_shown():
+    ctx = {
+        "active_layers": [
+            {"catalog_id": "imported-nas-smap-avg-vod", "name": "植被光学厚度 VOD", "visible": False},
+            {"catalog_id": "cmfd-precip-cn", "name": "CMFD 区域降水", "visible": True},
+        ]
+    }
+    intents = _resolve_deterministic_map_actions("显示 VOD、切到 2025-07-20、隐藏 CMFD", ctx)
+    assert intents is not None
+    visibility = [item for item in intents if item["name"] == "set_layer_visibility"]
+    assert {(item["args"]["catalog_id"], item["args"]["visible"]) for item in visibility} == {
+        ("imported-nas-smap-avg-vod", True),
+        ("cmfd-precip-cn", False),
+    }
+
+
+def test_keep_other_layers_unchanged_is_not_reported_as_missing_layer():
+    ctx = _ctx("CMFD 区域降水", "植被光学厚度 VOD", "土壤水分")
+    unresolved: list[str] = []
+    intents = _resolve_deterministic_map_actions(
+        "同时隐藏 CMFD 和平均版 VOD，其他图层保持原状", ctx, unresolved=unresolved
+    )
+    assert intents is not None
+    assert unresolved == []
+    hidden = [item for item in intents if item["name"] == "set_layer_visibility"]
+    assert len(hidden) == 2
+    assert all(item["args"]["visible"] is False for item in hidden)
+
+
+def test_hide_two_layers_emits_two_intents():
+    ctx = _ctx("CMFD 区域降水", "土壤水分")
+    intents = _resolve_deterministic_map_actions(
+        "隐藏 CMFD 区域降水和土壤水分图层", ctx
+    )
+    assert intents is not None
+    hidden = [i for i in intents if i["name"] == "set_layer_visibility"]
+    assert len(hidden) == 2
+    assert all(i["args"]["visible"] is False for i in hidden)
+
+
+def test_precip_request_rejects_soil_moisture_intent():
+    out = _guard_layer_variable_intents(
+        "显示降水图层",
+        {
+            "reply": "已显示。",
+            "ui_intents": [
+                {
+                    "name": "set_layer_visibility",
+                    "args": {
+                        "catalog_id": "imported-sm",
+                        "display_name": "土壤水分",
+                        "visible": True,
+                    },
+                }
+            ],
+        },
+    )
+    assert out["ui_intents"] == []
+    assert "没有执行" in out["reply"]
+
+
+def test_request_limit_reply_does_not_claim_model_is_down():
+    reply = _request_limit_reply()
+    assert "模型不可用" not in reply
+    assert "token" not in reply.lower()
+    # 2026-11-11 老师复测：单步请求撞预算时让用户「拆成两句话」等于甩锅——
+    # 它本来就是一句话，也没解释真实原因。这句必须彻底消失。
+    assert "拆成两句话" not in reply
+    assert "内容较多" not in reply
+    # 但要留下可照做的下一步，不能只说「没处理完」就没了；不再暗示
+    # 重发同一句通常会成功（这会掩盖真正的服务问题）。
+    assert "稍后重试" in reply
+    assert "页面状态没有变化" in reply
+
+
+def test_request_limit_reply_only_suggests_splitting_for_long_paste():
+    """长粘贴才建议分段，且不许把原因说成「你的话有问题」。"""
+    long_text = "\n".join(f"第 {i} 行：这是一段很长的粘贴内容" for i in range(8))
+    reply = _request_limit_reply(message=long_text)
+    assert "分两次发" in reply
+    assert "拆成两句话" not in reply
+    assert "内容比较长" in reply

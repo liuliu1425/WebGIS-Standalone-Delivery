@@ -1,0 +1,145 @@
+name: geoflow-delivery
+
+x-application: &application
+  image: geoflow-delivery-backend:local
+  restart: unless-stopped
+  environment:
+    BACKEND_ENV: production
+    BACKEND_API_KEYS_ENABLED: "true"
+    BACKEND_API_KEY: "${DELIVERY_SERVICE_KEY:?Create the runtime configuration first}"
+    BACKEND_API_KEY_ROLE: standard
+    BACKEND_HOST: 0.0.0.0
+    BACKEND_PORT: "8000"
+    BACKEND_RELOAD: "false"
+    BACKEND_UI_RESTART_ENABLED: "false"
+    BACKEND_ADMIN_USERNAME: "${DELIVERY_ADMIN_USER:?Create the runtime configuration first}"
+    BACKEND_ADMIN_PASSWORD: "${DELIVERY_ADMIN_PASSWORD:?Create the runtime configuration first}"
+    BACKEND_GEE_CREDENTIALS_ENCRYPTION_KEY: "${DELIVERY_ENCRYPTION_KEY:?Create the runtime configuration first}"
+    BACKEND_DATA_ROOT: /runtime/data
+    BACKEND_OUTPUT_ROOT: /runtime/output
+    HOME: /runtime/home
+    XDG_CACHE_HOME: /runtime/cache
+    BACKEND_REDIS_URL: redis://redis:6379/0
+    BACKEND_CELERY_BROKER_URL: redis://redis:6379/0
+    BACKEND_CELERY_RESULT_BACKEND: redis://redis:6379/0
+    BACKEND_CELERY_WORKER_POOL: solo
+    BACKEND_MINIO_ENDPOINT: minio:9000
+    BACKEND_MINIO_ACCESS_KEY: "${DELIVERY_MINIO_USER:?Create the runtime configuration first}"
+    BACKEND_MINIO_SECRET_KEY: "${DELIVERY_MINIO_PASSWORD:?Create the runtime configuration first}"
+    BACKEND_MINIO_SECURE: "false"
+    BACKEND_OPEN_METEO_SYNC_ENABLED: "false"
+  volumes:
+    - geo-input:/runtime/data
+    - geo-output:/runtime/output
+    - application-state:/srv/Code/backend/.data
+    - application-cache:/runtime/cache
+  networks:
+    - application
+  depends_on:
+    redis:
+      condition: service_healthy
+    minio:
+      condition: service_started
+    init-admin:
+      condition: service_completed_successfully
+
+services:
+  redis:
+    image: redis:7.4.10-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    networks: [application]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 15
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: ["server", "/data"]
+    environment:
+      MINIO_ROOT_USER: "${DELIVERY_MINIO_USER:?Create the runtime configuration first}"
+      MINIO_ROOT_PASSWORD: "${DELIVERY_MINIO_PASSWORD:?Create the runtime configuration first}"
+    volumes:
+      - object-data:/data
+    restart: unless-stopped
+    networks: [application]
+  init-admin:
+    <<: *application
+    restart: "no"
+    command: ["python", "/delivery/init_admin.py"]
+    volumes:
+      - geo-input:/runtime/data
+      - geo-output:/runtime/output
+      - application-state:/srv/Code/backend/.data
+      - application-cache:/runtime/cache
+      - ./init_admin.py:/delivery/init_admin.py:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+  backend:
+    <<: *application
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    command: ["python", "start_fastapi.py"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 4s
+      timeout: 3s
+      retries: 24
+      start_period: 6s
+  worker:
+    <<: *application
+    command: ["python", "start_celery_worker.py", "worker", "--pool=solo", "--concurrency=1", "--loglevel=INFO", "--hostname=delivery-general@%h", "-Q", "realtime,standard,heavy,batch,download-realtime,download-standard,gee-realtime,gee-standard,gee-heavy,gee-batch,weather-realtime,weather-standard,weather-heavy,weather-batch"]
+  worker-timeseries:
+    <<: *application
+    command: ["python", "start_celery_worker.py", "worker", "--pool=solo", "--concurrency=1", "--loglevel=INFO", "--hostname=delivery-timeseries@%h", "-Q", "geoflow-spatial-timeseries"]
+  beat:
+    <<: *application
+    command: ["python", "start_celery_beat.py"]
+  sample-loader:
+    <<: *application
+    restart: "no"
+    profiles: [samples]
+    command: ["python", "/delivery/seed_samples.py"]
+    volumes:
+      - geo-output:/runtime/output
+      - ../samples/generated:/fixtures:ro
+      - ./seed_samples.py:/delivery/seed_samples.py:ro
+  gateway:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${DELIVERY_HTTP_PORT:-25175}:5175"
+    volumes:
+      - ../Code/frontend/dist:/usr/share/nginx/html:ro
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../Code/infra/gateway/snippets:/etc/nginx/snippets/cgda:ro
+      - ../Code/infra/gateway/maintenance:/etc/nginx/maintenance:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks: [application, ingress]
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:5175/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+networks:
+  application:
+    internal: true
+  ingress:
+
+volumes:
+  geo-input:
+  geo-output:
+  application-state:
+  application-cache:
+  redis-data:
+  object-data:

@@ -1,0 +1,687 @@
+"""块目录 → 时间序列 overlay（运行中可增量追加 time_list）。"""
+
+from __future__ import annotations
+
+import calendar
+import hashlib
+import json
+import logging
+import os
+import re
+import shutil
+import time
+from contextlib import contextmanager, suppress
+from pathlib import Path
+from typing import Any
+from collections.abc import Iterator
+
+from rasterio.warp import transform_bounds as _transform_bounds
+
+from app.data_io.services._meta_io import save_bytes_atomic, save_json_atomic
+from app.data_io.services import paths as import_paths
+from app.data_io.services.raster_science import extract_variable_to_geotiff
+from app.services.overlay_registry import (
+    OverlaySpec,
+    register_overlay,
+    unregister_overlay,
+)
+from app.services.raster_preview_service import raster_preview_service
+
+logger = logging.getLogger(__name__)
+
+# YYYYMMDD_YYYYMMDD.mat（8 日块，Omega-SF 动态链）或 YYYYMMDD.mat（单日，
+# omega_avg_daily 逐日产品视为一天块：start=end）。
+_BLOCK_MAT_RE = re.compile(r"^(\d{8})(?:_(\d{8}))?\.mat$", re.IGNORECASE)
+
+
+@contextmanager
+def _exclusive_path_lock(
+    lock_path: Path, *, timeout_s: float = 120.0
+) -> Iterator[None]:
+    """Cross-platform exclusive lock to serialize materialize into the same dest_dir."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "a+b")
+    locked = False
+    deadline = time.monotonic() + timeout_s
+    try:
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    fh.seek(0)
+                    if fh.read(1) == b"":
+                        fh.write(b"\0")
+                        fh.flush()
+                        fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Timed out acquiring materialize lock: {lock_path}"
+                    )
+                time.sleep(0.05)
+        yield
+    finally:
+        if locked:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        fh.close()
+
+
+def stable_imported_layer_id(*parts: str) -> str:
+    digest = hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:12]
+    return f"imported-{digest}"
+
+
+def resolve_block_timeseries_layer_id(
+    run_id: str,
+    label: str,
+    variable_id: str,
+    *,
+    layer_key: str = "",
+) -> str:
+    """Stable overlay id; OMEGA_BLOCK 历史目录与新 OMEGA 标签共用同一层。
+
+    ``layer_key``（工作流/图层级稳定标识，如 layer_id）非空时替代 run_id 参与
+    哈希 → 同一工作流重复运行覆盖同一 imported-* 图层，而非逐 run 堆积新层。
+    """
+    key = (layer_key or "").strip() or run_id
+    label_u = (label or "").strip().upper()
+    var_u = (variable_id or "").strip().upper()
+    is_omega = (
+        var_u == "OMEGA"
+        or label_u in {"OMEGA", "OMEGA_BLOCK"}
+        or "OMEGA_BLOCK" in label_u
+    )
+    canon_label = "OMEGA" if is_omega else label
+    layer_id = stable_imported_layer_id(key, canon_label, variable_id)
+    if not is_omega:
+        return layer_id
+    legacy = stable_imported_layer_id(key, "OMEGA_BLOCK", variable_id)
+    legacy_dir = import_paths.imports_dir() / legacy
+    new_dir = import_paths.imports_dir() / layer_id
+    # 已有旧目录且尚未迁到新 id 时继续写旧目录，避免重复层
+    if legacy_dir.is_dir() and not new_dir.is_dir():
+        return legacy
+    return layer_id
+
+
+def _count_valid_geotiff_pixels(tif_path: Path) -> int:
+    """Count non-nodata finite pixels in band 1 (0 if unreadable/missing)."""
+    if not tif_path.is_file():
+        return 0
+    try:
+        import numpy as np
+        import rasterio
+
+        with rasterio.open(tif_path) as ds:
+            arr = ds.read(1)
+            nodata = ds.nodata
+        finite = np.isfinite(arr)
+        if nodata is not None and np.isfinite(nodata):
+            finite &= arr != nodata
+            # Same family as extract_variable_to_geotiff write_nodata=-9999
+            if float(nodata) <= -9000.0:
+                finite &= arr > -9000.0
+        else:
+            finite &= arr > -9000.0
+        return int(np.count_nonzero(finite))
+    except Exception:
+        return 0
+
+
+def _is_calendar_month_block(block_start: str, block_end: str) -> bool:
+    """整月块判定：起于 1 日、止于该月最后一天（如 ``20251201_20251231``）。
+
+    2026-10-18：评估侧产品口径改为自然月，风云 D2 逐日产物会额外合成整月块；
+    物化时据此把清单切到月粒度（日帧文件保留在盘上，只是不进 time_list）。
+    """
+    try:
+        from datetime import datetime
+
+        start = datetime.strptime(block_start, "%Y%m%d")
+        end = datetime.strptime(block_end, "%Y%m%d")
+    except ValueError:
+        return False
+    if start.day != 1:
+        return False
+    if end.year != start.year or end.month != start.month:
+        return False
+    return end.day == calendar.monthrange(start.year, start.month)[1]
+
+
+def _is_calendar_month_label(label: str) -> bool:
+    """``20251201_20251231`` → True；日帧 ``20251203`` 与 8 日块 → False。"""
+    match = _BLOCK_MAT_RE.match(f"{label}.mat")
+    if not match or not match.group(2):
+        return False
+    return _is_calendar_month_block(match.group(1), match.group(2))
+
+
+def _is_canonical_viirs8_block(block_start: str, block_end: str) -> bool:
+    """Return whether a label is a canonical Jan-1 anchored VIIRS 8-day block.
+
+    The final block of a year is truncated at Dec 31. This intentionally rejects
+    stale partial-window artifacts such as ``20251219_20251220`` while accepting
+    ``20251227_20251231``.
+    """
+    try:
+        from datetime import datetime, timedelta
+
+        start = datetime.strptime(block_start, "%Y%m%d")
+        end = datetime.strptime(block_end, "%Y%m%d")
+    except ValueError:
+        return False
+    if (start.timetuple().tm_yday - 1) % 8 != 0:
+        return False
+    year_end = datetime(start.year, 12, 31)
+    expected_end = min(start + timedelta(days=7), year_end)
+    return end == expected_end
+
+
+def list_block_mats(
+    block_dir: Path,
+    *,
+    time_start: str | None = None,
+    time_end: str | None = None,
+    canonical_viirs8_only: bool = False,
+    calendar_month_only: bool = False,
+) -> list[tuple[str, Path]]:
+    """Return sorted (time_label, path) for YYYYMMDD[_YYYYMMDD].mat files.
+
+    单日 ``YYYYMMDD.mat``（omega_avg_daily 逐日产品）视为 start=end 的一天块。
+    Optional ``time_start`` / ``time_end`` are ``YYYYMMDD`` inclusive filters
+    against the block's own start/end dates (overlap with the window).
+    ``canonical_viirs8_only`` rejects stale shortened blocks from older partial
+    runs; use it for completed Omega-SF run publication, not progressive running.
+    """
+    if not block_dir.is_dir():
+        return []
+    start = (time_start or "").replace("-", "")[:8] or None
+    end = (time_end or "").replace("-", "")[:8] or None
+    out: list[tuple[str, Path]] = []
+    for path in block_dir.iterdir():
+        if not path.is_file():
+            continue
+        m = _BLOCK_MAT_RE.match(path.name)
+        if not m:
+            continue
+        block_start = m.group(1)
+        block_end = m.group(2) or block_start
+        if canonical_viirs8_only and not _is_canonical_viirs8_block(
+            block_start, block_end
+        ):
+            continue
+        if calendar_month_only and not _is_calendar_month_block(block_start, block_end):
+            continue
+        if start and block_end < start:
+            continue
+        if end and block_start > end:
+            continue
+        # 单日块标签归一：YYYYMMDD（start==end 时不重复后缀，FE 显示
+        # "12-03 → 12-03" 的同日重复即源于此）。8 日块保持 start_end。
+        label = (
+            block_start if block_end == block_start else f"{block_start}_{block_end}"
+        )
+        out.append((label, path))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _slice_needs_refresh(
+    mat_path: Path, tif_path: Path, png_path: Path, bounds_path: Path
+) -> bool:
+    """True when any output is missing or older than the source mat."""
+    if not (png_path.exists() and tif_path.exists() and bounds_path.exists()):
+        return True
+    try:
+        mat_mtime = mat_path.stat().st_mtime
+        return any(
+            path.stat().st_mtime < mat_mtime
+            for path in (tif_path, png_path, bounds_path)
+        )
+    except OSError:
+        return True
+
+
+def upsert_block_dir_timeseries(
+    block_dir: Path,
+    *,
+    variable_id: str,
+    label: str,
+    run_id: str,
+    layer_key: str = "",
+    grid_preset: str = "ease2-global-9km",
+    palette: str = "cividis",
+    vmin: float | None = None,
+    vmax: float | None = None,
+    native_step: str = "8d",
+    time_start: str | None = None,
+    time_end: str | None = None,
+    canonical_viirs8_only: bool = False,
+    calendar_month_only: bool = False,
+    force: bool = False,
+    override_existing_palette: bool = False,
+) -> dict[str, Any]:
+    """Commit block mats under ``block_dir`` as one time-series overlay.
+
+    Incremental: existing slices are kept when still newer than the source mat.
+    Progressive runs rewrite mats in place; stale early TIFs are re-extracted.
+    Overlay id is stable per (layer_key or run_id, label); OMEGA 与历史
+    OMEGA_BLOCK 目录兼容。
+    """
+    block_dir = Path(block_dir)
+    mats = list_block_mats(
+        block_dir,
+        time_start=time_start,
+        time_end=time_end,
+        canonical_viirs8_only=canonical_viirs8_only,
+        calendar_month_only=calendar_month_only,
+    )
+    if not mats and (time_start or time_end):
+        # 运行时间窗与块目录无交集（典型：按时间轴跑了一个本地没有数据的日期，
+        # 如时间轴停在 2026-09 而块产物只有 2025-12~2026-02）。
+        # 此处若直接抛错，run 记录仍是 succeeded，但 SM/VOD/OMEGA 三层会**全部
+        # 静默丢失** —— 前端表现为「工作流执行成功、地图上却没有图层」，且再次
+        # 「添加图层」会不停重跑工作流（2026-10-13 定位 run-402e1a6847b8）。
+        # 回退为「不过滤」：块目录里有多少帧就发多少帧，保证「跑过就一定有图」。
+        fallback = list_block_mats(
+            block_dir,
+            time_start=None,
+            time_end=None,
+            canonical_viirs8_only=canonical_viirs8_only,
+            calendar_month_only=calendar_month_only,
+        )
+        if fallback:
+            logger.warning(
+                "upsert_block_dir_timeseries: 运行时间窗 %s~%s 在块目录 %s 内无匹配 "
+                ".mat，回退为不过滤并发布全部 %d 个切片",
+                time_start,
+                time_end,
+                block_dir,
+                len(fallback),
+            )
+            mats = fallback
+    if not mats:
+        raise FileNotFoundError(f"块目录无 YYYYMMDD[_YYYYMMDD].mat: {block_dir}")
+
+    display_label = (
+        "OMEGA"
+        if (
+            (variable_id or "").upper() == "OMEGA"
+            or (label or "").upper() in {"OMEGA", "OMEGA_BLOCK"}
+            or "OMEGA_BLOCK" in (label or "").upper()
+        )
+        else label
+    )
+    layer_id = resolve_block_timeseries_layer_id(
+        run_id, display_label, variable_id, layer_key=layer_key
+    )
+    dest_dir = import_paths.imports_dir() / layer_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = import_paths.imports_dir() / "_locks" / f"{layer_id}.lock"
+
+    with _exclusive_path_lock(lock_path):
+        return _upsert_block_dir_timeseries_locked(
+            mats=mats,
+            layer_id=layer_id,
+            dest_dir=dest_dir,
+            variable_id=variable_id,
+            label=display_label,
+            run_id=run_id,
+            grid_preset=grid_preset,
+            palette=palette,
+            vmin=vmin,
+            vmax=vmax,
+            native_step=native_step,
+            calendar_month_only=calendar_month_only,
+            force=force,
+            override_existing_palette=override_existing_palette,
+        )
+
+
+def _preserve_existing_time_slices(
+    dest_dir: Path,
+    time_list: list[str],
+    bounds_by_time: dict[str, list[float]],
+    calendar_month_only: bool = False,
+) -> int:
+    """把旧 meta 里仍齐全的历史切片并回 ``time_list``（清单只增不减）。
+
+    2026-10-13：一次窄窗重跑（典型：时间轴停在某个 9 天区间 → run 窗口 9 天）
+    过去会把 ``meta.time_list`` 整页覆盖，把历史宽窗 / 手工物化的切片从清单里
+    抹掉 —— 切片文件仍在磁盘，只是不再被列出，表现为「时间轴上只剩几天，
+    图还在但选不到」。此处保留旧清单中 preview/source/bounds 三件仍齐全的
+    切片，返回并入数量。
+    """
+    old_meta_path = dest_dir / "meta.json"
+    if not old_meta_path.is_file():
+        return 0
+    try:
+        old_payload = json.loads(old_meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return 0
+    raw_old = old_payload.get("time_list") if isinstance(old_payload, dict) else None
+    if not isinstance(raw_old, list):
+        return 0
+    known = set(time_list)
+    kept: list[str] = []
+    for old_label in (str(x) for x in raw_old if x):
+        if old_label in known:
+            continue
+        if calendar_month_only and not _is_calendar_month_label(old_label):
+            # 月口径下不把历史日帧并回清单（文件仍留在盘上，可随时切回日粒度）
+            continue
+        png_old = dest_dir / f"preview_{old_label}.png"
+        tif_old = dest_dir / f"source_{old_label}.tif"
+        bnd_old = dest_dir / f"bounds_{old_label}.json"
+        if not (png_old.is_file() and tif_old.is_file() and bnd_old.is_file()):
+            continue
+        try:
+            old_bounds = json.loads(bnd_old.read_text(encoding="utf-8")).get("bounds")
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        if not (isinstance(old_bounds, list) and len(old_bounds) == 4):
+            continue
+        # 2026-11-05：历史切片里「整片无有效像元」的也跳过——否则本次新算的
+        # 空块刚被摘掉，又被这里按旧 meta 并回清单，等于前功尽弃
+        # （SMAP 动态层 11-01~11-24 三块就是这么一直挂在时间轴上的）。
+        if _count_valid_geotiff_pixels(tif_old) <= 0:
+            continue
+        kept.append(old_label)
+        bounds_by_time[old_label] = [float(v) for v in old_bounds]
+    if not kept:
+        return 0
+    time_list.extend(kept)
+    time_list.sort()
+    logger.info(
+        "upsert_block_dir_timeseries: %s 清单只增不减，保留 %d 个历史切片（合计 %d）",
+        dest_dir.name,
+        len(kept),
+        len(time_list),
+    )
+    return len(kept)
+
+
+def _existing_meta_palette(dest_dir: Path) -> str:
+    """读该层已落盘的色带名（读不到回空串）。"""
+    path = Path(dest_dir) / "meta.json"
+    if not path.is_file():
+        return ""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return ""
+    value = payload.get("palette") if isinstance(payload, dict) else None
+    return str(value).strip() if isinstance(value, str) else ""
+
+
+def _upsert_block_dir_timeseries_locked(
+    *,
+    mats: list[tuple[str, Path]],
+    layer_id: str,
+    dest_dir: Path,
+    variable_id: str,
+    label: str,
+    run_id: str,
+    grid_preset: str,
+    palette: str,
+    vmin: float | None,
+    vmax: float | None,
+    native_step: str,
+    force: bool,
+    calendar_month_only: bool = False,
+    override_existing_palette: bool = False,
+) -> dict[str, Any]:
+    # 已落盘配色优先（2026-11-12）。
+    #
+    # 重跑一个工作流只该更新数据，**不该换掉用户已经看惯的色带**。现场：
+    # 2026-11-11 22:02 一次重跑（run-d3d49d0c9236）把风云组 SM 从 sm-classic
+    # 冲回 sm-paper、ω 从 reds 冲成 cividis —— 根因是「产物注册表的默认配色」
+    # 与「逐层手工定的配色」是两套东西，重跑只认前者。
+    #
+    # 这里让盘上已有 meta 的 palette 压过入参：首次创建用默认值/按层覆盖，
+    # 之后重跑一律沿用。确实要强制换色时，显式传 override_existing_palette=True。
+    if not override_existing_palette:
+        kept_palette = _existing_meta_palette(dest_dir)
+        if kept_palette:
+            if palette and kept_palette != palette:
+                logger.info(
+                    "upsert_block_dir_timeseries: %s 沿用盘上已配色 %s（入参 %s 不用）",
+                    layer_id,
+                    kept_palette,
+                    palette,
+                )
+            palette = kept_palette
+
+    time_list: list[str] = []
+    bounds_by_time: dict[str, list[float]] = {}
+    valid_count_by_time: dict[str, int] = {}
+    # 2026-11-05：整片无有效像元的时间块**不进时间轴**。
+    # 现场：SMAP 动态散射约束产品 11-01~11-24 三块，源 mat 里 SM/VOD/OMEGA
+    # 全是 NaN（上游 SMAP_Origin_Data 在 2025-11 一天数据都没有），却照样被
+    # 物化成全透明的空帧挂上时间轴 ⇒ 用户点进去统计返回「有效像元 0」，
+    # 反复反馈「这一块为什么全是 0」。空帧对用户没有信息量，摘掉更诚实；
+    # 同时把标签记下来，在运行日志里说清是哪几天缺数据（而不是静默消失）。
+    all_labels: list[str] = [str(lbl) for lbl, _ in mats]
+    empty_labels: list[str] = []
+    source_crs = "EPSG:6933"
+
+    for time_label, mat_path in mats:
+        png_path = dest_dir / f"preview_{time_label}.png"
+        tif_path = dest_dir / f"source_{time_label}.tif"
+        bounds_path = dest_dir / f"bounds_{time_label}.json"
+
+        if not force and not _slice_needs_refresh(
+            mat_path, tif_path, png_path, bounds_path
+        ):
+            try:
+                data = json.loads(bounds_path.read_text(encoding="utf-8"))
+                b = data.get("bounds")
+                if isinstance(b, list) and len(b) == 4:
+                    bounds_by_time[time_label] = [float(x) for x in b]
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                pass
+            valid_count_by_time[time_label] = _count_valid_geotiff_pixels(tif_path)
+            if valid_count_by_time[time_label] > 0:
+                time_list.append(time_label)
+            else:
+                empty_labels.append(time_label)
+            continue
+
+        tmp_tif = import_paths.imports_dir() / "_tmp" / f"{layer_id}_{time_label}.tif"
+        tmp_tif.parent.mkdir(parents=True, exist_ok=True)
+        extract_meta = extract_variable_to_geotiff(
+            mat_path,
+            variable_id=variable_id,
+            output_tif=tmp_tif,
+            grid_preset=grid_preset,
+        )
+        shutil.copy2(tmp_tif, tif_path)
+        tmp_tif.unlink(missing_ok=True)
+        valid_count_by_time[time_label] = _count_valid_geotiff_pixels(tif_path)
+        if valid_count_by_time[time_label] > 0:
+            time_list.append(time_label)
+        else:
+            empty_labels.append(time_label)
+
+        # 时间序列必须用全网格框（勿按有效像元裁剪），否则各时刻 bounds 不一致。
+        # 预览渲染到 EPSG:3857：MapLibre 底图为 Web Mercator，ImageSource 按 WGS84
+        # 四角线性贴图；若 PNG 是 equirectangular（4326），全球框会南北严重拉伸。
+        # 导出仍用 source_*.tif 原网格（EPSG:6933），与显示无关。
+        # 烘 PNG 用注册范围（vmin/vmax）。传 None 时 render 内部回落到该帧
+        # p2/p98 自适应；传具体值时按固定色阶上色，保证「PNG 成品」与
+        # meta.json / 图例 / 动态重着色三处一致（2026-10-14 VOD 1.5 收口）。
+        png_bytes, mercator_bounds = (
+            raster_preview_service.render_cog_preview_reprojected(
+                cog_path=tif_path,
+                palette=palette,
+                width=2048,
+                height=2048,
+                source_crs=str(extract_meta.get("crs") or source_crs),
+                target_crs="EPSG:3857",
+                min_value=vmin,
+                max_value=vmax,
+                crop_to_data=False,
+            )
+        )
+        save_bytes_atomic(png_path, png_bytes)
+        west, south, east, north = _transform_bounds(
+            "EPSG:3857",
+            "EPSG:4326",
+            float(mercator_bounds[0]),
+            float(mercator_bounds[1]),
+            float(mercator_bounds[2]),
+            float(mercator_bounds[3]),
+            densify_pts=21,
+        )
+        slice_bounds = [float(west), float(south), float(east), float(north)]
+        bounds_by_time[time_label] = slice_bounds
+        save_json_atomic(
+            bounds_path,
+            {
+                "bounds": slice_bounds,
+                "meta": {
+                    "layer_id": layer_id,
+                    "time": time_label,
+                    "variable_id": variable_id,
+                    "native_step": native_step,
+                    "science_source": mat_path.name,
+                },
+            },
+        )
+
+    _preserve_existing_time_slices(
+        dest_dir,
+        time_list,
+        bounds_by_time,
+        calendar_month_only=calendar_month_only,
+    )
+
+    if empty_labels:
+        logger.warning(
+            "upsert_block_dir_timeseries: %s 有 %d 个时间块整片无有效像元，"
+            "已从时间轴摘除（文件保留在盘上）：%s",
+            dest_dir.name,
+            len(empty_labels),
+            "、".join(empty_labels[:12]),
+        )
+
+    if not time_list and empty_labels:
+        # 极端兜底：整层所有块都是空的（上游整段时间没数据）。此时若照摘不误，
+        # 会抛「未能物化任何时间切片」并把 run 判失败 —— 那是把「数据缺」
+        # 说成「程序坏」。保留全部标签，让上层按「有效像元 0 / 无数据」如实
+        # 告知用户（统计链路已会明确回「整片无有效像元」）。
+        time_list.extend(all_labels)
+        time_list.sort()
+        logger.warning(
+            "upsert_block_dir_timeseries: %s 全部 %d 个时间块都没有有效像元，"
+            "保留清单以避免误判为运行失败",
+            dest_dir.name,
+            len(all_labels),
+        )
+
+    if not time_list:
+        raise RuntimeError("未能物化任何时间切片")
+
+    # Prefer last slice that actually has data; trailing all-nodata days
+    # (common at year/window end) must not become the default blank map.
+    default_time = time_list[-1]
+    for time_label in reversed(time_list):
+        if valid_count_by_time.get(time_label, 0) > 0:
+            default_time = time_label
+            break
+    bounds_wgs84 = bounds_by_time.get(default_time)
+    if bounds_wgs84 is None:
+        for time_label in reversed(time_list):
+            if time_label in bounds_by_time:
+                bounds_wgs84 = bounds_by_time[time_label]
+                break
+    # Shared bounds.json for registry meta
+    shared_bounds = {
+        "bounds": bounds_wgs84 or [-180.0, -85.0, 180.0, 85.0],
+        "meta": {
+            "layer_id": layer_id,
+            "category": "time-series",
+            "palette": palette,
+            "vmin": vmin,
+            "vmax": vmax,
+            "time_list": time_list,
+            "default_time": default_time,
+            "current_time": default_time,
+            "native_step": native_step,
+            "variable_id": variable_id,
+            "label": label,
+            "run_id": run_id,
+            "follow_policy": "containing",
+        },
+    }
+    save_json_atomic(dest_dir / "bounds.json", shared_bounds)
+    meta_payload = {
+        "layer_id": layer_id,
+        "kind": "raster",
+        "category": "time-series",
+        "native_step": native_step,
+        "time_list": time_list,
+        "default_time": default_time,
+        "variable_id": variable_id,
+        "label": label,
+        "run_id": run_id,
+        "palette": palette,
+        "vmin": vmin,
+        "vmax": vmax,
+    }
+    save_json_atomic(dest_dir / "meta.json", meta_payload)
+
+    with suppress(Exception):
+        unregister_overlay(layer_id)
+
+    register_overlay(
+        OverlaySpec(
+            layer_id=layer_id,
+            overlay_dir=dest_dir,
+            category="time-series",
+            time_pattern="preview_{time}.png",
+            bounds_pattern="bounds_{time}.json",
+            bounds_filename="bounds.json",
+            time_list=list(time_list),
+            default_time=default_time,
+            palette=palette,
+            vmin=vmin,
+            vmax=vmax,
+            opacity=0.8,
+            crs="EPSG:4326",
+            source_pattern=str(dest_dir / "source_{time}.tif"),
+            source_reader="geotiff",
+            unit=label,
+        )
+    )
+
+    return {
+        "layer_id": layer_id,
+        "title": f"Algorithm Map Layer: {label}",
+        "product_tag": label,
+        "bounds": bounds_wgs84,
+        "source_crs": "EPSG:4326",
+        "time_list": time_list,
+        "default_time": default_time,
+        "native_step": native_step,
+        "cog_preview_url": f"/overlay-preview/{layer_id}",
+    }

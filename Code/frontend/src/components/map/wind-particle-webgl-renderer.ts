@@ -1,0 +1,1321 @@
+/**
+ * 风场粒子 WebGL 渲染层 — MapLibre CustomLayerInterface 实现。
+ *
+ * 架构（对照 Example/Windy.app WindMap.js）：
+ *   - 以 `type: 'custom'` 注册到 MapLibre，但**不在 MapLibre 的 GL context 里绘制**；
+ *     render() 仅缓存投影矩阵（modelViewProjectionMatrix）。
+ *   - 创建**独立的 overlay canvas + 独立 WebGL context**，用自有 RAF 循环绘制。
+ *   - 独立 canvas 挂在 map.getContainer() 上（与 Canvas 粒子路径一致），
+ *     z-index 高于地图 canvas，叠在风速色底之上。
+ *
+ * 粒子模拟（B3，GPGPU ping-pong）：
+ *   - 每个粒子 = 位置纹理中的一个纹素（RGBA8，16-bit 分割精度存 lon/lat）。
+ *   - 更新 pass：fragment shader 读当前位置纹理、采样风场纹理、RK2 平流，
+ *     写新位置到 ping-pong 另一张纹理。
+ *   - 绘制 pass：readPixels 取位置 → CPU 投影到裁剪空间 → GL_POINTS
+ *     （避开顶点着色器纹理采样/VTF；部分驱动上 VTF 会静默失败导致粒子全在视口外）。
+ *
+ * 渲染阶段：
+ *   - B2：风场纹理颜色场 quad（粒子系统未就绪时的回退）。
+ *   - B3：粒子平流（主路径，含 B4 拖尾衰减）。
+ *   - 无风场数据时不绘制任何占位内容（避免生产环境出现调试视觉）。
+ */
+import type { CustomRenderMethodInput, Map as MaplibreMap } from 'maplibre-gl'
+import { debugLog } from '../../utils/perf-probe'
+import type { WindGeoJSON } from './types'
+// P1-7：shader 编译/链接工具函数从共享模块导入
+import { linkProgram } from './webgl-utils'
+import {
+  WIND_FIELD_FRAGMENT_SHADER,
+  WIND_FIELD_VERTEX_SHADER,
+  PARTICLE_UPDATE_VERTEX_SHADER,
+  PARTICLE_UPDATE_FRAGMENT_SHADER,
+  PARTICLE_DRAW_CLIP_VERTEX_SHADER,
+  PARTICLE_DRAW_SOFT_FRAGMENT_SHADER,
+  TRAIL_FADE_FRAGMENT_SHADER,
+  TRAIL_SCREEN_FRAGMENT_SHADER,
+  lngLatToMercatorNormalized,
+} from './wind-particle-webgl-shaders'
+import { buildWindGridFromGeoJSON } from './wind-grid'
+import type { LonFrame } from './weather-grid-lattice'
+import {
+  buildPaletteLUT,
+  encodeWindGridToRGBA,
+  WIND_TEXTURE_MAX_WIND,
+  type EncodedWindTexture,
+} from './wind-particle-webgl-texture'
+import { resolveParticleResolution } from './wind-particle-gl-profile'
+import { isPerfEnabled, perfMark } from '../../utils/perf-probe'
+import { GLOBE_OCCLUSION_RIM_COSINE, getGlobeViewPole, globeFacingCosine } from './canvas-utils'
+
+/** MapLibre resize 事件名 */
+const MAP_EVENT_RESIZE = 'resize'
+
+/** B2 风场颜色场默认不透明度 */
+const FIELD_OPACITY = 0.75
+
+// ── 粒子模拟参数（对照 Example/Windy.app WindMap.js，商业密度加码）─────────────
+/** 平流速度：与点径匹配，略高于 0.02 以免拖尾断丝 */
+const DEFAULT_SPEED_SCALE = 0.022
+/** 点大小（设备像素）；略大于 Windy 3.0，帧间更易连成丝 */
+const PARTICLE_POINT_SIZE = 4.0
+/** 近白半透明，略提高 alpha 增强可见度 */
+const PARTICLE_COLOR: [number, number, number, number] = [1.0, 1.0, 1.0, 0.92]
+/** 60fps 每帧毫秒数（dt 归一化） */
+const MS_PER_60FPS_FRAME = 1000 / 60
+/** idle 目标 ~30fps */
+const MS_PER_30FPS_FRAME = 1000 / 30
+/** dt 归一化上界（防标签页失焦后跳帧） */
+const MAX_DT_FRAMES = 4
+/** moveend 后进入 idle 降帧的等待 */
+const IDLE_AFTER_MOVE_MS = 1500
+/**
+ * 拖尾每帧保留比例（Windy 0.96；略提高使丝更长更连续）。
+ * 帧率无关：每帧乘 Math.pow(TRAIL_FADE, dt)。
+ */
+const TRAIL_FADE = 0.975
+/** 连续若干帧拿不到投影矩阵则标记失败，供 controller 回退 Canvas */
+const MATRIX_MISS_FAIL_AFTER = 90
+
+/** 与 GLSL encodeFloat 等价的 JS 单坐标编码（hi, lo 两个字节）。 */
+function encodeFloatByte(v: number): [number, number] {
+  const scaled = Math.max(0, Math.min(1, v)) * 255
+  const hi = Math.floor(scaled)
+  const lo = Math.floor((scaled - hi) * 255)
+  return [hi, lo]
+}
+
+/** 与 GLSL encodePosition 等价：归一化 (nx, ny) → [R, G, B, A] 四字节。 */
+export function encodePositionBytes(nx: number, ny: number): [number, number, number, number] {
+  const ex = encodeFloatByte(nx)
+  const ey = encodeFloatByte(ny)
+  return [ex[0], ex[1], ey[0], ey[1]]
+}
+
+/** 与 GLSL decodePosition 等价：从 RGBA8 字节还原归一化 (nx, ny)（供单测验证往返）。 */
+export function decodePositionBytes(r: number, g: number, b: number, a: number): [number, number] {
+  const nx = r / 255 + g / (255 * 255)
+  const ny = b / 255 + a / (255 * 255)
+  return [nx, ny]
+}
+
+/** 从编码风场纹理最近邻取风速归一化 k∈[0,1]（供 CPU 绘制着色）。 */
+export function sampleEncodedWindSpeedK(
+  encoded: EncodedWindTexture,
+  lon: number,
+  lat: number,
+): number {
+  const { width, height, data, west, south, east, north } = encoded
+  if (width <= 0 || height <= 0 || east === west || north === south) return 0
+  const u = (lon - west) / (east - west)
+  const v = (north - lat) / (north - south)
+  if (u < 0 || u > 1 || v < 0 || v > 1) return 0
+  const c = Math.min(width - 1, Math.max(0, Math.floor(u * width)))
+  const r = Math.min(height - 1, Math.max(0, Math.floor(v * height)))
+  return data[(r * width + c) * 4 + 2] / 255
+}
+
+/** 单帧最多绘制的世界副本数（防御病态矩阵；正常视野 ≤5） */
+const MAX_WORLD_WRAP_DRAWS = 12
+
+/**
+ * 反子午线世界包裹偏移：计算屏幕 [-1,1] 实际可见的所有世界副本。
+ *
+ * matrix[0] 是一个世界宽度在裁剪空间（宽 2.0）中的尺寸，matrix[12] 是主世界
+ * 的 x 平移。副本 k 的 clip 范围为 [tx + k·w, tx + (k+1)·w]，与屏幕相交即需绘制。
+ * 即使 matrix[0] ≥ 2（单世界比屏幕宽），相机贴近反子午线时屏幕仍会露出相邻
+ * 副本（跨幅临界），旧的「±1 启发式」会漏掉 → 表现为半球/半边区域无场。
+ * 返回应用于 matrix[12]（x 平移）的偏移数组。主世界不在屏内时，返回值可以不含 0；
+ * 此时相邻世界副本才是实际可见的副本。抽离为纯函数以便单测。
+ */
+export function computeWorldWrapOffsets(matrix: ArrayLike<number>): number[] {
+  // 本函数只接受 clip 量纲矩阵：m[0]=一个世界宽度在裁剪空间(宽 2.0)中的尺寸、
+  // m[12]=主世界 x 平移。历史上某些 MapLibre 版本（v5 部分小版本）在此处返回
+  // pixel viewport 矩阵（m[0]/m[12] 与 m[15] 同量纲），若直接当作 clip matrix
+  // 使用，IDL 处 m[0]≈5983、m[12]≈-1.66 会算出偏移 [0]，粒子全被投到
+  // clip x=3..6 屏外（风场 canvas 存在但完全透明）。
+  // 因此统一按 m[15] 归一化到 clip 量纲（v6 的 defaultProjectionData.mainMatrix
+  // 本身已是 clip 量纲，m[15]≈1，此处为无操作的防御分支）。
+  const matrixScale = Number.isFinite(matrix[15]) && Math.abs(matrix[15]) > 1 ? 1 / matrix[15] : 1
+  const w = matrix[0] * matrixScale
+  const tx = matrix[12] * matrixScale
+  if (!Number.isFinite(w) || !Number.isFinite(tx) || w <= 0) return [0]
+  // 最小 k：副本右缘 tx+(k+1)·w > -1；最大 k：副本左缘 tx+k·w < 1
+  // （+0 把 Math.ceil 可能产生的 -0 归一化，避免偏移数组出现 -0）
+  const kMin = Math.ceil((-1 - tx) / w - 1 + 1e-9) + 0
+  const kMax = Math.ceil((1 - tx) / w - 1e-9) - 1 + 0
+  if (kMax < kMin) return [0]
+  const offsets: number[] = []
+  const lo = Math.max(kMin, -MAX_WORLD_WRAP_DRAWS)
+  const hi = Math.min(kMax, MAX_WORLD_WRAP_DRAWS)
+  for (let k = lo; k <= hi; k += 1) offsets.push(k * w)
+  // 主世界可能完全在屏外，不能强制退回 [0]；否则日界线附近只会绘制
+  // 屏外主世界，实际可见的相邻世界副本反而被丢弃。
+  return offsets.length > 0 ? offsets : [0]
+}
+
+/**
+ * 从 maplibre-gl custom layer 的 render 参数取出「mercator [0,1]² → clip」矩阵。
+ *
+ * v6 起 `CustomRenderMethodInput.defaultProjectionData` 是必需字段，其
+ * `mainMatrix` 即所需矩阵（transform 内部由 `getProjectionDataForCustomLayer`
+ * 生成：tileMatrix × viewProj 再按 EXTENT 缩放，输入已是 mercator [0,1]、输出 clip）。
+ *
+ * 故意**不**设兜底矩阵：`modelViewProjectionMatrix` 是像素世界坐标矩阵、
+ * `defaultProjectionData.projectionMatrix` 亦非 mercator [0,1] 输入量纲，二者与
+ * `lngLatToMercatorNormalized` 混用都会把粒子投到屏外。取不到时返回 null，交由
+ * 上层 `matrixMissFrames` 失败检测显式暴露，而不是静默渲染错位。
+ */
+export function extractMercatorProjectionMatrix(
+  options: CustomRenderMethodInput | ArrayLike<number> | null | undefined,
+): ArrayLike<number> | null {
+  if (!options) return null
+  // 旧版签名：第二参直接是 Float32Array 矩阵
+  if (
+    typeof (options as ArrayLike<number>)[0] === 'number' &&
+    (options as ArrayLike<number>).length >= 16
+  ) {
+    return options as ArrayLike<number>
+  }
+  const opts = options as CustomRenderMethodInput & {
+    defaultProjectionData?: { mainMatrix?: ArrayLike<number> }
+  }
+  const fromDefault = opts.defaultProjectionData?.mainMatrix
+  if (fromDefault && typeof fromDefault[0] === 'number') return fromDefault
+  return null
+}
+
+export class WindParticleWebGLLayer {
+  readonly id: string
+  readonly type = 'custom' as const
+  readonly renderingMode = '2d' as const
+
+  private map: MaplibreMap | null = null
+  private canvas: HTMLCanvasElement | null = null
+  private gl: WebGLRenderingContext | null = null
+
+  // B2 风场颜色场程序
+  private fieldProgram: WebGLProgram | null = null
+  private fieldAttribLngLat = -1
+  private fieldUniformMatrix: WebGLUniformLocation | null = null
+  private fieldUniformWindTexture: WebGLUniformLocation | null = null
+  private fieldUniformWindBounds: WebGLUniformLocation | null = null
+  private fieldUniformMaxWind: WebGLUniformLocation | null = null
+  private fieldUniformOpacity: WebGLUniformLocation | null = null
+  private fieldUniformUseGlobe: WebGLUniformLocation | null = null
+  private fieldQuadBuffer: WebGLBuffer | null = null
+  private windTexture: WebGLTexture | null = null
+
+  // B3 粒子系统
+  private updateProgram: WebGLProgram | null = null
+  private updateAttribPos = -1
+  private updateUniformParticleTexture: WebGLUniformLocation | null = null
+  private updateUniformWindTexture: WebGLUniformLocation | null = null
+  private updateUniformWindBounds: WebGLUniformLocation | null = null
+  private updateUniformMaxWind: WebGLUniformLocation | null = null
+  private updateUniformScaledSpeed: WebGLUniformLocation | null = null
+  private updateUniformDt: WebGLUniformLocation | null = null
+  private updateUniformFrameSeed: WebGLUniformLocation | null = null
+  private updateUniformResetAll: WebGLUniformLocation | null = null
+  private updateUniformPrevWindBounds: WebGLUniformLocation | null = null
+  private updateUniformRemap: WebGLUniformLocation | null = null
+
+  private drawProgram: WebGLProgram | null = null
+  private drawAttribClipSpeed = -1
+  private drawUniformPointSize: WebGLUniformLocation | null = null
+  private drawUniformColor: WebGLUniformLocation | null = null
+
+  private particleTextures: WebGLTexture[] = []
+  private particleFBO: WebGLFramebuffer | null = null
+  private currentParticleIndex = 0
+  private particleVertexBuffer: WebGLBuffer | null = null
+  /** 位置纹理边长（全量 72 / 核显 lite 48） */
+  private readonly particleResolution: number
+  /** readPixels 缓冲：RGBA8 位置纹理 */
+  private readonly particlePosPixels: Uint8Array
+  /** 当前帧各粒子 NDC（x,y,_）；世界包裹时按 offset 副本扩容 */
+  private particleClipData: Float32Array
+  private particleDrawCount = 0
+  private fullscreenQuadBuffer: WebGLBuffer | null = null
+  private particleCount: number
+  private particleSystemReady = false
+  private particleResetAll = true
+  private frameSeed = 0
+  private matrixMissFrames = 0
+  private matrixReadyLogged = false
+
+  // B4 拖尾系统（ping-pong trail FBO，尺寸 = canvas 设备像素）
+  private fadeProgram: WebGLProgram | null = null
+  private fadeAttribPos = -1
+  private fadeUniformTexture: WebGLUniformLocation | null = null
+  private fadeUniformFade: WebGLUniformLocation | null = null
+  private screenProgram: WebGLProgram | null = null
+  private screenAttribPos = -1
+  private screenUniformTexture: WebGLUniformLocation | null = null
+  private screenUniformOpacity: WebGLUniformLocation | null = null
+  private trailTextures: WebGLTexture[] = []
+  private trailFBO: WebGLFramebuffer | null = null
+  private currentTrailIndex = 0
+  private trailWidth = 0
+  private trailHeight = 0
+  private trailDirty = true
+
+  /** 缓存的 modelViewProjectionMatrix（16 元素列主序），render() 时更新 */
+  private matrix = new Float32Array(16)
+  private hasMatrix = false
+  /** 当前投影模式（'globe' / 'mercator'）—— 跟随 map.getProjection() 切换 */
+  private useGlobe = false
+  private readonly lastDrawnMatrix = new Float32Array(16)
+  private hasLastDrawnMatrix = false
+  /** 世界包裹绘制时的临时矩阵（避免每帧分配） */
+  private readonly tempMatrix = new Float32Array(16)
+
+  private rafId: number | null = null
+  private lastFrameTime = 0
+  private mapMoving = false
+  private lastMoveEndAt = 0
+  private frameCounter = 0
+  /** 面板盖住地图时为 true：停 RAF；visibility 恢复时也不应强行 start */
+  private animationPaused = false
+  private visibilityHandler: (() => void) | null = null
+  private moveStartHandler: (() => void) | null = null
+  private moveEndHandler: (() => void) | null = null
+  private zoomEndHandler: (() => void) | null = null
+  /** onAdd / shader / VTF 失败时为 true；controller 可回退 Canvas */
+  private initFailed = false
+  private initFailReason: string | null = null
+  private readonly frame = () => {
+    if (this.animationPaused) {
+      this.rafId = null
+      return
+    }
+    this.rafId = requestAnimationFrame(this.frame)
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+      return
+    }
+    const now = performance.now()
+    const idle =
+      !this.mapMoving && this.lastMoveEndAt > 0 && now - this.lastMoveEndAt >= IDLE_AFTER_MOVE_MS
+    // globe 的球面矩阵 + 背面剔除比 mercator 更昂贵；交互期降到 30fps，
+    // 但保留足够平滑的粒子运动。停止交互后沿用原有 idle 30fps 策略。
+    const minFrameMs = this.useGlobe || idle ? MS_PER_30FPS_FRAME : MS_PER_60FPS_FRAME
+    if (this.lastFrameTime > 0 && now - this.lastFrameTime < minFrameMs - 1) {
+      return
+    }
+    const dt =
+      this.lastFrameTime > 0
+        ? Math.min((now - this.lastFrameTime) / MS_PER_60FPS_FRAME, MAX_DT_FRAMES)
+        : 1
+    this.lastFrameTime = now
+    this.frameCounter += 1
+    if (isPerfEnabled() && this.frameCounter % 30 === 0) {
+      perfMark('wind.rafDt', { dt, idle, res: this.particleResolution })
+    }
+    this.drawFrame(dt)
+    const matrixChanged = this.matrixNeedsRepaint()
+    // 仅在矩阵变化或交互中请求 MapLibre repaint（transform API 可在无 repaint 时取矩阵）
+    if (this.mapMoving || matrixChanged) {
+      try {
+        this.map?.triggerRepaint()
+      } catch {
+        /* map may be destroyed */
+      }
+    }
+  }
+
+  private resizeHandler: (() => void) | null = null
+
+  private matrixNeedsRepaint(): boolean {
+    if (!this.hasMatrix) return true
+    if (!this.hasLastDrawnMatrix) {
+      this.lastDrawnMatrix.set(this.matrix)
+      this.hasLastDrawnMatrix = true
+      return true
+    }
+    for (let i = 0; i < 16; i++) {
+      if (Math.abs(this.matrix[i] - this.lastDrawnMatrix[i]) > 1e-7) {
+        this.lastDrawnMatrix.set(this.matrix)
+        return true
+      }
+    }
+    return false
+  }
+
+  /** 层是否仍可作为 WebGL 粒子路径（未在 onAdd 中失败）。 */
+  isUsable(): boolean {
+    return !this.initFailed
+  }
+
+  getFailureReason(): string | null {
+    return this.initFailReason
+  }
+
+  /** 风场纹理待上传标记与数据（setWindData 在 GL 就绪前可能被调用） */
+  private pendingWindTexture: EncodedWindTexture | null = null
+  private windBounds: { west: number; south: number; east: number; north: number } | null = null
+  /** bbox 变化前的旧 bounds（remap 帧用；null 表示无历史） */
+  private prevWindBounds: { west: number; south: number; east: number; north: number } | null = null
+  /** 下一更新帧仅做归一化坐标重映射（不平流），保持轨迹/拖尾稳定 */
+  private pendingRemap = false
+  private hasWindData = false
+  /** B5 调色板纹理（256×1 RGBA LUT）与待上传标记 */
+  private paletteTexture: WebGLTexture | null = null
+  private paletteDirty = false
+  private paletteLUT: Uint8Array | null = null
+  private particleColors: string[] = []
+
+  constructor(id = 'wind-particle-webgl') {
+    this.id = id
+    this.particleResolution = resolveParticleResolution()
+    this.particleCount = this.particleResolution * this.particleResolution
+    this.particlePosPixels = new Uint8Array(this.particleCount * 4)
+    this.particleClipData = new Float32Array(this.particleCount * 3)
+  }
+
+  // ── CustomLayerInterface 回调 ─────────────────────────────────────
+
+  onAdd(map: MaplibreMap, _gl: WebGLRenderingContext): void {
+    this.map = map
+    this.initFailed = false
+    this.initFailReason = null
+
+    // 独立 overlay canvas（与 Canvas 粒子路径一致：挂在 map container 上）
+    const canvas = document.createElement('canvas')
+    canvas.className = 'wind-particle-webgl-canvas'
+    canvas.style.position = 'absolute'
+    canvas.style.top = '0'
+    canvas.style.left = '0'
+    canvas.style.width = '100%'
+    canvas.style.height = '100%'
+    canvas.style.pointerEvents = 'none'
+    canvas.style.zIndex = '5'
+    map.getContainer().appendChild(canvas)
+    this.canvas = canvas
+
+    const glAttrs = {
+      alpha: true,
+      antialias: false,
+      preserveDrawingBuffer: false,
+      premultipliedAlpha: false,
+    } as const
+    // 优先 WebGL2（FBO/readPixels 更稳）；再回退 WebGL1
+    const gl = (canvas.getContext('webgl2', glAttrs) ||
+      canvas.getContext('webgl', glAttrs) ||
+      canvas.getContext('experimental-webgl', glAttrs)) as WebGLRenderingContext | null
+    if (!gl) {
+      this.failInit('WebGL context unavailable')
+      if (canvas.parentNode) canvas.parentNode.removeChild(canvas)
+      this.canvas = null
+      return
+    }
+    this.gl = gl
+    gl.disable(gl.DEPTH_TEST)
+
+    // B2 风场颜色场
+    this.fieldProgram = linkProgram(
+      gl,
+      WIND_FIELD_VERTEX_SHADER,
+      WIND_FIELD_FRAGMENT_SHADER,
+      'WindParticleWebGL',
+    )
+    if (this.fieldProgram) {
+      this.fieldAttribLngLat = gl.getAttribLocation(this.fieldProgram, 'a_lnglat')
+      this.fieldUniformMatrix = gl.getUniformLocation(this.fieldProgram, 'u_matrix')
+      this.fieldUniformWindTexture = gl.getUniformLocation(this.fieldProgram, 'u_windTexture')
+      this.fieldUniformWindBounds = gl.getUniformLocation(this.fieldProgram, 'u_windBounds')
+      this.fieldUniformMaxWind = gl.getUniformLocation(this.fieldProgram, 'u_maxWind')
+      this.fieldUniformOpacity = gl.getUniformLocation(this.fieldProgram, 'u_opacity')
+      this.fieldUniformUseGlobe = gl.getUniformLocation(this.fieldProgram, 'u_useGlobe')
+    }
+    this.fieldQuadBuffer = gl.createBuffer()
+    this.windTexture = gl.createTexture()
+    this.paletteTexture = gl.createTexture()
+    // 默认调色板（透明→白），保证 setColors 之前 LUT 纹理有效
+    this.paletteLUT = buildPaletteLUT([])
+    this.paletteDirty = true
+
+    // B3 粒子系统（program 与 buffer 在 onAdd 编译；纹理/FBO 在首个风场数据到达时创建）
+    this.initParticlePrograms(gl)
+    // B4 拖尾衰减/屏幕合成程序
+    this.initTrailPrograms(gl)
+
+    if (!this.updateProgram || !this.drawProgram) {
+      this.failInit('particle shader program link failed')
+      this.teardown()
+      return
+    }
+
+    this.resizeCanvasToMap()
+    this.resizeHandler = () => this.resizeCanvasToMap()
+    map.on(MAP_EVENT_RESIZE, this.resizeHandler)
+
+    this.moveStartHandler = () => {
+      this.mapMoving = true
+      // 交互期间拖尾（屏幕空间纹理）与底图错位：清空，交互中只画粒子点，
+      // 结束后重新累积，避免旧位置残影与新位置粒子叠加的错乱感
+      this.trailDirty = true
+    }
+    this.moveEndHandler = () => {
+      this.mapMoving = false
+      this.lastMoveEndAt = performance.now()
+    }
+    this.zoomEndHandler = () => {
+      this.mapMoving = false
+      this.lastMoveEndAt = performance.now()
+      // 不再整列重撒：bbox 变化由 setWindData 的 remap/面积启发式处理
+    }
+    map.on('movestart', this.moveStartHandler)
+    map.on('moveend', this.moveEndHandler)
+    map.on('zoomstart', this.moveStartHandler)
+    map.on('zoomend', this.zoomEndHandler)
+
+    this.visibilityHandler = () => {
+      if (document.visibilityState === 'visible') {
+        this.lastFrameTime = 0
+        this.start()
+      } else {
+        this.stop()
+      }
+    }
+    document.addEventListener('visibilitychange', this.visibilityHandler)
+  }
+
+  /**
+   * 缓存投影矩阵；绘制在自有 RAF / 自有 context 上完成。
+   *
+   * maplibre-gl v6：mercator [0,1]² → clip 使用 `options.defaultProjectionData.mainMatrix`
+   * （transform 内部已按 EXTENT 缩放；globe 模式下该矩阵为「单位球 → clip」）。
+   * 这是本类唯一的矩阵来源——v6 已移除私有 `map.transform`。
+   * `modelViewProjectionMatrix` 是像素世界坐标，不能与 lngLatToMercator 混用。
+   */
+  render(_gl: WebGLRenderingContext, options: CustomRenderMethodInput): void {
+    const matrix = extractMercatorProjectionMatrix(options)
+    if (!matrix) return
+    this.matrix.set(matrix)
+    this.hasMatrix = true
+  }
+
+  /**
+   * 每帧同步投影模式，并汇报投影矩阵是否就绪。
+   *
+   * maplibre-gl v6 起私有 `map.transform` 已移除（v6 的 Map 类型上不再有该成员），
+   * 投影矩阵的唯一来源是 custom layer 的 `render(gl, options)` 参数：
+   * `options.defaultProjectionData.mainMatrix`（v6 中该字段为必需项，见下方 render）。
+   * 因此矩阵由 `render()` 缓存到 `this.matrix`，这里只做两件事：
+   * 探测 globe ↔ mercator 切换（切换时清 trail），以及返回 `hasMatrix`。
+   * `drawFrame` 在首个 map render 之前的连续 miss 由 MATRIX_MISS_FAIL_AFTER 兜底，
+   * 该阈值（90 帧）远大于首帧 render 的延迟。
+   */
+  private refreshProjectionMatrix(): boolean {
+    // 跟随 MapLibre 当前投影：globe 模式 shader 走"单位球 → clip"，mercator 模式走
+    // "mercator [0,1]² → clip"。两种矩阵输入维度不同（3D 球面 vs 2D mercator），
+    // 由 uploadParticlePointBuffer / drawWindField 分支处理。
+    const isGlobe = this.map?.getProjection?.()?.type === 'globe'
+    if (this.useGlobe !== isGlobe) {
+      // 投影切换：清空 trail，避免 mercator/globe 残留拖尾叠出穿球鬼影
+      this.trailDirty = true
+    }
+    this.useGlobe = isGlobe
+    return this.hasMatrix
+  }
+
+  private failInit(reason: string): void {
+    this.initFailed = true
+    this.initFailReason = reason
+    console.warn('[WindParticleWebGL]', reason)
+  }
+
+  onRemove(_map: MaplibreMap, _gl: WebGLRenderingContext): void {
+    this.teardown()
+  }
+
+  // ── 公共 API（controller 调用）────────────────────────────────────
+
+  start(): void {
+    if (this.animationPaused) return
+    if (this.rafId !== null) return
+    this.lastFrameTime = 0
+    this.rafId = requestAnimationFrame(this.frame)
+  }
+
+  stop(): void {
+    if (this.rafId !== null) {
+      cancelAnimationFrame(this.rafId)
+      this.rafId = null
+    }
+  }
+
+  /**
+   * 全屏面板盖住地图时暂停 RAF（保留 GPU 粒子状态）；关闭后续播。
+   * 与 document.visibility 暂停可叠加：面板暂停优先。
+   */
+  setAnimationPaused(paused: boolean): void {
+    if (this.animationPaused === paused) return
+    this.animationPaused = paused
+    if (paused) this.stop()
+    else if (typeof document === 'undefined' || document.visibilityState !== 'hidden') {
+      this.start()
+    }
+  }
+
+  /** 喂入风场数据：构建网格 + 编码为纹理（实际上传延迟到 drawFrame，确保 GL 就绪） */
+  setWindData(geojson: WindGeoJSON | null, frame?: LonFrame | null): void {
+    if (!geojson) {
+      this.hasWindData = false
+      this.pendingWindTexture = null
+      return
+    }
+    const grid = buildWindGridFromGeoJSON(geojson, frame)
+    if (!grid) {
+      console.warn('[WindParticleWebGL] setWindData: 无法构建风场网格')
+      this.hasWindData = false
+      this.pendingWindTexture = null
+      return
+    }
+    const encoded = encodeWindGridToRGBA(grid)
+    const newBounds = {
+      west: encoded.west,
+      south: encoded.south,
+      east: encoded.east,
+      north: encoded.north,
+    }
+    const boundsChanged =
+      !this.windBounds ||
+      this.windBounds.west !== newBounds.west ||
+      this.windBounds.east !== newBounds.east ||
+      this.windBounds.south !== newBounds.south ||
+      this.windBounds.north !== newBounds.north
+    if (boundsChanged) {
+      const old = this.windBounds
+      if (!old) {
+        // 首次数据：全量重撒
+        this.particleResetAll = true
+        this.trailDirty = true
+      } else {
+        // 面积显著增大（zoom-out 揭示更多区域）→ 全量重撒保证密度；
+        // 否则 remap：粒子地理位置不变，轨迹与屏幕拖尾保持稳定，
+        // 出界粒子在更新 shader 内于新 bbox 重撒（自动补足 zoom-in 密度）。
+        const oldArea = (old.east - old.west) * (old.north - old.south)
+        const newArea = (newBounds.east - newBounds.west) * (newBounds.north - newBounds.south)
+        if (newArea > oldArea * 1.5) {
+          this.particleResetAll = true
+          this.trailDirty = true
+        } else {
+          this.prevWindBounds = { ...old }
+          this.pendingRemap = true
+        }
+      }
+    }
+    this.pendingWindTexture = encoded
+    this.windBounds = newBounds
+    this.hasWindData = true
+  }
+
+  /** 更新调色板：构建 256×1 LUT（上传延迟到 drawFrame，确保 GL 就绪） */
+  setColors(colors: string[]): void {
+    if (colors.join(',') === this.particleColors.join(',')) return
+    this.particleColors = colors
+    this.paletteLUT = buildPaletteLUT(colors)
+    this.paletteDirty = true
+  }
+
+  /** 清理 GL 资源与 DOM（幂等，可被 onRemove / destroy 重复调用） */
+  dispose(): void {
+    this.teardown()
+  }
+
+  // ── B3 粒子系统初始化 ─────────────────────────────────────────────
+
+  private initParticlePrograms(gl: WebGLRenderingContext): void {
+    this.updateProgram = linkProgram(
+      gl,
+      PARTICLE_UPDATE_VERTEX_SHADER,
+      PARTICLE_UPDATE_FRAGMENT_SHADER,
+      'WindParticleWebGL',
+    )
+    if (this.updateProgram) {
+      this.updateAttribPos = gl.getAttribLocation(this.updateProgram, 'a_pos')
+      this.updateUniformParticleTexture = gl.getUniformLocation(
+        this.updateProgram,
+        'u_particleTexture',
+      )
+      this.updateUniformWindTexture = gl.getUniformLocation(this.updateProgram, 'u_windTexture')
+      this.updateUniformWindBounds = gl.getUniformLocation(this.updateProgram, 'u_windBounds')
+      this.updateUniformMaxWind = gl.getUniformLocation(this.updateProgram, 'u_maxWind')
+      this.updateUniformScaledSpeed = gl.getUniformLocation(this.updateProgram, 'u_scaledSpeed')
+      this.updateUniformDt = gl.getUniformLocation(this.updateProgram, 'u_dt')
+      this.updateUniformFrameSeed = gl.getUniformLocation(this.updateProgram, 'u_frameSeed')
+      this.updateUniformResetAll = gl.getUniformLocation(this.updateProgram, 'u_resetAll')
+      this.updateUniformPrevWindBounds = gl.getUniformLocation(
+        this.updateProgram,
+        'u_prevWindBounds',
+      )
+      this.updateUniformRemap = gl.getUniformLocation(this.updateProgram, 'u_remap')
+    }
+
+    this.drawProgram = linkProgram(
+      gl,
+      PARTICLE_DRAW_CLIP_VERTEX_SHADER,
+      PARTICLE_DRAW_SOFT_FRAGMENT_SHADER,
+      'WindParticleWebGL',
+    )
+    if (this.drawProgram) {
+      this.drawAttribClipSpeed = gl.getAttribLocation(this.drawProgram, 'a_clipSpeed')
+      this.drawUniformPointSize = gl.getUniformLocation(this.drawProgram, 'u_pointSize')
+      this.drawUniformColor = gl.getUniformLocation(this.drawProgram, 'u_color')
+    }
+
+    // 粒子顶点缓冲：每粒子 clipX/clipY/_（每帧 DYNAMIC 回填）
+    this.particleVertexBuffer = gl.createBuffer()
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.particleVertexBuffer)
+    gl.bufferData(gl.ARRAY_BUFFER, this.particleClipData.byteLength, gl.DYNAMIC_DRAW)
+
+    // 全屏 quad（更新 pass 用）：TRIANGLE_STRIP
+    this.fullscreenQuadBuffer = gl.createBuffer()
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.fullscreenQuadBuffer)
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW)
+  }
+
+  /** 创建粒子位置纹理（NEAREST，RGBA8） */
+  private createParticleTexture(data: Uint8Array): WebGLTexture | null {
+    const gl = this.gl
+    if (!gl) return null
+    const tex = gl.createTexture()
+    gl.bindTexture(gl.TEXTURE_2D, tex)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA,
+      this.particleResolution,
+      this.particleResolution,
+      0,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      data,
+    )
+    return tex
+  }
+
+  /** 首个风场数据到达后，初始化 ping-pong 位置纹理 + FBO */
+  private ensureParticleSystem(): void {
+    if (this.particleSystemReady || !this.gl) return
+    const gl = this.gl
+    const initialData = this.buildInitialParticleData()
+    const tex0 = this.createParticleTexture(initialData)
+    const tex1 = this.createParticleTexture(initialData)
+    if (!tex0 || !tex1) {
+      if (tex0) gl.deleteTexture(tex0)
+      if (tex1) gl.deleteTexture(tex1)
+      console.warn('[WindParticleWebGL] 粒子位置纹理创建失败')
+      return
+    }
+    this.particleTextures = [tex0, tex1]
+    this.particleFBO = gl.createFramebuffer()
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.particleFBO)
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex1, 0)
+    const complete = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    if (!complete) {
+      console.warn('[WindParticleWebGL] 粒子 FBO 不完整，粒子模拟禁用')
+      return
+    }
+    this.particleSystemReady = this.updateProgram !== null && this.drawProgram !== null
+    this.particleResetAll = true
+  }
+
+  private buildInitialParticleData(): Uint8Array {
+    const res = this.particleResolution
+    const data = new Uint8Array(res * res * 4)
+    for (let i = 0; i < res * res; i++) {
+      const [r, g, b, a] = encodePositionBytes(Math.random(), Math.random())
+      data[i * 4] = r
+      data[i * 4 + 1] = g
+      data[i * 4 + 2] = b
+      data[i * 4 + 3] = a
+    }
+    return data
+  }
+
+  // ── B4 拖尾系统 ──────────────────────────────────────────────────
+
+  private initTrailPrograms(gl: WebGLRenderingContext): void {
+    // 衰减 pass 与屏幕合成 pass 均复用全屏 quad 顶点着色器
+    this.fadeProgram = linkProgram(
+      gl,
+      PARTICLE_UPDATE_VERTEX_SHADER,
+      TRAIL_FADE_FRAGMENT_SHADER,
+      'WindParticleWebGL',
+    )
+    if (this.fadeProgram) {
+      this.fadeAttribPos = gl.getAttribLocation(this.fadeProgram, 'a_pos')
+      this.fadeUniformTexture = gl.getUniformLocation(this.fadeProgram, 'u_texture')
+      this.fadeUniformFade = gl.getUniformLocation(this.fadeProgram, 'u_fade')
+    }
+    this.screenProgram = linkProgram(
+      gl,
+      PARTICLE_UPDATE_VERTEX_SHADER,
+      TRAIL_SCREEN_FRAGMENT_SHADER,
+      'WindParticleWebGL',
+    )
+    if (this.screenProgram) {
+      this.screenAttribPos = gl.getAttribLocation(this.screenProgram, 'a_pos')
+      this.screenUniformTexture = gl.getUniformLocation(this.screenProgram, 'u_texture')
+      this.screenUniformOpacity = gl.getUniformLocation(this.screenProgram, 'u_opacity')
+    }
+  }
+
+  private createTrailTexture(width: number, height: number): WebGLTexture | null {
+    const gl = this.gl
+    if (!gl) return null
+    const tex = gl.createTexture()
+    gl.bindTexture(gl.TEXTURE_2D, tex)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
+    return tex
+  }
+
+  /** 确保 trail 纹理与 canvas 尺寸一致（resize / bbox 变化时重建并清空） */
+  private ensureTrailTextures(): void {
+    const gl = this.gl
+    if (!gl || !this.canvas) return
+    const w = this.canvas.width
+    const h = this.canvas.height
+    if (w <= 0 || h <= 0) return
+    const sizeMatch = w === this.trailWidth && h === this.trailHeight
+    if (sizeMatch && !this.trailDirty && this.trailTextures.length === 2) return
+
+    // 尺寸变化或需清空：删除旧纹理并重建
+    for (const tex of this.trailTextures) gl.deleteTexture(tex)
+    const t0 = this.createTrailTexture(w, h)
+    const t1 = this.createTrailTexture(w, h)
+    if (!t0 || !t1) {
+      if (t0) gl.deleteTexture(t0)
+      if (t1) gl.deleteTexture(t1)
+      this.trailTextures = []
+      return
+    }
+    this.trailTextures = [t0, t1]
+    if (!this.trailFBO) {
+      this.trailFBO = gl.createFramebuffer()
+    }
+    // 清空两张 trail 纹理
+    for (const tex of this.trailTextures) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.trailFBO)
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0)
+      gl.clearColor(0, 0, 0, 0)
+      gl.clear(gl.COLOR_BUFFER_BIT)
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    this.trailWidth = w
+    this.trailHeight = h
+    this.trailDirty = false
+  }
+
+  /** 绘制全屏 quad（供 fade / screen pass 复用） */
+  private drawFullscreenQuad(attribPos: number): void {
+    const gl = this.gl
+    if (!gl) return
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.fullscreenQuadBuffer)
+    gl.enableVertexAttribArray(attribPos)
+    gl.vertexAttribPointer(attribPos, 2, gl.FLOAT, false, 0, 0)
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+  }
+
+  // ── 帧渲染 ─────────────────────────────────────────────────────────
+
+  /** 让 canvas 尺寸与地图 canvas 对齐（含 devicePixelRatio），保证矩阵 viewport 一致 */
+  private resizeCanvasToMap(): void {
+    if (!this.canvas || !this.map) return
+    const mapCanvas = this.map.getCanvas()
+    const w = mapCanvas.width
+    const h = mapCanvas.height
+    if (w > 0 && h > 0 && (this.canvas.width !== w || this.canvas.height !== h)) {
+      this.canvas.width = w
+      this.canvas.height = h
+    }
+    // CSS 尺寸：仅当 mapCanvas 已设置非空 style 时才同步，避免覆盖 onAdd 中的 '100%'
+    const styleW = mapCanvas.style.width
+    const styleH = mapCanvas.style.height
+    if (styleW) this.canvas.style.width = styleW
+    if (styleH) this.canvas.style.height = styleH
+  }
+
+  /** 上传待处理的风场纹理 + 重建场 quad（在 GL 就绪后由 drawFrame 调用） */
+  private flushPendingWindTexture(): void {
+    const gl = this.gl
+    if (!gl || !this.pendingWindTexture || !this.windTexture) return
+    const encoded = this.pendingWindTexture
+
+    gl.bindTexture(gl.TEXTURE_2D, this.windTexture)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA,
+      encoded.width,
+      encoded.height,
+      0,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      encoded.data,
+    )
+
+    // 场 quad：覆盖风场 bbox 的 4 角点（TRIANGLE_STRIP：NW, SW, NE, SE）
+    if (this.windBounds && this.fieldQuadBuffer) {
+      const { west, south, east, north } = this.windBounds
+      const quad = new Float32Array([west, north, west, south, east, north, east, south])
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.fieldQuadBuffer)
+      gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW)
+    }
+
+    this.pendingWindTexture = null
+  }
+
+  /** 上传待处理的调色板 LUT 纹理（在 GL 就绪后由 drawFrame 调用） */
+  private flushPaletteTexture(): void {
+    const gl = this.gl
+    if (!gl || !this.paletteDirty || !this.paletteLUT || !this.paletteTexture) return
+    gl.bindTexture(gl.TEXTURE_2D, this.paletteTexture)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, this.paletteLUT)
+    this.paletteDirty = false
+  }
+
+  private drawFrame(dt: number): void {
+    const gl = this.gl
+    if (!gl || !this.canvas) return
+
+    if (!this.refreshProjectionMatrix()) {
+      this.matrixMissFrames += 1
+      if (this.matrixMissFrames >= MATRIX_MISS_FAIL_AFTER && !this.initFailed) {
+        this.failInit('projection matrix unavailable (custom layer render / transform)')
+      }
+      return
+    }
+    this.matrixMissFrames = 0
+    if (!this.matrixReadyLogged) {
+      this.matrixReadyLogged = true
+      debugLog('[WindParticleWebGL] projection matrix ready, particles drawing')
+    }
+
+    this.flushPendingWindTexture()
+    this.flushPaletteTexture()
+    if (this.hasWindData) {
+      this.ensureParticleSystem()
+    }
+
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height)
+    gl.clearColor(0, 0, 0, 0)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+
+    // 优先粒子渲染（B3/B4）；风场颜色场 quad（B2）在粒子未就绪时作回退
+    if (this.hasWindData && this.particleSystemReady && this.windBounds) {
+      const zoom = this.map?.getZoom() ?? 4
+      const zoomFactor = Math.min(Math.pow(2, Math.max(0, 4.2 - zoom)), 2.4)
+      const advectDt = Math.min(dt, 2)
+      const scaledSpeed = DEFAULT_SPEED_SCALE * zoomFactor * advectDt
+
+      const brokeStreaks = this.particleResetAll
+      this.updateParticles(scaledSpeed, dt)
+      // updateParticles 会把 viewport 改成粒子纹理尺寸，绘制前必须恢复
+      gl.viewport(0, 0, this.canvas.width, this.canvas.height)
+      if (brokeStreaks) {
+        this.trailDirty = true
+      }
+
+      // B4：拖尾系统就绪时用 ping-pong trail FBO；否则直接画点。
+      // 交互（平移/缩放）期间不累积拖尾：拖尾是屏幕空间纹理，底图移动时
+      // 旧轨迹会与新位置粒子错位叠加；交互只画点，结束后重新累积。
+      const canTrail =
+        !!(this.fadeProgram && this.screenProgram && this.trailFBO) && !this.mapMoving
+      if (canTrail) {
+        this.ensureTrailTextures()
+      }
+      if (canTrail && this.trailTextures.length >= 2) {
+        this.renderTrails(dt)
+      } else {
+        gl.enable(gl.BLEND)
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+        this.drawParticles(gl)
+      }
+    } else if (this.hasWindData && this.fieldProgram && this.windBounds) {
+      gl.enable(gl.BLEND)
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+      this.drawWindField(gl)
+    }
+    // hasWindData=false 时不绘制任何占位内容（原 B1 调试三角形已移除）
+  }
+
+  /** B3 更新 pass：ping-pong FBO 内做 RK2 平流（写原始位置数据，不做混合） */
+  private updateParticles(scaledSpeed: number, dt: number): void {
+    const gl = this.gl
+    if (!gl || !this.updateProgram || !this.particleFBO || !this.windBounds) return
+    const nextIndex = 1 - this.currentParticleIndex
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.particleFBO)
+    gl.framebufferTexture2D(
+      gl.FRAMEBUFFER,
+      gl.COLOR_ATTACHMENT0,
+      gl.TEXTURE_2D,
+      this.particleTextures[nextIndex],
+      0,
+    )
+    gl.viewport(0, 0, this.particleResolution, this.particleResolution)
+    gl.disable(gl.BLEND)
+
+    gl.useProgram(this.updateProgram)
+    gl.activeTexture(gl.TEXTURE0)
+    gl.bindTexture(gl.TEXTURE_2D, this.particleTextures[this.currentParticleIndex])
+    gl.uniform1i(this.updateUniformParticleTexture, 0)
+    gl.activeTexture(gl.TEXTURE1)
+    gl.bindTexture(gl.TEXTURE_2D, this.windTexture)
+    gl.uniform1i(this.updateUniformWindTexture, 1)
+    gl.uniform4f(
+      this.updateUniformWindBounds,
+      this.windBounds.west,
+      this.windBounds.south,
+      this.windBounds.east,
+      this.windBounds.north,
+    )
+    gl.uniform1f(this.updateUniformMaxWind, WIND_TEXTURE_MAX_WIND)
+    gl.uniform1f(this.updateUniformScaledSpeed, scaledSpeed)
+    gl.uniform1f(this.updateUniformDt, dt)
+    gl.uniform1f(this.updateUniformFrameSeed, this.frameSeed)
+    gl.uniform1f(this.updateUniformResetAll, this.particleResetAll ? 1 : 0)
+    const prev = this.prevWindBounds ?? this.windBounds
+    gl.uniform4f(this.updateUniformPrevWindBounds, prev.west, prev.south, prev.east, prev.north)
+    gl.uniform1f(this.updateUniformRemap, this.pendingRemap && !this.particleResetAll ? 1 : 0)
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.fullscreenQuadBuffer)
+    gl.enableVertexAttribArray(this.updateAttribPos)
+    gl.vertexAttribPointer(this.updateAttribPos, 2, gl.FLOAT, false, 0, 0)
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    this.currentParticleIndex = nextIndex
+    this.particleResetAll = false
+    this.pendingRemap = false
+    this.frameSeed = (this.frameSeed + 1) % 1024
+  }
+
+  /** B4 拖尾渲染：衰减旧 trail → 叠加新粒子 → 合成到屏幕 */
+  private renderTrails(dt: number): void {
+    const gl = this.gl
+    if (!gl || !this.canvas || !this.trailFBO) return
+    if (this.trailTextures.length < 2) return
+    const nextTrail = 1 - this.currentTrailIndex
+
+    // 1. 衰减旧 trail 到 nextTrail FBO（覆盖写，不混合）
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.trailFBO)
+    gl.framebufferTexture2D(
+      gl.FRAMEBUFFER,
+      gl.COLOR_ATTACHMENT0,
+      gl.TEXTURE_2D,
+      this.trailTextures[nextTrail],
+      0,
+    )
+    gl.viewport(0, 0, this.trailWidth, this.trailHeight)
+    gl.disable(gl.BLEND)
+    gl.useProgram(this.fadeProgram)
+    gl.activeTexture(gl.TEXTURE0)
+    gl.bindTexture(gl.TEXTURE_2D, this.trailTextures[this.currentTrailIndex])
+    gl.uniform1i(this.fadeUniformTexture, 0)
+    // 对齐 Windy trailFade=0.96；dt 为相对 60fps 的帧数
+    gl.uniform1f(this.fadeUniformFade, Math.pow(TRAIL_FADE, dt))
+    this.drawFullscreenQuad(this.fadeAttribPos)
+
+    // 2. 在同一 FBO 上叠加当前粒子（混合）
+    gl.enable(gl.BLEND)
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+    this.drawParticles(gl)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+
+    // 3. 合成 nextTrail 到屏幕
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height)
+    gl.enable(gl.BLEND)
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+    gl.useProgram(this.screenProgram)
+    gl.activeTexture(gl.TEXTURE0)
+    gl.bindTexture(gl.TEXTURE_2D, this.trailTextures[nextTrail])
+    gl.uniform1i(this.screenUniformTexture, 0)
+    gl.uniform1f(this.screenUniformOpacity, 1.0)
+    this.drawFullscreenQuad(this.screenAttribPos)
+
+    this.currentTrailIndex = nextTrail
+  }
+
+  /**
+   * 绘制 pass：Windy 风格实心点叠进 trail FBO。
+   * 连续丝状观感来自「点大小覆盖帧间位移 + trailFade≈0.96 拖尾」。
+   */
+  private drawParticles(gl: WebGLRenderingContext): void {
+    if (!this.drawProgram || !this.windBounds || !this.canvas || !this.particleFBO) return
+    if (!this.uploadParticlePointBuffer(gl)) return
+
+    gl.useProgram(this.drawProgram)
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.particleVertexBuffer)
+    gl.enableVertexAttribArray(this.drawAttribClipSpeed)
+    gl.vertexAttribPointer(this.drawAttribClipSpeed, 3, gl.FLOAT, false, 0, 0)
+    gl.uniform4f(
+      this.drawUniformColor,
+      PARTICLE_COLOR[0],
+      PARTICLE_COLOR[1],
+      PARTICLE_COLOR[2],
+      PARTICLE_COLOR[3],
+    )
+    // gl_PointSize 以 framebuffer 像素计；canvas 已是设备像素，与 Windy 同用固定尺寸
+    gl.uniform1f(this.drawUniformPointSize, PARTICLE_POINT_SIZE)
+    gl.drawArrays(gl.POINTS, 0, this.particleDrawCount)
+  }
+
+  /** readPixels → 投影到 NDC（含世界副本）→ 上传为 GL_POINTS 顶点 */
+  private uploadParticlePointBuffer(gl: WebGLRenderingContext): boolean {
+    if (!this.particleFBO || !this.windBounds) return false
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.particleFBO)
+    gl.framebufferTexture2D(
+      gl.FRAMEBUFFER,
+      gl.COLOR_ATTACHMENT0,
+      gl.TEXTURE_2D,
+      this.particleTextures[this.currentParticleIndex],
+      0,
+    )
+    gl.readPixels(
+      0,
+      0,
+      this.particleResolution,
+      this.particleResolution,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      this.particlePosPixels,
+    )
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    if (isPerfEnabled() && this.frameCounter % 30 === 0) {
+      perfMark('wind.readPixels', { skipped: false, res: this.particleResolution })
+    }
+
+    const { west, south, east, north } = this.windBounds
+    const m = this.matrix
+    const pixels = this.particlePosPixels
+    // world wrap 只在 mercator 模式有意义：globe 是真实球面，矩阵物理上不接受
+    // "世界副本偏移"（matrix[12] += 1 只会把球面平移出屏，不在原地环绕）。
+    // globe 模式我们让背后的粒子直接 NDC=(2,2) 推出裁剪空间，让 fragment 不绘制。
+    const wrapOffsets = this.useGlobe ? [0] : computeWorldWrapOffsets(m)
+    const capacity = this.particleCount * wrapOffsets.length * 3
+    if (this.particleClipData.length < capacity) {
+      this.particleClipData = new Float32Array(capacity)
+    }
+    const out = this.particleClipData
+    let write = 0
+
+    if (this.useGlobe) {
+      // 经纬度 → 单位球坐标 → mainMatrix(true) → 透视除法 → NDC
+      // 另用视向极点点积剔除地平线内侧背面（仅 cw<=0 不够，仍会穿球叠到圆盘）
+      const DEG2RAD = Math.PI / 180
+      const viewPole = this.map
+        ? getGlobeViewPole(this.map)
+        : ([0, 0, 1] as [number, number, number])
+      for (let i = 0; i < this.particleCount; i++) {
+        const p = i * 4
+        const [nx, ny] = decodePositionBytes(pixels[p], pixels[p + 1], pixels[p + 2], pixels[p + 3])
+        const lon = west + (east - west) * nx
+        const lat = north + (south - north) * ny
+        const facing = globeFacingCosine(lon, lat, viewPole)
+        const latC = Math.max(-85.051129, Math.min(85.051129, lat))
+        const lonR = lon * DEG2RAD
+        const latR = latC * DEG2RAD
+        const cosLat = Math.cos(latR)
+        const sx = cosLat * Math.sin(lonR)
+        const sy = Math.sin(latR)
+        const sz = cosLat * Math.cos(lonR)
+        // 列主序矩阵：mainMatrix * vec4(sx,sy,sz,1)
+        const cx = m[0] * sx + m[4] * sy + m[8] * sz + m[12]
+        const cy = m[1] * sx + m[5] * sy + m[9] * sz + m[13]
+        const cw = m[3] * sx + m[7] * sy + m[11] * sz + m[15]
+        if (cw <= 0 || facing < GLOBE_OCCLUSION_RIM_COSINE) {
+          // 镜头背面 / 地平线内：推出裁剪空间，z<0 供片元 discard（防 trail 残影）
+          const o = write * 3
+          out[o] = 2.0
+          out[o + 1] = 2.0
+          out[o + 2] = -1
+          write += 1
+          continue
+        }
+        const invW = 1 / cw
+        const o = write * 3
+        out[o] = cx * invW
+        out[o + 1] = cy * invW
+        out[o + 2] = 0
+        write += 1
+      }
+    } else {
+      for (let i = 0; i < this.particleCount; i++) {
+        const p = i * 4
+        const [nx, ny] = decodePositionBytes(pixels[p], pixels[p + 1], pixels[p + 2], pixels[p + 3])
+        const lon = west + (east - west) * nx
+        const lat = north + (south - north) * ny
+        const [mercX, mercY] = lngLatToMercatorNormalized(lon, lat)
+        const baseX = m[0] * mercX + m[4] * mercY + m[12]
+        const baseY = m[1] * mercX + m[5] * mercY + m[13]
+        const w = m[3] * mercX + m[7] * mercY + m[15]
+        const invW = w !== 0 ? 1 / w : 0
+        const clipY = baseY * invW
+        for (const offset of wrapOffsets) {
+          // matrix[12] += offset ⇒ clipX += offset * invW（与 field 世界包裹一致）
+          const o = write * 3
+          out[o] = (baseX + offset) * invW
+          out[o + 1] = clipY
+          out[o + 2] = 0
+          write += 1
+        }
+      }
+    }
+
+    this.particleDrawCount = write
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.particleVertexBuffer)
+    gl.bufferData(gl.ARRAY_BUFFER, out.subarray(0, write * 3), gl.DYNAMIC_DRAW)
+    return write > 0
+  }
+
+  private drawWindField(gl: WebGLRenderingContext): void {
+    if (!this.fieldProgram || !this.windBounds || !this.windTexture) return
+    gl.useProgram(this.fieldProgram)
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.fieldQuadBuffer)
+    gl.enableVertexAttribArray(this.fieldAttribLngLat)
+    gl.vertexAttribPointer(this.fieldAttribLngLat, 2, gl.FLOAT, false, 0, 0)
+    gl.activeTexture(gl.TEXTURE0)
+    gl.bindTexture(gl.TEXTURE_2D, this.windTexture)
+    gl.uniform1i(this.fieldUniformWindTexture, 0)
+    gl.uniform4f(
+      this.fieldUniformWindBounds,
+      this.windBounds.west,
+      this.windBounds.south,
+      this.windBounds.east,
+      this.windBounds.north,
+    )
+    gl.uniform1f(this.fieldUniformMaxWind, WIND_TEXTURE_MAX_WIND)
+    gl.uniform1f(this.fieldUniformOpacity, FIELD_OPACITY)
+    gl.uniform1f(this.fieldUniformUseGlobe, this.useGlobe ? 1 : 0)
+    // world wrap 只在 mercator 模式有意义：globe 模式是世界唯一的真实球面，
+    // 不存在"世界副本"，且 3D 球面坐标 × 偏移 matrix[12] 物理上不对。
+    if (this.useGlobe) {
+      gl.uniformMatrix4fv(this.fieldUniformMatrix, false, this.matrix)
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+    } else {
+      // 世界包裹：屏幕可见的每个世界副本各画一次，消除反子午线附近的半球空白
+      const offsets = computeWorldWrapOffsets(this.matrix)
+      for (const offset of offsets) {
+        this.tempMatrix.set(this.matrix)
+        this.tempMatrix[12] += offset
+        gl.uniformMatrix4fv(this.fieldUniformMatrix, false, this.tempMatrix)
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+      }
+    }
+  }
+
+  private teardown(): void {
+    this.stop()
+    if (this.map && this.resizeHandler) {
+      this.map.off(MAP_EVENT_RESIZE, this.resizeHandler)
+      this.resizeHandler = null
+    }
+    if (this.map && this.moveStartHandler) {
+      this.map.off('movestart', this.moveStartHandler)
+      this.map.off('zoomstart', this.moveStartHandler)
+      this.moveStartHandler = null
+    }
+    if (this.map && this.moveEndHandler) {
+      this.map.off('moveend', this.moveEndHandler)
+      this.moveEndHandler = null
+    }
+    if (this.map && this.zoomEndHandler) {
+      this.map.off('zoomend', this.zoomEndHandler)
+      this.zoomEndHandler = null
+    }
+    if (this.visibilityHandler) {
+      document.removeEventListener('visibilitychange', this.visibilityHandler)
+      this.visibilityHandler = null
+    }
+    const gl = this.gl
+    if (gl) {
+      if (this.fieldQuadBuffer) gl.deleteBuffer(this.fieldQuadBuffer)
+      if (this.fieldProgram) gl.deleteProgram(this.fieldProgram)
+      if (this.windTexture) gl.deleteTexture(this.windTexture)
+      if (this.paletteTexture) gl.deleteTexture(this.paletteTexture)
+      if (this.updateProgram) gl.deleteProgram(this.updateProgram)
+      if (this.drawProgram) gl.deleteProgram(this.drawProgram)
+      if (this.particleVertexBuffer) gl.deleteBuffer(this.particleVertexBuffer)
+      if (this.fullscreenQuadBuffer) gl.deleteBuffer(this.fullscreenQuadBuffer)
+      for (const tex of this.particleTextures) gl.deleteTexture(tex)
+      if (this.particleFBO) gl.deleteFramebuffer(this.particleFBO)
+      for (const tex of this.trailTextures) gl.deleteTexture(tex)
+      if (this.trailFBO) gl.deleteFramebuffer(this.trailFBO)
+      if (this.fadeProgram) gl.deleteProgram(this.fadeProgram)
+      if (this.screenProgram) gl.deleteProgram(this.screenProgram)
+    }
+    this.fieldQuadBuffer = null
+    this.fieldProgram = null
+    this.windTexture = null
+    this.paletteTexture = null
+    this.paletteLUT = null
+    this.paletteDirty = false
+    this.updateProgram = null
+    this.drawProgram = null
+    this.particleVertexBuffer = null
+    this.fullscreenQuadBuffer = null
+    this.particleTextures = []
+    this.particleFBO = null
+    this.particleSystemReady = false
+    this.trailTextures = []
+    this.trailFBO = null
+    this.fadeProgram = null
+    this.screenProgram = null
+    this.trailWidth = 0
+    this.trailHeight = 0
+    this.trailDirty = true
+    this.gl = null
+    if (this.canvas && this.canvas.parentNode) {
+      this.canvas.parentNode.removeChild(this.canvas)
+    }
+    this.canvas = null
+    this.map = null
+    this.hasMatrix = false
+    this.hasWindData = false
+    this.pendingWindTexture = null
+    this.windBounds = null
+    this.matrixMissFrames = 0
+    this.matrixReadyLogged = false
+    this.particleDrawCount = 0
+    this.initFailed = this.initFailed || false
+  }
+}
+
+/** @internal 测试辅助：探测浏览器是否具备粒子 WebGL 所需能力。 */
+export function probeWindParticleWebGLSupport(doc: Document = document): {
+  ok: boolean
+  reason?: string
+} {
+  try {
+    const canvas = doc.createElement('canvas')
+    const gl = (canvas.getContext('webgl2', { alpha: true }) ||
+      canvas.getContext('webgl', { alpha: true }) ||
+      canvas.getContext('experimental-webgl', { alpha: true })) as WebGLRenderingContext | null
+    if (!gl) return { ok: false, reason: 'no-webgl' }
+    // 绘制已改为 readPixels + CPU 投影，不再依赖顶点纹理采样
+    return { ok: true }
+  } catch {
+    return { ok: false, reason: 'probe-error' }
+  }
+}

@@ -1,0 +1,200 @@
+{
+  "version": 3,
+  "note": "Read tools execute immediately; run_workflow creates a confirmation ticket. Multi-hop capped by BACKEND_AGENT_MAX_TOOL_HOPS. web_search gated by BACKEND_AGENT_WEB_SEARCH_ENABLED. list_workflow_timers is admin-only.",
+  "tools": [
+    {
+      "name": "search_layers",
+      "description": "按关键词搜图层（只读，已按权限过滤）。结果含页面上已加载的图层（on_page=true，排最前）与目录层；每条带 layer_kind（runtime_product / catalog_reference / product_group）、product_class、temporal_shape、product_family。产品族条目 is_product_group=true，group_members 列出可统计的变量层。同一图层不会重复列出。",
+      "args": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+          "query": { "type": "string" },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 }
+        }
+      }
+    },
+    {
+      "name": "list_workflows",
+      "description": "List available workflow definitions/templates (read-only). Optional keyword filter.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Optional keyword matched against workflow id/name/tags"
+          },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 20 }
+        }
+      }
+    },
+    {
+      "name": "get_layer_meta",
+      "description": "一个图层的详细元数据（只读）：描述、就绪状态、范围、工作流绑定、时序事实。temporal_coverage 只是描述符声明值，actual_temporal_coverage / actual_block_count / actual_time_blocks / temporal_summary 才来自盘上真实 time_list；coverage_conflict=true 时以 actual_* 为准。另含 catalog_id、sibling_copies / is_stale_copy（同源旧副本识别）。",
+      "args": {
+        "type": "object",
+        "required": ["catalog_id"],
+        "properties": {
+          "catalog_id": { "type": "string", "description": "Layer catalog id" }
+        }
+      }
+    },
+    {
+      "name": "get_workflow_meta",
+      "description": "Get detailed info for one workflow definition (read-only, ACL): description, engine, node summary, linked layer.",
+      "args": {
+        "type": "object",
+        "required": ["workflow_id"],
+        "properties": {
+          "workflow_id": { "type": "string", "description": "Workflow definition id" }
+        }
+      }
+    },
+    {
+      "name": "sample_layer_point",
+      "description": "在地图某点上采样栅格/图层（或天气）值。用 lng/lat，或省略取 client_context.map_point；catalog_id 可选，省略则采样页面活动图层。每条样值返回 requested_time 与 actual_time / period_start / period_end，按各自的时间块分别说明。",
+      "args": {
+        "type": "object",
+        "properties": {
+          "lng": { "type": "number", "description": "Longitude (WGS84)" },
+          "lat": { "type": "number", "description": "Latitude (WGS84)" },
+          "catalog_id": {
+            "type": "string",
+            "description": "Optional single layer; if omitted sample active layers"
+          },
+          "time": {
+            "type": "string",
+            "description": "Optional time key (e.g. YYYYMMDD) for time-series overlays"
+          }
+        }
+      }
+    },
+    {
+      "name": "web_search",
+      "description": "Search the public web (DuckDuckGo Instant Answer + Wikipedia fallback) for background knowledge. Not for private/intranet data.",
+      "args": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+          "query": { "type": "string" },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 8, "default": 5 }
+        }
+      }
+    },
+    {
+      "name": "list_workflow_runs",
+      "description": "List recent workflow runs for the current user (admin sees all). Filter by status / active_only / limit.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "active_only": {
+            "type": "boolean",
+            "default": false,
+            "description": "If true, only non-terminal runs"
+          },
+          "status": {
+            "type": "string",
+            "description": "Optional status filter e.g. succeeded / failed / running"
+          },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 }
+        }
+      }
+    },
+    {
+      "name": "get_workflow_run",
+      "description": "Get status of one workflow run by run_id (owner-scoped).",
+      "args": {
+        "type": "object",
+        "required": ["run_id"],
+        "properties": {
+          "run_id": { "type": "string" }
+        }
+      }
+    },
+    {
+      "name": "get_layer_coverage",
+      "description": "图层的数据覆盖（在线窗口 + 本地日期）。传 time 得到该日是否有数据的判定（resolved.status=available/unavailable）。顶层 actual_time 是权威命中：hit_source=ondemand_frame 表示按需补出的单日帧（is_daily_frame=true），hit_source=block 表示只落在多日块内；不要用 resolved.actual_time 压过它。available_dates 给出该层真实相邻日期（before/after）。另含 catalog_id 与 sibling_copies / is_stale_copy（同源旧副本）；问「这层 id / 是不是旧副本」时用它，不要用统计工具。 查询可用日期或日尺度能力时使用 include_nas=true：channels.nas 返回真实 NAS 逐日文件索引的范围、数量和连接状态，channels.local/time_blocks 仅表示本地时间片，不能混用。NAS 文件存在不保证像元有效；source_unavailable 表示远端日期未知，不等于无数据。查询不会下载或生成帧，不修改地图日期。",
+      "args": {
+        "type": "object",
+        "required": ["catalog_id"],
+        "properties": {
+          "catalog_id": { "type": "string" },
+          "time": {
+            "type": "string",
+            "description": "Optional date to resolve, e.g. 20251215 or 2025-12-15"
+          },
+          "include_nas": {
+            "type": "boolean",
+            "description": "是否只读查询该产品对应的 NAS 日期索引；列可用日期、判断日尺度能力时传true。省略时，无time的范围查询默认true，具体日期本地命中查询默认false。"
+          }
+        }
+      }
+    },
+    {
+      "name": "get_layer_statistics",
+      "description": "某一本地图层在一个时间片上的栅格统计（只读）：mean/min/max/std + 有效像元数，已排除 NoData。catalog_id 可省略（回落页面选中层），time 可省略（回落页面日期）；返回 time_source=page/requested/layer_default 标明日期来源，layer_default 表示不是页面那天。period_start~period_end 是命中的时间块，layer_span_* 是整层首尾，不得混用。is_daily_frame 表示是否单日观测；value_basis.kind 表示值出自哪种帧（ondemand_frame / daily_frame / block）。范围默认整幅栅格，不由视口裁剪。不建图层、不写产物、不跑工作流。",
+      "args": {
+        "type": "object",
+        "required": ["catalog_id"],
+        "properties": {
+          "catalog_id": { "type": "string", "description": "图层 id，形如 imported-<12位>" },
+          "time": {
+            "type": "string",
+            "description": "可选日期，如 20251215 或 2025-12-15；省略则用图层默认时间"
+          },
+          "bbox": {
+            "type": "array",
+            "items": { "type": "number" },
+            "description": "可选 WGS84 经纬度矩形框 [西,南,东,北]，仅在用户明确指定矩形区域时传。用户说「XX省/XX市(直辖市)/自治区/港澳台」的全省/全市平均时，不要用 bbox，改用 region 参数按行政边界做掩膜统计"
+          },
+          "region": {
+            "type": "string",
+            "description": "可选行政区名，支持省级（省/自治区/直辖市/港澳台）和地级市（地级市/自治州/地区/盟），如「四川省」「广州市」「凉山彝族自治州」。用户要「某省/某市整个行政区平均」时传此参数，后端按该行政区边界多边形掩膜统计，只算边界内像元，不混入邻近行政区；县/区一级不支持；与 bbox 互斥，region 优先"
+          }
+        }
+      }
+    },
+    {
+      "name": "list_workflow_timers",
+      "description": "List workflow timers (admin only). Optional workflow_id filter.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "workflow_id": { "type": "string" },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 20 }
+        }
+      }
+    },
+    {
+      "name": "run_workflow",
+      "description": "Prepare a workflow-run for a catalog layer. Does NOT submit until the user confirms via confirmation card. Optional time_range (ISO start/end) and workflow_variant=online.",
+      "args": {
+        "type": "object",
+        "required": ["catalog_id"],
+        "properties": {
+          "catalog_id": { "type": "string", "description": "Layer catalog id" },
+          "workflow_id": {
+            "type": "string",
+            "description": "Optional workflow seed id; defaults to layer descriptor workflow_id"
+          },
+          "params": { "type": "object", "description": "Optional algorithm parameters" },
+          "time_range": {
+            "type": "object",
+            "description": "Optional ISO time window {start|start_at, end|end_at}",
+            "properties": {
+              "start": { "type": "string" },
+              "end": { "type": "string" },
+              "start_at": { "type": "string" },
+              "end_at": { "type": "string" }
+            }
+          },
+          "workflow_variant": {
+            "type": "string",
+            "enum": ["online", "local"],
+            "description": "Use online variant seed when declared on the layer"
+          }
+        }
+      }
+    }
+  ]
+}

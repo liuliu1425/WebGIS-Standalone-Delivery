@@ -1,0 +1,21 @@
+/**
+ * Weather session helpers extracted from the layers god store.
+ * Catalog authority remains backend `/layers`; static whitelist is safe fallback only.
+ */
+import { isWeatherLayerDescriptor } from '../../services/layer-capabilities'
+import type { LayerDescriptor } from '../../services/runtime-api'
+import { LAYER_LIBRARY, WEATHER_ENGINE_CATALOG_IDS } from './catalog'
+
+export function isWeatherEngineCatalogId(
+  catalogId: string,
+  descriptor: LayerDescriptor | null | undefined,
+): boolean {
+  if (descriptor) {
+    return isWeatherLayerDescriptor(descriptor)
+  }
+  const staticItem = LAYER_LIBRARY.find((item) => item.catalogId === catalogId)
+  if (staticItem?.sources.some((s) => s.id.startsWith('weatherengine'))) {
+    return true
+  }
+  return WEATHER_ENGINE_CATALOG_IDS.has(catalogId)
+}

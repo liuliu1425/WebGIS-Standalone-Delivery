@@ -1,0 +1,259 @@
+from __future__ import annotations
+
+import json
+import logging
+import re
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+logger = logging.getLogger(__name__)
+FY_DATE_PATTERN = re.compile(r"(\d{8})")
+
+
+@dataclass(frozen=True, slots=True)
+class FyOrbitFile:
+    file_name: str
+    file_path: Path
+    date_key: str
+    orbit_type: str
+    satellite: str
+
+
+@dataclass(frozen=True, slots=True)
+class FyDailyGroup:
+    date_key: str
+    descending_files: tuple[FyOrbitFile, ...] = ()
+    ascending_files: tuple[FyOrbitFile, ...] = ()
+    # FY-3F ORBA 升轨（FY3F_MWRI-_ORBA_L1_*.HDF）
+    orba_files: tuple[FyOrbitFile, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class FyDailyJobPlan:
+    date_key: str
+    orbit_type: str
+    input_files: tuple[str, ...]
+    output_dir: str
+    work_dir: str
+    output_prefix: str
+    satellite: str
+    metadata: dict[str, str] = field(default_factory=dict)
+
+
+def extract_fy_date_key(file_name: str) -> str:
+    match = FY_DATE_PATTERN.search(file_name)
+    if match is None:
+        raise ValueError(f"Cannot parse date from FY file name: {file_name}")
+    return match.group(1)
+
+
+def detect_fy_orbit_type(file_name: str) -> str:
+    if "MWRID" in file_name:
+        return "MWRID"
+    if "MWRIA" in file_name:
+        return "MWRIA"
+    # FY-3F MWRI L1 实测命名（FY3F_MWRI-_ORBA_L1_*.HDF）使用 ORBA 升轨标识。
+    if "ORBA" in file_name:
+        return "ORBA"
+    raise ValueError(f"Cannot detect FY orbit type from file name: {file_name}")
+
+
+def detect_fy_satellite(file_name: str) -> str:
+    upper_name = file_name.upper()
+    if "FY3B" in upper_name:
+        return "FY3B"
+    if "FY3D" in upper_name:
+        return "FY3D"
+    if "FY3F" in upper_name:
+        return "FY3F"
+    return "FY3"
+
+
+def build_date_keys(start_time: datetime, end_time: datetime) -> list[str]:
+    keys: list[str] = []
+    current = start_time
+    while current <= end_time:
+        keys.append(current.strftime("%Y%m%d"))
+        current += timedelta(days=1)
+    return keys
+
+
+_FY_HDF_SUFFIXES = frozenset({".hdf", ".hdf5"})
+_DEFAULT_HDF_PATTERN = "*.HDF"
+_FY_BT_DATASET_PATHS = (
+    "Calibration/EARTH_OBSERVE_BT_10_to_89GHz",
+    "EARTH_OBSERVE_BT_10_to_89GHz",
+)
+
+
+def _probe_h5_dataset(ds: object) -> None:
+    """强制读一格；h5py Dataset 无 ``.flat``，按 ndim 取首元素。"""
+    size = int(getattr(ds, "size", 0) or 0)
+    if size <= 0:
+        return
+    ndim = int(getattr(ds, "ndim", 0) or 0)
+    if ndim <= 0:
+        _ = ds[()]  # type: ignore[index]
+    else:
+        _ = ds[tuple(0 for _ in range(ndim))]  # type: ignore[index]
+
+
+def _orbit_hdf_readable(path: Path) -> bool:
+    """跳过截断/损坏的轨道 HDF，避免后续 gdal_translate 整日失败。"""
+    suffix = path.suffix.lower()
+    if suffix not in _FY_HDF_SUFFIXES and suffix != ".h5":
+        return True
+    try:
+        import h5py
+    except ImportError:
+        return True
+    path_str = str(path)
+    try:
+        if not h5py.is_hdf5(path_str):
+            return False
+        with h5py.File(path_str, "r") as handle:
+            _ = list(handle.keys())[:1]
+            for ds_path in _FY_BT_DATASET_PATHS:
+                if ds_path not in handle:
+                    continue
+                _probe_h5_dataset(handle[ds_path])
+                break
+        return True
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError):
+        return False
+
+
+def discover_fy_orbit_files(
+    input_dir: str | Path, pattern: str = _DEFAULT_HDF_PATTERN
+) -> list[FyOrbitFile]:
+    input_dir = Path(input_dir)
+    if pattern == _DEFAULT_HDF_PATTERN:
+        # 默认模式大小写不敏感并接受 .hdf/.hdf5 变体（Linux glob 区分大小写；
+        # .hdf5 是 HDF5 生态与合成 fixture 的常见命名）。显式传入的 pattern
+        # （如 "*.tif" 回退）保持精确语义。
+        candidates: list[Path] = sorted(
+            p
+            for p in input_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in _FY_HDF_SUFFIXES
+        )
+    else:
+        candidates = sorted(input_dir.glob(pattern))
+    files: list[FyOrbitFile] = []
+    skipped_unreadable = 0
+    for file_path in candidates:
+        file_name = file_path.name
+        if not _orbit_hdf_readable(file_path):
+            skipped_unreadable += 1
+            continue
+        try:
+            files.append(
+                FyOrbitFile(
+                    file_name=file_name,
+                    file_path=file_path,
+                    date_key=extract_fy_date_key(file_name),
+                    orbit_type=detect_fy_orbit_type(file_name),
+                    satellite=detect_fy_satellite(file_name),
+                )
+            )
+        except ValueError:
+            continue
+    if skipped_unreadable:
+        logger.warning(
+            "discover_fy_orbit_files: skipped %d unreadable HDF under %s",
+            skipped_unreadable,
+            input_dir,
+        )
+    if not files:
+        raise FileNotFoundError(f"No FY HDF files found in {input_dir}")
+    return files
+
+
+def group_fy_files_by_day(input_files: list[FyOrbitFile]) -> dict[str, FyDailyGroup]:
+    grouped: dict[str, dict[str, list[FyOrbitFile]]] = {}
+    for item in input_files:
+        grouped.setdefault(item.date_key, {"MWRID": [], "MWRIA": [], "ORBA": []})
+        grouped[item.date_key][item.orbit_type].append(item)
+
+    result: dict[str, FyDailyGroup] = {}
+    for date_key, orbit_map in grouped.items():
+        result[date_key] = FyDailyGroup(
+            date_key=date_key,
+            descending_files=tuple(orbit_map["MWRID"]),
+            ascending_files=tuple(orbit_map["MWRIA"]),
+            orba_files=tuple(orbit_map["ORBA"]),
+        )
+    return result
+
+
+def build_fy_daily_job_plans(
+    input_dir: str | Path,
+    output_root: str | Path,
+    start_time: datetime,
+    end_time: datetime,
+    orbit_mode: str,
+) -> list[FyDailyJobPlan]:
+    # 优先 HDF 轨道文件；无 HDF 时接受 NAS 回退交付的逐波段预投影 TIF
+    # （FY3D_GBAL_L1_10V/10H_YYYYMMDD_MWRID_0.tif，已是 EASE2 9km 网格）。
+    try:
+        input_files = discover_fy_orbit_files(input_dir)
+        input_format = "hdf"
+    except FileNotFoundError:
+        input_files = discover_fy_orbit_files(input_dir, pattern="*.tif")
+        input_format = "tif"
+    grouped = group_fy_files_by_day(input_files)
+    date_keys = build_date_keys(start_time, end_time)
+    output_root = Path(output_root)
+
+    plans: list[FyDailyJobPlan] = []
+    for date_key in date_keys:
+        group = grouped.get(date_key)
+        if group is None:
+            continue
+
+        orbit_items: list[tuple[str, tuple[FyOrbitFile, ...]]] = []
+        if orbit_mode in {"MWRID", "Both"} and group.descending_files:
+            orbit_items.append(("MWRID", group.descending_files))
+        if orbit_mode in {"MWRIA", "Both"} and group.ascending_files:
+            orbit_items.append(("MWRIA", group.ascending_files))
+        # FY-3F 仅 ORBA 升轨可用（B4_FY3F.m / FY3F_MWRI_mosaic.py 实测）
+        if orbit_mode in {"ORBA", "Both"} and group.orba_files:
+            orbit_items.append(("ORBA", group.orba_files))
+
+        for orbit_type, files in orbit_items:
+            satellite = files[0].satellite
+            target_output_dir = (
+                output_root / orbit_type if orbit_mode == "Both" else output_root
+            )
+            work_dir = target_output_dir / "_work" / date_key
+            output_prefix = f"{satellite}_GBAL_L1_10V10H_{date_key}_{orbit_type}"
+            plans.append(
+                FyDailyJobPlan(
+                    date_key=date_key,
+                    orbit_type=orbit_type,
+                    input_files=tuple(str(item.file_path) for item in files),
+                    output_dir=str(target_output_dir),
+                    work_dir=str(work_dir),
+                    output_prefix=output_prefix,
+                    satellite=satellite,
+                    metadata={
+                        "input_dir": str(Path(input_dir)),
+                        "file_count": str(len(files)),
+                        "input_format": input_format,
+                    },
+                )
+            )
+    return plans
+
+
+def write_fy_daily_plan_json(
+    plans: list[FyDailyJobPlan], output_path: str | Path
+) -> Path:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = [asdict(plan) for plan in plans]
+    output_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return output_path

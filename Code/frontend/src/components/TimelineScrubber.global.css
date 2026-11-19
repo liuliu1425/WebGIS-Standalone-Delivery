@@ -1,0 +1,53 @@
+/* Teleport 到 body，需非 scoped */
+.play-interval-menu {
+  min-width: 9.2rem;
+  padding: 0.35rem;
+  border-radius: 0.55rem;
+  border: 1px solid var(--border-strong);
+  background: linear-gradient(180deg, var(--surface-2), var(--surface-2));
+  box-shadow: var(--elevation-3);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+}
+
+.play-interval-menu-title {
+  padding: 0.2rem 0.45rem 0.35rem;
+  font-size: var(--font-size-caption);
+  color: var(--text-secondary);
+  letter-spacing: 0.04em;
+}
+
+.play-interval-option {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  width: 100%;
+  border: none;
+  border-radius: 0.35rem;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--font-size-caption);
+  padding: 0.32rem 0.45rem;
+  cursor: pointer;
+  text-align: left;
+}
+
+.play-interval-option:hover {
+  background: var(--accent-surface);
+  color: var(--accent-strong);
+}
+
+.play-interval-option.active {
+  background: var(--accent-surface);
+  color: var(--accent);
+}
+
+.play-interval-check {
+  width: 0.85rem;
+  text-align: center;
+  font-size: var(--font-size-caption);
+  opacity: 0.9;
+}

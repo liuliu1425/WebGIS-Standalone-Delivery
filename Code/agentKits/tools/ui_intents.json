@@ -1,0 +1,214 @@
+{
+  "version": 3,
+  "intents": [
+    {
+      "name": "add_layer",
+      "description": "将明确产品添加到已添加图层列表，默认隐藏，不改变当前选中、其他图层显隐和任何日期。已添加时复用现有实例，不重复添加。",
+      "args": {
+        "type": "object",
+        "properties": {
+          "catalog_id": {
+            "type": "string"
+          },
+          "instance_id": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          }
+        },
+        "anyOf": [
+          {
+            "required": [
+              "catalog_id"
+            ]
+          },
+          {
+            "required": [
+              "instance_id"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "select_layer",
+      "description": "仅将已添加的指定图层设为当前选中查看对象，时间轴跟随其独立记忆日期；不改变目标或其他图层的显隐与日期。未添加时需先明确调用 add_layer，再调用本工具。纯“切换到某产品/查看某图层”使用本工具；带具体日期时用 set_timeline。",
+      "args": {
+        "type": "object",
+        "properties": {
+          "catalog_id": {
+            "type": "string"
+          },
+          "instance_id": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          }
+        },
+        "anyOf": [
+          {
+            "required": [
+              "catalog_id"
+            ]
+          },
+          {
+            "required": [
+              "instance_id"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "set_layer_visibility",
+      "description": "显示或隐藏指定图层。visible=true 表示勾选显示并选为当前图层，不隐藏其他图层；visible=false 只取消显示，保留当前选中对象。仅用户明确“只显示/只保留该层”时 solo=true，才隐藏其他产品图层。添加到列表、仅选中查看应分别使用 add_layer、select_layer，不用本工具替代。",
+      "args": {
+        "type": "object",
+        "required": ["catalog_id", "visible"],
+        "properties": {
+          "catalog_id": { "type": "string" },
+          "instance_id": { "type": "string" },
+          "display_name": { "type": "string" },
+          "visible": { "type": "boolean" },
+          "solo": {
+            "type": "boolean",
+            "description": "仅当用户明确要「只看 / 只留这一层」时为 true；缺省 false。隐藏图层（visible=false）时无意义。"
+          }
+        }
+      }
+    },
+    {
+      "name": "set_layer_opacity",
+      "description": "调节图层透明度。**用户只要提到透明度就必须调用本工具**（哪怕只给了模糊说法、没给数字），绝不允许只用文字回复说「已调好」——那条路上什么都改不了，用户看到的还是原样。opacity 必须在 0~1 之间：用户说百分比或口语必须先换算（50% -> 0.5，六成 -> 0.6，八成五 -> 0.85），绝不许把 50 直接当数值传（会被当成完全遮住，地图全黑）。用户只说「淡一点/调低些/太实了」没给数字时，取 0.6 这类中间值或按 ±0.1 微调，并在回答里如实回报改后的实际值。",
+      "args": {
+        "type": "object",
+        "required": ["catalog_id", "opacity"],
+        "properties": {
+          "catalog_id": { "type": "string" },
+          "opacity": { "type": "number", "minimum": 0, "maximum": 1 }
+        }
+      }
+    },
+    {
+      "name": "fit_layer",
+      "description": "Fit map viewport to a layer extent.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "catalog_id": { "type": "string" },
+          "instance_id": { "type": "string" }
+        },
+        "anyOf": [{ "required": ["catalog_id"] }, { "required": ["instance_id"] }]
+      }
+    },
+    {
+      "name": "list_active_layers",
+      "description": "List currently active map layers from the client. Prefer answering the user in Chinese with the layer names; this tool confirms the client-side list.",
+      "args": { "type": "object", "properties": {} }
+    },
+    {
+      "name": "fit_china",
+      "description": "Zoom the map viewport to China national extent. Use when the user asks for 中国全境/全国范围/缩放到中国. Alias zoom_to_china is also accepted by the client.",
+      "args": { "type": "object", "properties": {} }
+    },
+    {
+      "name": "locate_coordinate",
+      "description": "Fly the map to a WGS84 longitude/latitude. 用 lng + lat 两个字段；zoom 可选（城市一般 10–12）。",
+      "args": {
+        "type": "object",
+        "required": ["lng", "lat"],
+        "properties": {
+          "lng": { "type": "number", "description": "Longitude WGS84 (−180…180)" },
+          "lat": { "type": "number", "description": "Latitude WGS84 (−90…90)" },
+          "zoom": { "type": "number", "minimum": 1, "maximum": 22 }
+        }
+      }
+    },
+    {
+      "name": "switch_basemap",
+      "description": "Switch the active basemap tile source. Common ids: tianditu-img, tianditu-vec, gaode-street, gaode-satellite, esri-imagery, osm-standard. Prefer basemap_id; source_id/id also accepted.",
+      "args": {
+        "type": "object",
+        "required": ["basemap_id"],
+        "properties": {
+          "basemap_id": { "type": "string" },
+          "source_id": { "type": "string" },
+          "id": { "type": "string" }
+        }
+      }
+    },
+    {
+      "name": "set_timeline",
+      "description": "切换明确目标图层记住的日期或小时，必须提供 catalog_id（已有实例可带 instance_id）。保留该层显隐、页面选中对象和其他图层日期。先读取目标产品真实时间范围与时间粒度；非法日期、静态数据及超出真实范围不得下发。时间控件变化不表示取数完成，执行结果由前端加载回执确认。",
+      "args": {
+        "type": "object",
+        "properties": {
+          "instance_id": { "type": "string" },
+          "display_name": { "type": "string" },
+          "hour": { "type": "integer", "minimum": 0, "maximum": 23 },
+          "date": { "type": "string", "description": "ISO date YYYY-MM-DD" },
+          "catalog_id": {
+            "type": "string",
+            "description": "要把时间轴切到哪一层（用户点名的图层，或当前明确选中的那一层）。省略时前端按当前选中层处理；地图上同时显示多个产品时务必传。"
+          }
+        }
+      }
+    },
+    {
+      "name": "set_timeline_playing",
+      "description": "Start or pause timeline playback.",
+      "args": {
+        "type": "object",
+        "required": ["playing"],
+        "properties": {
+          "playing": { "type": "boolean" }
+        }
+      }
+    },
+    {
+      "name": "remove_layer",
+      "description": "Remove an active map layer by catalog_id or instance_id. Fails if the layer has a running/queued workflow.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "catalog_id": { "type": "string" },
+          "instance_id": { "type": "string" }
+        },
+        "anyOf": [{ "required": ["catalog_id"] }, { "required": ["instance_id"] }]
+      }
+    },
+    {
+      "name": "reorder_layer",
+      "description": "Bring a layer to front or send to back in the stack.",
+      "args": {
+        "type": "object",
+        "required": ["action"],
+        "properties": {
+          "catalog_id": { "type": "string" },
+          "instance_id": { "type": "string" },
+          "action": { "type": "string", "enum": ["front", "back"] }
+        }
+      }
+    },
+    {
+      "name": "set_layer_symbology",
+      "description": "设置图层的调色板（换配色）和/或数值范围 vmin/vmax（改量程）。两者性质不同：换配色只改外观、不影响读数，用户说了就能做；改量程会改变「什么颜色代表什么数值」，0.75 以上全部压成同一色、用户就分不出高低了 —— 所以**只有用户明确说「改量程 / 最大值设成 X / 最小值设成 Y」时才允许传 vmin/vmax**。用户只抱怨「颜色太深 / 不好看」时只传 palette，并在回答里说明量程没动、还是多少到多少。",
+      "args": {
+        "type": "object",
+        "properties": {
+          "catalog_id": { "type": "string" },
+          "instance_id": { "type": "string" },
+          "palette": {
+            "type": "string",
+            "description": "配色 id，只能取下列 25 个之一（中文名供对照）：thermal-orange 热力橙红、precip-cyan 降水青蓝、wind-blue 风场蓝、magenta-yellow 品红黄、yellow-red 黄红外推、blue-green 蓝绿渐变、red-blue 红蓝发散、purple-orange 紫橙渐变、dark-rainbow 暗色彩虹、darkgreen-yellow 墨绿亮黄、viridis、cividis、spectral、blues、reds、greens、ylgnbu、plasma、hot、terrain、tab10、ylgn、ylorrd、brg、rdylgn_r。用户用中文名说要哪个就换成对应 id。名字不在表里（例如 rainbow-ultra）就是没有这个配色：必须直说「没有这个配色」并列出相近的几个可选，绝不许先回「已改为 XXX」。"
+          },
+          "vmin": { "type": "number" },
+          "vmax": { "type": "number" }
+        },
+        "anyOf": [{ "required": ["catalog_id"] }, { "required": ["instance_id"] }]
+      }
+    }
+  ]
+}

@@ -1,0 +1,267 @@
+# Backend
+
+`Code/backend/` 是本项目的后端服务根目录。它承接前端请求、组织工作流运行、管理状态与事件、回传结果，并作为 Python 算法包、天气引擎与 Web 平台之间的桥梁。
+
+## 当前后端定位
+
+核心不是 CRUD API，而是一条稳定的任务执行链：
+
+- 接收前端或外部系统请求
+- 校验并标准化工作流提交参数（engine request registry）
+- 创建运行记录、状态流和事件流
+- 选择同步执行或 Celery 异步执行
+- 经 bridge 调用 weather / Python provider / download / GEE
+- 管理 artifact、结果引用、预览图与统一瓦片
+- 向前端提供查询、元数据和结果读取接口
+
+工作流编排已从单体 `interaction_hub` 拆分为 `app/services/workflow/` 下的聚焦服务，经 `service_container.py` 对外暴露。
+
+## 当前可用能力（按域）
+
+### 系统 / 控制流
+
+- `GET /health`
+- `POST /workflow-runs`
+- `GET /workflow-runs/{run_id}`
+- `GET /workflow-runs/{run_id}/view`
+- `GET /workflow-runs/{run_id}/events`
+- `POST /workflow-runs/{run_id}/cancel`
+- `POST /workflow-runs/{run_id}/retry`
+- `GET /runtime/status`
+- `GET /runtime/config` / `PATCH /runtime/config`
+- `GET /runtime/metrics`
+- `GET /runtime/api-config`（及 provider 变体）
+
+### 目录 / 图层 / 叠加
+
+- `GET /layers`
+- `GET /demo/layers/snapshots`、`GET /demo/layers/{layer_id}/snapshot`
+- `GET /geo/transform`
+- `GET /overlays`、`/overlay-preview/{layer_id}`、`/overlay-bounds/{layer_id}`、`/overlay-value/{layer_id}`
+
+### 天气
+
+- `GET /weather/point`
+- `GET /weather/providers-for-layer/{layer_id}`（图层可选天气源列表）
+- `GET /weather/workflows`（及 diagnostics / 按名查询）
+- `GET /weather/tiles/{layer_id}/{z}/{x}/{y}`（**天气 GeoJSON 瓦片正式入口**；支持 `provider` 钉源）
+
+### 底图代理与缓存
+
+- `GET /unified-tiles/{layer_id}/{z}/{x}/{y}`（**底图栅格正式入口**；天气 layer 将 404）
+- `GET /runtime/tiles/providers`
+- `GET /runtime/tiles/cache/stats`、`POST /runtime/tiles/cache/clear`
+- 旧前缀 `/tiles/...` 已移除
+
+### 配置 / 设置面（`/config/*`）
+
+前端「系统设置」面板消费这些接口（开发态 Vite 需代理 `/config`）：
+
+- `GET /config/general`、`/config/about`、`/config/data-source`
+- `GET /config/data-cache/overview`、`POST /config/data-cache/evict`（静态 materialize 缓存）
+- `PUT /config/data-source/open-data-presets`、`PUT /config/data-source/remote-layer-uris`（DB 覆盖；图层 URI 优先于 env）
+- `GET|PUT|DELETE /config/api-keys*`（天地图 / 百度等；运行真源 = DB 覆盖 env）
+- `GET|POST|DELETE /config/gee/accounts*`、`GET /config/gee/runtime`
+- `GET /config/weather`、`GET|PUT /config/weather/providers*`
+- `GET|PUT|DELETE /config/remote-storage*`
+
+### 工作流定义 / 节点模板
+
+- `GET /workflow-definitions`、CRUD / duplicate
+- `GET /workflow-definitions/node-templates`
+- `POST /workflow-definitions/compile`：LiteGraph 画布 → Python `workflow_definition`（编辑器 Run 主路径）
+
+**安全**：`/config/*` 写操作与敏感读需有效凭据（会话 Cookie、用户 API Token 或 `backend_auth` 服务密钥 `X-API-Key`）。RBAC：三角色模型——`admin`（全权限）、`standard`（可读写/创建工作流，不可改高危配置）、`demo`（只读 + 受控数据上传）。development 且未启用 keys 时仅 **loopback** 可旁路。非 development 必须配置 `BACKEND_GEE_CREDENTIALS_ENCRYPTION_KEY`（共享加密主密钥）。详见 `AGENTS.md` 高风险区。
+
+### 算法 / Provider / Artifact / 导入 / GEE
+
+- `GET /algorithm/workflows`（及 panel-schema / ui-schema / diagnostics）
+- `GET /provider/workflows`（及 diagnostics / 按名查询）
+- `GET /artifacts/{artifact_id}`、`GET /artifacts/{artifact_id}/preview.png`
+- `POST /import/raster`
+- `GET /gee/config`（及 limits / status / environment）
+- GEE 业务路由可按配置挂载
+
+执行模式：支持 `sync` / `celery`。旧 `/tasks` 仍经 `task_store` 软下线桥接到 `workflow-runs`，不再作为主叙事。
+
+## 工作流容量双池
+
+`POST /workflow-runs` 提交时按 payload 分类计入不同活跃 run 上限：
+
+| 池 | 判定 | 配置 | 默认 |
+|----|------|------|------|
+| business | 非瓦片 workflow（分析 / 课题组 / GEE / 非瓦片天气 DAG 等） | `BACKEND_MAX_ACTIVE_RUNS` / runtime `max_active_runs` | 8 |
+| weather_tile | `weather_request` DAG 含 `weather_tile_render` | `BACKEND_MAX_ACTIVE_WEATHER_TILE_RUNS` / runtime `max_active_weather_tile_runs` | 16 |
+
+前端视口天气瓦片热路径应走 `GET /weather/tiles/...`（`WeatherTileService`），不占上述任一 workflow 池。显式 tile workflow 仍可用，计入 `weather_tile` 池。
+
+## 当前实现事实
+
+- `retry_pending` 中间态与自动重试语义
+- `FailureCategory` 失败分类
+- `BridgeExecutionError` 作为 bridge 层统一失败协议
+- `source_fetcher` 驱动的真实下载抓取链
+- `weatherengine` fallback 与 weather workflow DAG 双路径
+- 天气网格缓存、请求去重、断路器与统一瓦片 provider registry
+- artifact preview 路由，供前端以 PNG 方式读取 COG 结果
+- OpenAPI 可供前端 `openapi-typescript` 生成类型
+
+## 目录结构
+
+```text
+backend/
+├─ app/
+│  ├─ api/                 # REST 路由（按域拆分）
+│  │  ├─ routers/          # health / workflow / runtime / layer / weather / auth / …
+│  │  ├─ tile_routes.py
+│  │  ├─ weather_tile_routes.py
+│  │  ├─ config_routes.py
+│  │  └─ gee_config_routes.py
+│  ├─ core/                # 配置、Celery、日志、Redis
+│  ├─ services/            # 业务服务、桥接、目录、瓦片、存储
+│  │  ├─ workflow/         # submission / lifecycle / runtime / persistence …
+│  │  ├─ config_service.py # 配置门面（再导出 L3 模块）
+│  │  ├─ config_api_keys.py / config_gee_accounts.py / …
+│  │  └─ tile_proxy_service.py  # 含天地图服务端 UA
+│  ├─ tasks/               # Celery 任务
+│  ├─ weatherengine/       # 点查、网格、瓦片、天气 DAG；render/value 可拆分子模块
+│  ├─ workflow_engine/     # 通用 DAG 执行器
+│  ├─ gee/                 # Earth Engine 嵌入模块
+│  └─ main.py
+├─ docker-compose.yml      # Redis + MinIO；Open-Meteo（--profile open-meteo）
+├─ requirements.txt
+└─ （单测集中在仓库根 Test/backend/，勿在此目录新建 tests/）
+```
+
+## 当前核心模块
+
+### `app/api/`
+
+只做参数接收、调用服务层和返回响应。按域拆分为多个 router，不再使用单体 `routes.py`。
+
+### `app/core/`
+
+配置、Celery app、日志、Redis 客户端等基础设施。
+
+### `app/services/workflow/`
+
+替代原 `interaction_hub` 的工作流域服务：
+
+| 模块 | 职责 |
+|------|------|
+| `submission_service.py` | 提交、派发、容量校验 |
+| `lifecycle_service.py` | 取消、重试、超时与失败收口 |
+| `transition_builder.py` | 状态转换构建 |
+| `persistence_service.py` | 持久化与事件记录 |
+| `runtime_status_service.py` | runtime 配置 / 状态 / 前端命令 |
+| `follow_up_dispatch_service.py` | follow-up 派发与陈旧 run 清理 |
+| `service_container.py` | 模块级服务实例组装 |
+
+相关辅助：`engine_request_registry.py`、`workflow_request_resolver.py`、`failure_classifier.py`、`bridge_protocol.py`。
+
+- `workflow_graph_compiler.py`：LiteGraph → Python provider `workflow_definition`
+- `data_cache_service.py` / `research_data_settings_repository.py`：静态缓存与开放数据/图层 URI 设置
+
+### 其他重要服务
+
+- `python_provider_bridge_service.py` / `weather_bridge_service.py` / `gee_bridge_service.py`
+- `source_fetcher.py`、`download_service.py`、`cache_service.py`
+- `tile_provider_registry.py`、`tile_proxy_service.py`（天地图必须用服务端 UA `CGDA-Backend/1.0`；街道底图由前端叠 `tianditu-vec`+`tianditu-cva`）
+- `config_service.py`：**门面**；实现在 `config_api_keys` / `config_gee_accounts` / `config_weather_providers` / `config_remote_storage`，经本模块再导出供 lifespan 与路由使用
+- `result_storage.py`、`result_view_service.py`、`object_store.py`
+- `layer_catalog.py`、`overlay_registry.py`
+
+### `app/weatherengine/`
+
+- `service.py`：`/weather/point` 与 fallback map_layer 产物
+- `tile_service.py`：z/x/y GeoJSON 瓦片（缓存键含 `provider_id`）
+- `fetch_gateway.py`：统一出站拉取（钉源 / 自动优先级 / 失败 fallback）
+- `providers/`：Open-Meteo online/local（默认双源）、WeatherAPI、OpenWeather 等可插拔源
+- `field_mapping.py`：商业源字段映射到 Open-Meteo 风格契约名
+- `workflow_service.py` + `nodes/*`：天气 DAG（`provider_id` 可钉源；风场、温湿降水气压能见度、tile_render 等）
+- `client.py`：网格预报拉取（Open-Meteo 风格，经 Provider 封装）
+### `app/tasks/`
+
+通用 workflow task、download follow-up、weather 刷新等 Celery 入口。
+
+## 后端运行模型
+
+控制流 + 数据流双通道：
+
+1. 前端提交 workflow request
+2. 后端创建 run 记录与事件流
+3. 同步执行器或 Celery worker 执行
+4. bridge / provider / weatherengine 产出结果引用
+5. 控制流：`workflow-runs/{run_id}` / `events` 回传状态
+6. 数据流：`view`、artifact、preview、`unified-tiles` 按需读取
+
+补充：
+
+- 控制流状态含 `retry_pending`
+- `ResultKind.map_layer` 是天气图层、GeoJSON 与栅格预览链的重要数据面入口
+- 推荐新前端消费 `/unified-tiles/...`，不要新增对 deprecated 天气/底图瓦片路径的依赖
+
+## 运行与部署
+
+- 本地一键：仓库根 `start.bat`（**强制** `Env\Python312\python.exe`）或 `Env\Python312\python.exe launch.py`（编排 compose + API + 多队列 worker + 前端）。勿用系统 PATH 的 `python`。
+- **RAR 解压（服务端无界面）**：`app/data_io/services/archive_safe.py` 使用 `Code/backend/vendor/unrar/{win-x64,linux-x64}` 控制台 UnRAR（或系统 `unrar`），**禁止** WinRAR GUI / `unrarw64` 自解压包。Linux 生产可 `apt install unrar`。上传侧拒绝 SFX/PE、路径穿越、符号链接、可执行成员与压缩炸弹；加密 RAR 直接拒绝。详见 `Code/backend/vendor/unrar/README.md`（勿把运行时依赖放进仓库根 `Tools/`）。
+- **SHP/DBF 编码**：`app/data_io/services/dbf_encoding.py` 专责跨 Windows/Linux 的多语言编码（`.cpg`、DBF LDID、locale 提示、utf-8/gb18030/gbk/big5/cp125x 等候选 + 文本质量打分）。导入 meta 会写入 `source_encoding` / `encoding_sources`；属性编辑写回会保留这些字段。
+- **导出编码**：`POST /export/layer` / `/export/batch` 支持 `encoding`（`auto` / `utf-8` / `utf-8-sig` / `gbk` / `gb18030` / …）；SHP zip 附带 `.cpg`；CSV 可按目标编码落盘。选项列表：`GET /export/encodings`。
+- 基础设施：`docker-compose.yml` 提供 Redis 宿主机 `:16379`（容器内 6379）、MinIO `:9100/:9101`、Open-Meteo API `cgda-open-meteo` `:8080`
+- Open-Meteo：**API 在 backend 运行栈**；**同步在** `Code/infra/data-sync`（`-p data-sync`，`run --rm open-meteo-sync`）。气象库为 named volume `backend_open-meteo-data`（落在 `I:\Docker\DockerDesktop` 的 VHDX 内，勿用 Windows 路径 bind）。图层选源：`open-meteo-online`（公网）与 `open-meteo-local`（`BACKEND_OPEN_METEO_LOCAL_URL`，默认 `http://127.0.0.1:8080/v1/forecast`）。详见 `.env.open-meteo.example` 与 `Code/infra/data-sync/README.md`。
+- Docker Desktop 数据盘建议在 `I:\Docker\DockerDesktop`（镜像/容器与气象库分离）
+- 环境变量参考 `.env.example`
+- 亦可使用 `Env/backend/` 脚本做单项启动
+
+## 推荐阅读顺序
+
+1. `Code/backend/README.md`
+2. `Code/shared/contracts/README.md`
+3. `Docs/03-规范协议/双通道接口设计总结.md`
+4. `Docs/02-架构设计/工程决策纪要-配置瓦片与契约.md`
+5. `Code/algorithms/providers/Python/README.md`
+6. `Code/algorithms/providers/docs/backend_integration_contract.md`
+7. `Docs/05-专题研究/其它专题/课题组数据全链路-2026-07-21.md`（画布编译链路）
+
+## 说明
+
+- `workflow-runs` 是主线；旧 `/tasks` 仅为兼容桥接
+- 文档与代码需持续对齐路由名称、任务模型与结果模型
+- 带日期的阶段快照不覆盖本 README 的现行结构描述
+
+<!-- geoflow-directory-navigation:start -->
+## 本层目录导航
+
+[源码根目录](../../README.md) · [上一级](../README.md)
+
+交付运行说明：[部署与运行](../../Docs/%E9%83%A8%E7%BD%B2%E4%B8%8E%E8%BF%90%E8%A1%8C.md)。本层原有开发说明保留，运行入口与最终验收以交付部署文档为准。
+
+### 子目录
+
+| 目录 | 说明 |
+|---|---|
+| [app](app/README.md) | 应用入口、接口、数据访问与服务实现。 |
+| [scripts](scripts/README.md) | 本目录的源码、配置与说明见下方导航。 |
+| [vendor](vendor/README.md) | 本目录的源码、配置与说明见下方导航。 |
+| [workflow_seeds](workflow_seeds/README.md) | 本目录的源码、配置与说明见下方导航。 |
+
+### 文件
+
+| 文件 | 类型 |
+|---|---|
+| [.env.example](.env.example) | 配置字段示例 |
+| [compose.prod.yml](compose.prod.yml) | YAML 配置 |
+| [DATA_SETUP_GUIDE.txt](DATA_SETUP_GUIDE.txt) | 清单或说明 |
+| [deployment.config.json.example](deployment.config.json.example) | 源码或配置 |
+| [docker-compose.yml](docker-compose.yml) | YAML 配置 |
+| [Dockerfile](Dockerfile) | 镜像构建定义 |
+| [mypy.ini](mypy.ini) | 源码或配置 |
+| [requirements-dev.txt](requirements-dev.txt) | 依赖清单或约束 |
+| [requirements.txt](requirements.txt) | 依赖清单或约束 |
+| [source_uri_map.example.json](source_uri_map.example.json) | 配置、协议或数据清单 |
+| [start_celery_beat.py](start_celery_beat.py) | Python 模块或脚本 |
+| [start_celery_worker.py](start_celery_worker.py) | Python 模块或脚本 |
+| [start_fastapi.py](start_fastapi.py) | Python 模块或脚本 |
+| [test_celery_e2e.py](test_celery_e2e.py) | Python 模块或脚本 |
+
+<!-- geoflow-directory-navigation:end -->

@@ -1,0 +1,90 @@
+# Shared Contracts
+
+`Code/shared/contracts/` 用于承载前后端共享的数据契约与公共协议，是整个项目中非常重要的边界层。它的作用是让前端、后端和算法包围绕统一的数据结构协作，减少字段不一致、协议分叉和临时约定带来的维护成本。
+
+## 当前职责
+
+当前共享协议目录主要覆盖以下内容：
+
+- 图层目录接口
+- 任务提交接口
+- 任务状态接口
+- 前后端共享的基础请求与响应结构
+- 面向后端工作流与结果查询的公共字段定义
+
+## 当前协议原则
+
+- 字段优先使用 `snake_case`
+- 前后端围绕统一的图层、时间范围、空间范围、任务状态对象协作
+- 当前先用 `Pydantic` 模型作为协议单一事实来源
+- 后续可再导出 JSON Schema 或 TypeScript 类型
+
+## 命名例外白名单（N-3）
+
+`snake_case` 原则的正式例外：**气压层字段保留 `hPa` 大写后缀**，源自 Open-Meteo 原生命名，
+前后端已一致使用，改名将造成无谓的破坏性变更。以下 9 个字段为豁免项
+（`WeatherPointCurrent`，`api_contracts.py`）：
+
+- `wind_speed_850hPa` / `wind_direction_850hPa` / `temperature_850hPa`
+- `wind_speed_500hPa` / `wind_direction_500hPa` / `temperature_500hPa`
+- `wind_speed_200hPa` / `wind_direction_200hPa` / `temperature_200hPa`
+
+规则：新增气压层字段沿用同一命名模式（`<metric>_<level>hPa`）；其他字段仍严格 `snake_case`。
+
+## 当前文件
+
+- `api_contracts.py`：当前共享协议的主要定义文件
+
+## 该目录的重要性
+
+共享协议层是项目工程化的基础。只要前端、后端和算法包都遵守同一套契约，系统就能在以下方面保持稳定：
+
+- 请求字段一致
+- 响应字段一致
+- 图层配置一致
+- 任务状态一致
+- 结果结构一致
+
+## 与其他模块的关系
+
+### 与前端的关系
+前端通过共享协议理解任务提交、图层展示和结果结构，避免直接硬编码后端字段。
+
+### 与后端的关系
+后端通过共享协议接收前端请求，并统一返回可被前端消费的结果对象。
+
+### 与算法包的关系
+算法包在接入平台时，也需要遵循共享协议中关于任务、结果和元数据的约定，以保证输出能被后端稳定接收。
+
+## 推荐阅读顺序
+
+如果你在接手共享协议相关内容，建议按下面顺序阅读：
+
+1. `Code/shared/contracts/README.md`
+2. `Code/shared/contracts/api_contracts.py`
+3. `Code/backend/README.md`
+4. `Code/algorithms/providers/Python/README.md`
+
+## 说明
+
+- 当前共享协议目录仍然比较轻量，但它是系统稳定性的核心边界之一
+- 后续如果协议扩展，建议优先在这里补充正式契约，再向前端和后端同步
+- 这个目录应尽量保持“少而稳定”，避免出现多个并行版本的协议定义
+
+<!-- geoflow-directory-navigation:start -->
+## 本层目录导航
+
+[源码根目录](../../../README.md) · [上一级](../README.md)
+
+交付运行说明：[部署与运行](../../../Docs/%E9%83%A8%E7%BD%B2%E4%B8%8E%E8%BF%90%E8%A1%8C.md)。本层原有开发说明保留，运行入口与最终验收以交付部署文档为准。
+
+### 文件
+
+| 文件 | 类型 |
+|---|---|
+| [__init__.py](__init__.py) | Python 模块或脚本 |
+| [api_contracts.py](api_contracts.py) | Python 模块或脚本 |
+| [config_contracts.py](config_contracts.py) | Python 模块或脚本 |
+| [workflow_progress.py](workflow_progress.py) | Python 模块或脚本 |
+
+<!-- geoflow-directory-navigation:end -->

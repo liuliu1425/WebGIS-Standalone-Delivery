@@ -1,0 +1,893 @@
+<script setup lang="ts">
+import { computed, onMounted, onUnmounted, ref, shallowRef, watch, type Component } from 'vue'
+import { useRouter } from 'vue-router'
+import {
+  Settings,
+  User,
+  X,
+  LayoutGrid,
+  Key,
+  Globe,
+  CloudSun,
+  CloudLightning,
+  Server,
+  Database,
+  Info,
+  Palette,
+  Bot,
+} from '../ui/icons'
+
+import { useAuthStore } from '../../stores/auth'
+import { useSettingsStore } from '../../stores/settings'
+import { useUiLoadingStore } from '../../stores/ui-loading'
+import { loadSettingsUiLocal, saveSettingsUiLocal } from '../../services/settings-local'
+import GeneralSettings from './GeneralSettings.vue'
+import AppearanceSettings from './AppearanceSettings.vue'
+import AgentSettings from './AgentSettings.vue'
+import ApiKeySettings from './ApiKeySettings.vue'
+import GeeAccountSettings from './GeeAccountSettings.vue'
+import WeatherProviderSettings from './WeatherProviderSettings.vue'
+import OpenMeteoSyncSettings from './OpenMeteoSyncSettings.vue'
+import DataSourceSettings from './DataSourceSettings.vue'
+import RemoteStorageSettings from './RemoteStorageSettings.vue'
+import AboutSettings from './AboutSettings.vue'
+import UserAccountSettings from './UserAccountSettings.vue'
+import { SETTINGS_COPY } from '../../ui-copy'
+
+const emit = defineEmits<{
+  close: []
+}>()
+
+const settingsStore = useSettingsStore()
+const authStore = useAuthStore()
+const router = useRouter()
+
+/** 跳转管理员专属的部署配置中心（/deployment），先关设置面板避免双层遮罩。 */
+function openDeploymentCenter() {
+  emit('close')
+  void router.push('/deployment')
+}
+
+type SettingsTab =
+  | 'general'
+  | 'appearance'
+  | 'agent'
+  | 'accounts'
+  | 'api-keys'
+  | 'gee-accounts'
+  | 'weather-providers'
+  | 'open-meteo-sync'
+  | 'remote-storage'
+  | 'data-source'
+  | 'about'
+
+const TAB_IDS: SettingsTab[] = [
+  'general',
+  'appearance',
+  'agent',
+  'accounts',
+  'api-keys',
+  'gee-accounts',
+  'weather-providers',
+  'open-meteo-sync',
+  'remote-storage',
+  'data-source',
+  'about',
+]
+
+const savedTabRaw = loadSettingsUiLocal().activeTab
+/** Legacy `system-status` tab merged into about. */
+const savedTab = (savedTabRaw === 'system-status' ? 'about' : savedTabRaw) as
+  SettingsTab | undefined
+const defaultTab = (): SettingsTab =>
+  authStore.authRequired && authStore.isAuthenticated ? 'accounts' : 'general'
+const activeTab = ref<SettingsTab>(savedTab && TAB_IDS.includes(savedTab) ? savedTab : defaultTab())
+
+const tabComponents = shallowRef<Record<SettingsTab, Component>>({
+  general: GeneralSettings,
+  appearance: AppearanceSettings,
+  agent: AgentSettings,
+  accounts: UserAccountSettings,
+  'api-keys': ApiKeySettings,
+  'gee-accounts': GeeAccountSettings,
+  'weather-providers': WeatherProviderSettings,
+  'open-meteo-sync': OpenMeteoSyncSettings,
+  'remote-storage': RemoteStorageSettings,
+  'data-source': DataSourceSettings,
+  about: AboutSettings,
+})
+
+const ALL_TABS: Array<{ id: SettingsTab; label: string; icon: Component }> = [
+  { id: 'general', label: SETTINGS_COPY.tabGeneral, icon: LayoutGrid },
+  { id: 'appearance', label: SETTINGS_COPY.tabAppearance, icon: Palette },
+  { id: 'agent', label: SETTINGS_COPY.tabAgent, icon: Bot },
+  { id: 'accounts', label: '账户', icon: User },
+  { id: 'api-keys', label: SETTINGS_COPY.tabApiKeys, icon: Key },
+  { id: 'gee-accounts', label: SETTINGS_COPY.tabGee, icon: Globe },
+  { id: 'weather-providers', label: SETTINGS_COPY.tabWeather, icon: CloudSun },
+  { id: 'open-meteo-sync', label: SETTINGS_COPY.tabOpenMeteo, icon: CloudLightning },
+  { id: 'remote-storage', label: SETTINGS_COPY.tabRemoteStorage, icon: Server },
+  { id: 'data-source', label: SETTINGS_COPY.tabDataSource, icon: Database },
+  { id: 'about', label: '系统与关于', icon: Info },
+]
+
+/** VITE_SETTINGS_TABS=comma ids 白名单；未配置则全开（兼容现网） */
+function resolveVisibleSettingsTabs(): Array<{ id: SettingsTab; label: string; icon: Component }> {
+  const raw = String((import.meta.env as Record<string, unknown>).VITE_SETTINGS_TABS ?? '').trim()
+  if (!raw) return ALL_TABS
+  const allowed = new Set(
+    raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+  )
+  const filtered = ALL_TABS.filter((t) => allowed.has(t.id))
+  return filtered.length ? filtered : ALL_TABS
+}
+
+/**
+ * 受限登录态（demo 游客）能打开的分区：
+ * - `accounts` 账户（退出登录，只依赖登录态）；
+ * - `appearance` 外观（纯浏览器本地偏好，不走后端配置）；
+ * - `about` 系统与关于（后端公开接口）。
+ * 其余分区都建立在被 403 拦下的系统配置之上 ⇒ 直接不列出，免得点进去只看得到一片错误。
+ * **不改任何权限**，只是不给注定无效的入口。
+ */
+const RESTRICTED_ALLOWED_TABS: SettingsTab[] = ['accounts', 'appearance', 'about']
+
+const tabs = computed(() => {
+  const visible = resolveVisibleSettingsTabs()
+  if (!authStore.authRequired) {
+    return visible.filter((t) => t.id !== 'accounts')
+  }
+  if (authStore.isRestrictedRole) {
+    const allowed = visible.filter((t) => RESTRICTED_ALLOWED_TABS.includes(t.id))
+    // 「账户」提到最前：受限身份最常见的诉求就是从这里退出登录
+    return [
+      ...allowed.filter((t) => t.id === 'accounts'),
+      ...allowed.filter((t) => t.id !== 'accounts'),
+    ]
+  }
+  return visible
+})
+
+const ROLE_LABEL: Record<string, string> = {
+  admin: '管理员',
+  standard: '标准用户',
+  demo: '演示',
+}
+
+const sessionLabel = computed(() => {
+  if (!authStore.authRequired || !authStore.user) return null
+  const role = ROLE_LABEL[authStore.user.role] ?? authStore.user.role
+  return `${authStore.user.username} · ${role}`
+})
+
+/** 系统配置读取被拦（典型：demo 角色读 GET /config/general 返回 403）⇒ 内容区整块降级为错误提示。 */
+const configUnavailable = computed(
+  () => Boolean(settingsStore.error) && !settingsStore.generalConfig,
+)
+
+/**
+ * 「账户」分区只依赖当前登录态（用户名 / 角色 / 退出登录），不依赖那份被拦下的系统配置。
+ * 因此它不受上面的错误闸门影响、始终可打开 —— 保证任何角色都能从设置里退出登录。
+ * 注意：这里只放行「显示」，不触碰任何权限判定。
+ */
+const accountTabActive = computed(() => activeTab.value === 'accounts')
+
+async function handleLogout() {
+  await authStore.logout()
+  emit('close')
+  await router.replace('/login')
+}
+
+function openAccountsTab() {
+  activeTab.value = 'accounts'
+}
+
+// 可见分区变化（例如受限角色登录后被收缩为 账户/外观/关于）时，把落点拉回有效页签。
+// 用 watch 而非一次性判断：登录态、白名单配置都可能晚于首帧变化。
+watch(
+  tabs,
+  (list) => {
+    if (list.some((t) => t.id === activeTab.value)) return
+    activeTab.value = list[0]?.id ?? defaultTab()
+  },
+  { immediate: true },
+)
+
+onMounted(async () => {
+  window.addEventListener('resize', onWindowResize)
+  const loading = useUiLoadingStore()
+  // 面板异步 chunk 已挂上：立刻关掉全屏 hero。
+  // 配置拉取用面板内 spinner；否则 9 路 /config 全完（甚至重试）才关全屏，看起来像「设置已出来但还在转」。
+  loading.hideImmediate()
+  try {
+    await settingsStore.loadAll({ quiet: Boolean(settingsStore.generalConfig) })
+  } catch {
+    /* loadAll 自行写入 error / partialError */
+  }
+  // 配置读不到（典型：demo 角色被 /config/general 403 拦下）⇒ 直接落到「账户」分区，
+  // 让「退出登录」在任何角色下都触手可及（admin 能读到配置，不受影响）。
+  if (settingsStore.error && !settingsStore.generalConfig) {
+    activeTab.value = 'accounts'
+  }
+})
+
+watch(activeTab, (tab) => {
+  // merge 写入：勿整表替换，否则会丢掉 mapDistributionChrome 等偏好
+  saveSettingsUiLocal({ ...loadSettingsUiLocal(), activeTab: tab })
+  if (tab === 'api-keys' && settingsStore.apiKeys.length === 0) {
+    void settingsStore.loadApiKeys()
+  } else if (tab === 'gee-accounts' && settingsStore.geeAccounts.length === 0) {
+    void settingsStore.loadGeeAccounts()
+  } else if (tab === 'weather-providers' && settingsStore.weatherProviders.length === 0) {
+    void settingsStore.loadWeatherProviders()
+  } else if (tab === 'remote-storage' && settingsStore.remoteStorageProfiles.length === 0) {
+    void settingsStore.loadRemoteStorageProfiles()
+  }
+})
+
+/** 设置侧栏：左缘拖动加宽（面板贴右，向左拖 = 变宽） */
+const PANEL_WIDTH_DEFAULT_PX = Math.round(38 * 16)
+const PANEL_WIDTH_MIN_PX = Math.round(32 * 16)
+const PANEL_WIDTH_MAX_CAP_PX = Math.round(56 * 16)
+
+function clampPanelWidth(px: number): number {
+  const maxByViewport = Math.floor(window.innerWidth * 0.92)
+  const max = Math.min(PANEL_WIDTH_MAX_CAP_PX, Math.max(PANEL_WIDTH_MIN_PX, maxByViewport))
+  return Math.min(max, Math.max(PANEL_WIDTH_MIN_PX, Math.round(px)))
+}
+
+const savedWidth = loadSettingsUiLocal().panelWidthPx
+const panelWidthPx = ref(
+  clampPanelWidth(
+    typeof savedWidth === 'number' && Number.isFinite(savedWidth)
+      ? savedWidth
+      : PANEL_WIDTH_DEFAULT_PX,
+  ),
+)
+const panelStyle = computed(() => ({ width: `${panelWidthPx.value}px` }))
+
+// ── 左菜单列 / 内容区 分隔拖拽（横向调节菜单宽度） ──
+const NAV_WIDTH_DEFAULT_PX = Math.round(8.5 * 16)
+const NAV_WIDTH_MIN_PX = Math.round(6.5 * 16)
+const NAV_WIDTH_MAX_PX = Math.round(15 * 16)
+
+function clampNavWidth(px: number): number {
+  return Math.min(NAV_WIDTH_MAX_PX, Math.max(NAV_WIDTH_MIN_PX, Math.round(px)))
+}
+
+const savedNavWidth = loadSettingsUiLocal().settingsNavWidthPx
+const navWidthPx = ref(
+  clampNavWidth(
+    typeof savedNavWidth === 'number' && Number.isFinite(savedNavWidth)
+      ? savedNavWidth
+      : NAV_WIDTH_DEFAULT_PX,
+  ),
+)
+const navStyle = computed(() => ({ width: `${navWidthPx.value}px` }))
+
+let navResizeStartX = 0
+let navResizeStartWidth = 0
+const isNavResizing = ref(false)
+let navResizeCaptureEl: Element | null = null
+let navResizePointerId: number | null = null
+
+function onNavDividerPointerDown(event: PointerEvent) {
+  event.preventDefault()
+  isNavResizing.value = true
+  document.body.style.userSelect = 'none'
+  navResizeStartX = event.clientX
+  navResizeStartWidth = navWidthPx.value
+  const el = event.currentTarget as Element
+  try {
+    el.setPointerCapture(event.pointerId)
+    navResizeCaptureEl = el
+    navResizePointerId = event.pointerId
+  } catch {
+    navResizeCaptureEl = null
+  }
+  window.addEventListener('pointermove', onNavResizePointerMove)
+  window.addEventListener('pointerup', onNavResizePointerUp)
+}
+
+function onNavResizePointerMove(event: PointerEvent) {
+  if (!isNavResizing.value) return
+  // 分隔条在 nav 右侧：向右拖 → clientX 变大 → 菜单加宽
+  navWidthPx.value = clampNavWidth(navResizeStartWidth + (event.clientX - navResizeStartX))
+}
+
+function onNavResizePointerUp(_event: PointerEvent) {
+  isNavResizing.value = false
+  document.body.style.userSelect = ''
+  window.removeEventListener('pointermove', onNavResizePointerMove)
+  window.removeEventListener('pointerup', onNavResizePointerUp)
+  if (navResizeCaptureEl && navResizePointerId !== null) {
+    try {
+      ;(navResizeCaptureEl as HTMLElement).releasePointerCapture(navResizePointerId)
+    } catch {
+      /* 指针已释放 */
+    }
+  }
+  navResizeCaptureEl = null
+  navResizePointerId = null
+  saveSettingsUiLocal({ settingsNavWidthPx: navWidthPx.value })
+}
+
+let resizeStartX = 0
+let resizeStartWidth = 0
+const isResizing = ref(false)
+/** pointerup 落在蒙层时浏览器会合成 click → 误触发 @click.self 关面板 */
+let suppressOverlayClose = false
+let suppressOverlayCloseTimer: ReturnType<typeof setTimeout> | null = null
+let resizeCaptureEl: Element | null = null
+let resizePointerId: number | null = null
+
+function onOverlayClick() {
+  if (suppressOverlayClose || isResizing.value) return
+  emit('close')
+}
+
+function armOverlayCloseSuppress() {
+  suppressOverlayClose = true
+  if (suppressOverlayCloseTimer !== null) clearTimeout(suppressOverlayCloseTimer)
+  // click 通常紧跟 pointerup；稍延后清除，覆盖同帧 / 下一任务队列派发
+  suppressOverlayCloseTimer = setTimeout(() => {
+    suppressOverlayClose = false
+    suppressOverlayCloseTimer = null
+  }, 100)
+}
+
+function onResizePointerMove(event: PointerEvent) {
+  if (!isResizing.value) return
+  // 向左拖 → clientX 变小 → 宽度增加
+  const next = resizeStartWidth + (resizeStartX - event.clientX)
+  panelWidthPx.value = clampPanelWidth(next)
+}
+
+function stopResize() {
+  if (!isResizing.value) return
+  isResizing.value = false
+  if (resizeCaptureEl && resizePointerId !== null) {
+    try {
+      resizeCaptureEl.releasePointerCapture(resizePointerId)
+    } catch {
+      /* capture 可能已释放 */
+    }
+  }
+  resizeCaptureEl = null
+  resizePointerId = null
+  window.removeEventListener('pointermove', onResizePointerMove)
+  window.removeEventListener('pointerup', stopResize)
+  window.removeEventListener('pointercancel', stopResize)
+  document.body.style.cursor = ''
+  document.body.style.userSelect = ''
+  armOverlayCloseSuppress()
+  saveSettingsUiLocal({ ...loadSettingsUiLocal(), panelWidthPx: panelWidthPx.value })
+}
+
+function onResizePointerDown(event: PointerEvent) {
+  if (event.button !== 0) return
+  event.preventDefault()
+  event.stopPropagation()
+  isResizing.value = true
+  resizeStartX = event.clientX
+  resizeStartWidth = panelWidthPx.value
+  document.body.style.cursor = 'ew-resize'
+  document.body.style.userSelect = 'none'
+  const target = event.currentTarget
+  if (target instanceof Element) {
+    resizeCaptureEl = target
+    resizePointerId = event.pointerId
+    try {
+      target.setPointerCapture(event.pointerId)
+    } catch {
+      /* 部分环境不支持 capture，仍靠 window 监听 */
+      resizeCaptureEl = null
+      resizePointerId = null
+    }
+  }
+  window.addEventListener('pointermove', onResizePointerMove)
+  window.addEventListener('pointerup', stopResize)
+  window.addEventListener('pointercancel', stopResize)
+}
+
+function onWindowResize() {
+  panelWidthPx.value = clampPanelWidth(panelWidthPx.value)
+}
+
+onUnmounted(() => {
+  stopResize()
+  if (suppressOverlayCloseTimer !== null) clearTimeout(suppressOverlayCloseTimer)
+  window.removeEventListener('resize', onWindowResize)
+})
+</script>
+
+<template>
+  <div class="settings-overlay" @click.self="onOverlayClick">
+    <div
+      class="settings-panel"
+      :class="{ 'settings-panel--resizing': isResizing }"
+      :style="panelStyle"
+    >
+      <div
+        class="settings-resize-handle"
+        title="向左拖动加宽"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="调整设置面板宽度"
+        @pointerdown="onResizePointerDown"
+        @click.stop
+      />
+      <div class="settings-header">
+        <Settings :size="18" class="header-icon" aria-hidden="true" />
+        <span class="header-title">{{ SETTINGS_COPY.panelTitle }}</span>
+        <button
+          v-if="sessionLabel"
+          type="button"
+          class="session-chip"
+          title="账户与登录"
+          @click="openAccountsTab"
+        >
+          <User :size="14" class="session-avatar" aria-hidden="true" />
+          <span class="session-text">{{ sessionLabel }}</span>
+        </button>
+        <button class="close-btn" title="关闭" @click="emit('close')">
+          <X :size="14" aria-hidden="true" />
+        </button>
+      </div>
+
+      <div class="settings-body">
+        <nav class="settings-nav" :style="navStyle">
+          <button
+            v-for="tab in tabs"
+            :key="tab.id"
+            class="nav-item"
+            :class="{ active: activeTab === tab.id }"
+            @click="activeTab = tab.id"
+          >
+            <span class="nav-icon" aria-hidden="true"><component :is="tab.icon" :size="16" /></span>
+            <span class="nav-label">{{ tab.label }}</span>
+          </button>
+
+          <div v-if="authStore.isAdmin" class="nav-divider" aria-hidden="true"></div>
+          <button
+            v-if="authStore.isAdmin"
+            type="button"
+            class="nav-item nav-deploy"
+            title="部署与数据源配置中心（管理员专属页面）"
+            @click="openDeploymentCenter"
+          >
+            <span class="nav-icon" aria-hidden="true"><Server :size="16" /></span>
+            <span class="nav-label">部署配置中心</span>
+          </button>
+        </nav>
+
+        <div
+          class="settings-nav-divider"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="调整菜单栏宽度（拖动）"
+          title="拖动调整菜单栏宽度"
+          @pointerdown="onNavDividerPointerDown"
+        ></div>
+
+        <div class="settings-content">
+          <div v-if="settingsStore.loading" class="content-loading">
+            <span class="loading-spinner"></span>
+            <span>加载配置中...</span>
+          </div>
+          <div v-else-if="configUnavailable && !accountTabActive" class="content-error">
+            <span>{{ settingsStore.error }}</span>
+            <div class="content-error-actions">
+              <button type="button" class="retry-btn" @click="settingsStore.loadAll()">重试</button>
+              <button type="button" class="retry-btn" @click="handleLogout">退出登录</button>
+            </div>
+          </div>
+          <template v-else>
+            <!-- 受限登录态（演示/游客）：系统配置对其不可读，与其显示一堆红色报错，
+                 不如一句话说清「能看到什么、为什么」。 -->
+            <div
+              v-if="authStore.isRestrictedRole && activeTab !== 'about'"
+              class="content-restricted-note"
+            >
+              当前账号为受限角色，系统配置不对其开放，仅显示「账户 / 外观 / 系统与关于」。
+            </div>
+            <div
+              v-if="settingsStore.partialError && !accountTabActive"
+              class="content-partial-error"
+            >
+              <span>{{ settingsStore.partialError }}</span>
+              <button type="button" class="retry-btn" @click="settingsStore.loadAll()">
+                重试失败项
+              </button>
+            </div>
+            <component :is="tabComponents[activeTab]" @close="emit('close')" />
+          </template>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.settings-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 998;
+  display: flex;
+  justify-content: flex-end;
+  background: var(--surface-raised);
+}
+
+.settings-panel {
+  position: relative;
+  width: 38rem;
+  max-width: 92vw;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-2);
+  border-left: 1px solid var(--border-default);
+  box-shadow: -12px 0 36px rgba(1, 8, 16, 0.32);
+  transition: width var(--motion-base) var(--ease-standard);
+}
+
+.settings-panel--resizing {
+  transition: none;
+  will-change: width;
+  cursor: ew-resize;
+}
+
+.settings-resize-handle {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 0.4rem;
+  transform: translateX(-50%);
+  cursor: ew-resize;
+  z-index: 2;
+  touch-action: none;
+}
+
+.settings-resize-handle::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 0.18rem;
+  height: 2.4rem;
+  transform: translate(-50%, -50%);
+  border-radius: 999px;
+  background: var(--border-default);
+  opacity: 0;
+  transition: opacity var(--motion-fast) var(--ease-soft);
+}
+
+.settings-panel:hover .settings-resize-handle::after,
+.settings-panel--resizing .settings-resize-handle::after {
+  opacity: 0.9;
+  background: var(--accent);
+}
+
+.settings-header {
+  display: flex;
+  align-items: center;
+  gap: 0.38rem;
+  padding: 0.72rem 0.82rem;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-strong);
+  font-size: var(--font-size-caption);
+  font-weight: 600;
+  flex: none;
+}
+
+.header-icon {
+  font-size: 0.82rem;
+  color: var(--accent);
+}
+
+.header-title {
+  flex: 1;
+  min-width: 0;
+}
+
+.session-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  max-width: 9rem;
+  padding: 0.22rem 0.45rem;
+  border: 1px solid var(--success-border);
+  border-radius: 999px;
+  background: var(--success-surface);
+  color: var(--success);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--font-size-caption);
+}
+
+.session-chip:hover {
+  border-color: var(--success);
+  background: var(--success-surface);
+}
+
+.session-avatar {
+  font-size: var(--font-size-caption);
+  line-height: 1;
+}
+
+.session-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.close-btn {
+  /* grid + place-items 双轴居中；显式 padding:0 抹掉 UA 默认按钮内边距，
+     避免 hover 高亮框与叉号出现视觉偏移 */
+  display: grid;
+  place-items: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  border: none;
+  border-radius: 0.42rem;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: var(--font-size-caption);
+  line-height: 0;
+  flex: none;
+  transition:
+    background-color var(--motion-fast) var(--ease-soft),
+    color var(--motion-fast) var(--ease-soft);
+}
+
+.close-btn svg {
+  flex: none;
+}
+
+.close-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.close-btn:active {
+  background: var(--border-subtle);
+}
+
+.settings-body {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+.settings-nav {
+  width: 8.5rem;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.12rem;
+  padding: 0.52rem 0.32rem;
+  border-right: 1px solid var(--border-subtle);
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.nav-divider {
+  margin: 0.3rem 0.24rem 0.18rem;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.nav-deploy .nav-label {
+  color: var(--accent-strong);
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 0.36rem;
+  padding: 0.42rem 0.52rem;
+  border: 1px solid transparent;
+  border-radius: 0.5rem;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--font-size-caption);
+  text-align: left;
+  transition:
+    background-color var(--motion-interactive-duration) var(--motion-interactive-ease),
+    border-color var(--motion-interactive-duration) var(--motion-interactive-ease),
+    color var(--motion-interactive-duration) var(--motion-interactive-ease),
+    box-shadow var(--motion-interactive-duration) var(--motion-interactive-ease);
+}
+
+.nav-item:hover {
+  background: var(--border-subtle);
+  color: var(--text-primary);
+}
+
+.nav-item.active {
+  border-color: var(--accent-border);
+  background: var(--accent-surface);
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+
+.nav-icon {
+  font-size: var(--font-size-caption);
+  opacity: 0.8;
+  flex: none;
+}
+
+.nav-item.active .nav-icon {
+  opacity: 1;
+}
+
+.nav-label {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 左菜单列 / 内容区 拖拽分隔条（悬停/拖拽态加宽高亮） */
+.settings-nav-divider {
+  flex: none;
+  width: 0.32rem;
+  margin: 0 -0.06rem;
+  cursor: col-resize;
+  border-radius: 2px;
+  background: transparent;
+  transition: background-color var(--motion-fast) var(--ease-standard);
+  touch-action: none;
+}
+
+.settings-nav-divider:hover,
+.settings-nav-divider:active {
+  background: var(--accent-border, var(--border-strong));
+}
+
+.settings-content {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding: 0.62rem 0.82rem;
+}
+
+.content-loading,
+.content-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.62rem;
+  padding: 3rem 1rem;
+  color: var(--text-disabled);
+  font-size: var(--font-size-caption);
+}
+
+.content-error-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.content-partial-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  margin-bottom: 0.55rem;
+  padding: 0.42rem 0.55rem;
+  border: 1px solid var(--warning-border);
+  border-radius: 0.45rem;
+  background: var(--warning-surface);
+  color: var(--accent-warm);
+  font-size: var(--font-size-caption);
+  line-height: 1.4;
+}
+
+/* 受限角色（演示/游客）说明条：中性色，不是报错 */
+.content-restricted-note {
+  margin-bottom: 0.55rem;
+  padding: 0.42rem 0.55rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.45rem;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-size: var(--font-size-caption);
+  line-height: 1.4;
+}
+
+.loading-spinner {
+  width: 1.6rem;
+  height: 1.6rem;
+  border: 2px solid var(--accent-border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.retry-btn {
+  padding: 0.26rem 0.72rem;
+  border: 1px solid var(--accent-border);
+  border-radius: 0.4rem;
+  background: var(--accent-surface);
+  color: var(--accent-strong);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--font-size-caption);
+}
+
+.retry-btn:hover {
+  background: var(--surface-hover);
+}
+
+/* 键盘焦点可达性：统一交互元素 focus-visible 轮廓 */
+.session-chip:focus-visible,
+.close-btn:focus-visible,
+.nav-item:focus-visible,
+.retry-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (max-width: 640px) {
+  .settings-panel {
+    width: 100vw !important;
+    max-width: 100vw;
+  }
+
+  .settings-resize-handle {
+    display: none;
+  }
+
+  .settings-body {
+    flex-direction: column;
+  }
+
+  .settings-nav-divider {
+    display: none;
+  }
+
+  .settings-nav {
+    width: 100%;
+    flex-direction: row;
+    border-right: none;
+    border-bottom: 1px solid var(--border-subtle);
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 0.32rem;
+    scrollbar-gutter: auto;
+  }
+
+  .nav-item {
+    flex: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loading-spinner {
+    animation: none;
+  }
+}
+</style>
+
+<style>
+@import './settings-scrollbar.css';
+</style>
